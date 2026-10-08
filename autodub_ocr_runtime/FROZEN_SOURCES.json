@@ -1,0 +1,72 @@
+{
+  "autodub_ocr_runtime/frozen/v12_c7_ocr_structure_sanitizer_r1.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c7_ocr_structure_sanitizer_r1.py",
+    "sha256": "C537999785526C728B8A7B92A7CFB52D880322EBDF5F84B368D7FAB2D22E27ED",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_c8_exact_context.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c8_exact_context.py",
+    "sha256": "D8F0386C6648F785683B4F5F89A92759686C6FA71FA96B106ECA50BFD7DEA3EE",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_c4_candidate_inventory.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c4_candidate_inventory.py",
+    "sha256": "82B68864E92313EF6358AECC748686C9E04A2BFA18F55347447CDF7CF2979C63",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_c4_candidate_inventory_r2.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c4_candidate_inventory_r2.py",
+    "sha256": "1F8AA3EF5E927B4D75F30E27D62B69E47EEB3508DDBE0B5C6A65DC3FFBA49782",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_c4_candidate_inventory_r4.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c4_candidate_inventory_r4.py",
+    "sha256": "FFE4D384C3EC24F69AF09826738DBC261BD84DA5B506406F5E337B4D0426C524",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_c4_candidate_adapter.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c4_candidate_adapter.py",
+    "sha256": "626C813FEC286E8E03EBA70BBA5D04745F3BF54AE08B39E4525E9CE5257DBF83",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_c4_candidate_adapter_r4.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c4_candidate_adapter_r4.py",
+    "sha256": "1100A0AC960A95ACC87B23DB804FEE5C801947270E7D52FF1F47843B402BFC5C",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_c3_structured_adapter.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c3_structured_adapter.py",
+    "sha256": "ED2B67F1DA6118ACCF7ACC2A2022095C6A1F3CD15D579FC1253EACA58BCCB901",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_c3_structured_adapter_r2.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c3_structured_adapter_r2.py",
+    "sha256": "FDF8522FA3650BDADFFC9F74DE63981AB3D9F6D70259353F4F63B6DDE5C45715",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_c1r_checked_adapter.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_c1r_checked_adapter.py",
+    "sha256": "F61BCF9D71DAD657159A5B43A2382DFB6FEAAFDA55B96DE6797707D96535DE9A",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/v12_a1_local_deletion.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/v12_a1_local_deletion.py",
+    "sha256": "56CC74FAB06C187C093AE7C6ADEC87A07650830D8D75F1B7EAB4FEE5499A038B",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/replay_p3_guard_candidates_v1.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/replay_p3_guard_candidates_v1.py",
+    "sha256": "7958C26BC312F94D2952CDC21ACA6801375366979C987E470D9D230BCC087514",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/replay_v11_p4_task_boundary_v1.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/scripts/replay_v11_p4_task_boundary_v1.py",
+    "sha256": "2B282239BEA14F22C79C9A7C9DE872625D59D59DA9F49F0D8F540AA6B7278596",
+    "modifications": "none; byte-identical copy"
+  },
+  "autodub_ocr_runtime/frozen/run_ocr_asr_correction_ablation.py": {
+    "source": "project_log/第8阶段/OCR纠错Prompt系统实验/stage4_dependencies/run_ocr_asr_correction_ablation.py",
+    "sha256": "946F75D9C9A0C255DDC2C8E400B47F721937803425FE0662D200DFCB1EBAAE04",
+    "modifications": "none; byte-identical copy"
+  }
+}
