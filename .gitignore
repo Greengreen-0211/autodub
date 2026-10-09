@@ -1,0 +1,30 @@
+# Python缓存
+__pycache__/
+*.py[cod]
+
+# 运行结果
+temp/
+output/
+logs/
+*.log
+
+# 私密配置
+.env
+.env.*
+!.env.example
+
+# 视频和音频
+*.mp4
+*.mov
+*.mkv
+*.wav
+*.mp3
+*.flac
+
+# 模型文件
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.onnx
