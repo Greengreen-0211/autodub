@@ -1,0 +1,2 @@
+# UI only. Never install the model runtime requirements for this mock frontend.
+gradio==6.1.0

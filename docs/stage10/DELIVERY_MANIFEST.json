@@ -1,0 +1,199 @@
+{
+  "created_at": "2026-10-09T20:27:57.648757+08:00",
+  "mock": true,
+  "target_branch": "frontend",
+  "repository": "https://github.com/Greengreen-0211/autodub",
+  "verified_branch_commit": "635d01b77f1d3f8cfdca520a3a4e3625206274b9",
+  "existing_dependency": {
+    "path": "scheme3_policy.py",
+    "sha256": "a1ad84218cd028e5e7c3bf337e1fbff23e6caa2489601b56cffc62e25b9388f7",
+    "newline_conversion_allowed": "LF/CRLF only",
+    "included": false
+  },
+  "validation": [
+    {
+      "command": "python -m unittest discover -s frontend/tests -v",
+      "exit_code": 0
+    },
+    {
+      "command": "python frontend/smoke_demo.py",
+      "exit_code": 0
+    },
+    {
+      "command": "python frontend/smoke_extensions.py",
+      "exit_code": 0
+    }
+  ],
+  "files": [
+    {
+      "path": "docs/stage10/FRONTEND_AUDIT_20261009.md",
+      "bytes": 6065,
+      "sha256": "835a9e58f72121579471231d1bcf732fc7c1d1ff5f189ad03f54b0ece8ee5a8b"
+    },
+    {
+      "path": "docs/stage10/HANDOFF_20261009.md",
+      "bytes": 18765,
+      "sha256": "94ea2d75e280a14ee0335baf4f298aec7ba49c85393eb8ba7f3dd1dbbe3ff2b8"
+    },
+    {
+      "path": "docs/stage10/README.md",
+      "bytes": 1384,
+      "sha256": "d99c57b2e97162b39cf0e5de7dc99e6733c0ee08b154bf74572bb8ad592d5755"
+    },
+    {
+      "path": "docs/stage10/VALIDATION_20261009.md",
+      "bytes": 15752,
+      "sha256": "433b771204fe209b21247311c83282e6ca340d2247df7f8c56172a062afc0070"
+    },
+    {
+      "path": "docs/stage10/接口约定_v0.1.md",
+      "bytes": 13565,
+      "sha256": "ad3226a777169e1fe3e2e8e27c19cbb8b6ee45ff02e4fc3607531fa3095e4c73"
+    },
+    {
+      "path": "docs/stage10/接口补充_v0.2_情绪与TTS试合成.md",
+      "bytes": 5986,
+      "sha256": "7cb73ead133bf09744d6184c01950e406028b869248c6ce78dbdfe871da76e32"
+    },
+    {
+      "path": "docs/stage10/接口补充_v0.3_逐阶段审核.md",
+      "bytes": 2394,
+      "sha256": "bdea9e68180ba2a2094fbca73fb43c3c74a6305130addd98b74bb0beff645aa1"
+    },
+    {
+      "path": "frontend/.gitignore",
+      "bytes": 61,
+      "sha256": "822cb6f9643a8b7351e5dc95b0a5e09a6d29a5f25d8fa2f775b9b4cac414a806"
+    },
+    {
+      "path": "frontend/AGENTS.md",
+      "bytes": 3100,
+      "sha256": "88289ae89e06daa8a06d22fcfd59e345715dd27fab606d9e08278e2c18fd7716"
+    },
+    {
+      "path": "frontend/app.py",
+      "bytes": 32844,
+      "sha256": "8a9b338f6acce59385572833762a1e65163eaa8ee34d99f5dcabff641f193bcc"
+    },
+    {
+      "path": "frontend/backend_client.py",
+      "bytes": 1764,
+      "sha256": "b2966748cb8b6cd8837f25d940b4202afa9bc45057dc3a01ca8a590b7677a9a4"
+    },
+    {
+      "path": "frontend/backup_frontend.py",
+      "bytes": 2180,
+      "sha256": "9270ace720ec9310141cfed24e459e8881a0da045ffa75a4e6f566d751c1b7a0"
+    },
+    {
+      "path": "frontend/examples/mock_contract.json",
+      "bytes": 98926,
+      "sha256": "8d9e4c815331657382dad66ad1d35b45887cb7e0309cee07d990a873d87aae9a"
+    },
+    {
+      "path": "frontend/examples/mock_review_extensions.json",
+      "bytes": 68288,
+      "sha256": "dc7fc09089424ba3c21f715eb8a0ac75809b31d850feaccbadd96b4edae78983"
+    },
+    {
+      "path": "frontend/examples/preview_completed_readonly.png",
+      "bytes": 64589,
+      "sha256": "61c962c4989e3ec91b85b8066608cac208cde81481acbf98db2620442fc294aa"
+    },
+    {
+      "path": "frontend/examples/preview_dark_colors.png",
+      "bytes": 102281,
+      "sha256": "cbccb98221018cf4efd3c08bc0400a4d74d91fe7f49ba1b131cba4a60dc951ca"
+    },
+    {
+      "path": "frontend/examples/preview_restored_style.png",
+      "bytes": 91968,
+      "sha256": "62ff938d73e6b48bb04a2bb7d2b4c2eda20efc02107e7f065e1bc21fc6d47259"
+    },
+    {
+      "path": "frontend/examples/preview_sequential_emotion.png",
+      "bytes": 67602,
+      "sha256": "324416b5bd095012f386e27a7b0b56bbd898b7d4998cde29aeac136b96f998e5"
+    },
+    {
+      "path": "frontend/examples/preview_sequential_routing.png",
+      "bytes": 63255,
+      "sha256": "41a724f80dad6ab2021afa54b7720df72c96acf39c98f83e453f506f738a95e9"
+    },
+    {
+      "path": "frontend/examples/preview_tts_models.png",
+      "bytes": 73811,
+      "sha256": "4c629759056bd8f084bb8c57a860e8a9f5aa77cc6dcd0512339d412d0d3af7f0"
+    },
+    {
+      "path": "frontend/fixtures.py",
+      "bytes": 2494,
+      "sha256": "e7d351af0349ec28931c96397b26ff0e8fee604b89ac311079a4e0694c6c1753"
+    },
+    {
+      "path": "frontend/mock_backend.py",
+      "bytes": 48790,
+      "sha256": "b4fab181af97b5390ac379af0b28ffaff3b892a8729bbaa07f74d3d0dfbbe1c8"
+    },
+    {
+      "path": "frontend/README.md",
+      "bytes": 12514,
+      "sha256": "3d1ba583defc7a6d64a53a3c069761e080ee19d18cb6f6ed5f0bd1819000aed3"
+    },
+    {
+      "path": "frontend/requirements.lock.txt",
+      "bytes": 939,
+      "sha256": "9d15e1a10dcecc9a5195243114648f32032a40d1657ff8a32f7d44897f8e3a09"
+    },
+    {
+      "path": "frontend/requirements.txt",
+      "bytes": 94,
+      "sha256": "4e36ca758b1db76eeaa3fd66f1ad0e45d8a17d968ad9997aa19b858eb7b411e1"
+    },
+    {
+      "path": "frontend/routing_explanation.py",
+      "bytes": 2061,
+      "sha256": "5825544817d03959b3ee73e806031baeeed7afd5702678d28568a5077264da95"
+    },
+    {
+      "path": "frontend/smoke_demo.py",
+      "bytes": 3160,
+      "sha256": "8f3a6223c42116a1a030deb8c33d87692e4439ee78a6c9c598a4d0830df377d9"
+    },
+    {
+      "path": "frontend/smoke_extensions.py",
+      "bytes": 3465,
+      "sha256": "1500fcb5073c02b76c4b0d95c7b868b14f63b3a0b5286663a4e06de91306d378"
+    },
+    {
+      "path": "frontend/styles.css",
+      "bytes": 15839,
+      "sha256": "30f03a6effc3f38e7eb445ba38f23bbb32a4b3a65591a2fd991b284c7b104645"
+    },
+    {
+      "path": "frontend/tests/test_policy_loading.py",
+      "bytes": 1993,
+      "sha256": "6b09485070064a8cc835056e209eac26ff2ae94d2ae84dd3ec3fc96d44ed14dd"
+    },
+    {
+      "path": "frontend/tests/test_review_extensions.py",
+      "bytes": 9094,
+      "sha256": "c5dd1315b23605d707f5b7488cc0f00bb9c0b9f7c836aaea0d81a799d4085eef"
+    },
+    {
+      "path": "frontend/tests/test_sequential_review.py",
+      "bytes": 3940,
+      "sha256": "df5db744605f3cfca640f5f01fba3ca127419d79dc3fbd8e8ab73120efa8fbe0"
+    },
+    {
+      "path": "frontend/tests/test_workflow.py",
+      "bytes": 20924,
+      "sha256": "f5a997c1790e064963e77907ebc560be9e57f5ff243b6965f71513bd8dee7c60"
+    },
+    {
+      "path": "frontend/workbench.py",
+      "bytes": 37059,
+      "sha256": "45a3da26ce1893ee0f836f3ac734c4ab8e1656ff362c06da7362c7d1c10bf165"
+    }
+  ]
+}
