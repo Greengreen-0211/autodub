@@ -1,0 +1,3215 @@
+{
+  "notice": "模拟合同样例；无 HTTP 服务、真实模型或媒体",
+  "contract_status": "PROPOSED_v0.1",
+  "tts_review_job": {
+    "job_id": "job_efe8b1528baa",
+    "revision": 2,
+    "snapshot_sequence": 70,
+    "mode": "review",
+    "status": "waiting_review",
+    "current_stage": "tts",
+    "resume_from": "mixing",
+    "source_language": "en",
+    "target_language": "zh",
+    "active_operation": null,
+    "mock": true,
+    "video_name": "内置三句模拟样例（无视频）",
+    "stages": [
+      {
+        "id": "separation",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": false,
+        "model": "Demucs htdemucs two-stems",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "asr",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": false,
+        "model": "Qwen3-ASR",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "ocr",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": true,
+        "model": "HunyuanOCR / frozen_b",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "diarization",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": false,
+        "model": "mock",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "emotion",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": true,
+        "model": "emotion2vec_plus_base",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "translation",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": {
+          "completed": 3,
+          "total": 3,
+          "ratio": 1.0
+        },
+        "review_required": false,
+        "model": "mock",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "light_tts",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": {
+          "completed": 3,
+          "total": 3,
+          "ratio": 1.0
+        },
+        "review_required": true,
+        "model": "mock",
+        "artifact_ids": [
+          "seg_0001_light_tts_r2_a1",
+          "seg_0002_light_tts_r2_a1",
+          "seg_0003_light_tts_r2_a1"
+        ],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "routing",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": {
+          "completed": 3,
+          "total": 3,
+          "ratio": 1.0
+        },
+        "review_required": true,
+        "model": "Scheme3 router",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "tts",
+        "status": "waiting_review",
+        "attempt": 1,
+        "progress": {
+          "completed": 3,
+          "total": 3,
+          "ratio": 1.0
+        },
+        "review_required": true,
+        "model": "Scheme3",
+        "artifact_ids": [
+          "seg_0001_tts_r2_a1",
+          "seg_0002_tts_r2_a1",
+          "seg_0003_tts_r2_a1"
+        ],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "mixing",
+        "status": "pending",
+        "attempt": 0,
+        "progress": null,
+        "review_required": false,
+        "model": "mock",
+        "artifact_ids": []
+      }
+    ],
+    "capabilities": {
+      "edit_source_text": true,
+      "edit_translation_text": true,
+      "edit_emotion": true,
+      "trial_tts_models": true,
+      "adopt_tts_trial": true,
+      "rerun_tts_segments": true,
+      "rerun_asr_segments": false,
+      "edit_timing": false,
+      "freeform_instruction": false,
+      "rework_stages": [
+        "emotion",
+        "translation",
+        "light_tts",
+        "tts"
+      ]
+    },
+    "tts_engines": [
+      {
+        "engine": "f5tts",
+        "available": true,
+        "languages": [
+          "zh",
+          "en"
+        ],
+        "mock": true
+      },
+      {
+        "engine": "indextts2",
+        "available": true,
+        "languages": [
+          "zh",
+          "en"
+        ],
+        "mock": true
+      },
+      {
+        "engine": "cosyvoice3",
+        "available": true,
+        "languages": [
+          "zh",
+          "en"
+        ],
+        "mock": true
+      },
+      {
+        "engine": "confucius4",
+        "available": true,
+        "languages": [
+          "zh",
+          "en"
+        ],
+        "mock": true
+      },
+      {
+        "engine": "omnivoice",
+        "available": true,
+        "languages": [
+          "zh",
+          "en",
+          "ja"
+        ],
+        "mock": true
+      }
+    ],
+    "artifacts": [
+      {
+        "artifact_id": "seg_0001_light_tts_r2_a1",
+        "kind": "light_tts_placeholder",
+        "segment_id": "seg_0001",
+        "stage": "light_tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "我们还有最后一次机会。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0002_light_tts_r2_a1",
+        "kind": "light_tts_placeholder",
+        "segment_id": "seg_0002",
+        "stage": "light_tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "【模拟译文 · zh】I cannot hear you.",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0003_light_tts_r2_a1",
+        "kind": "light_tts_placeholder",
+        "segment_id": "seg_0003",
+        "stage": "light_tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0001_tts_r2_a1",
+        "kind": "tts_placeholder",
+        "segment_id": "seg_0001",
+        "stage": "tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "我们还有最后一次机会。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0002_tts_r2_a1",
+        "kind": "tts_placeholder",
+        "segment_id": "seg_0002",
+        "stage": "tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "【模拟译文 · zh】I cannot hear you.",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0003_tts_r2_a1",
+        "kind": "tts_placeholder",
+        "segment_id": "seg_0003",
+        "stage": "tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      }
+    ],
+    "pending_edit": null,
+    "mock_worker_error": null
+  },
+  "source_edit_result": {
+    "job_id": "job_efe8b1528baa",
+    "revision": 2,
+    "edited_segment_ids": [
+      "seg_0002"
+    ],
+    "invalidated": [],
+    "affected": [
+      {
+        "stage": "diarization",
+        "segment_ids": [
+          "seg_0001",
+          "seg_0002",
+          "seg_0003"
+        ]
+      },
+      {
+        "stage": "emotion",
+        "segment_ids": [
+          "seg_0001",
+          "seg_0002",
+          "seg_0003"
+        ]
+      },
+      {
+        "stage": "translation",
+        "segment_ids": [
+          "seg_0001",
+          "seg_0002",
+          "seg_0003"
+        ]
+      },
+      {
+        "stage": "light_tts",
+        "segment_ids": [
+          "seg_0001",
+          "seg_0002",
+          "seg_0003"
+        ]
+      },
+      {
+        "stage": "routing",
+        "segment_ids": [
+          "seg_0001",
+          "seg_0002",
+          "seg_0003"
+        ]
+      },
+      {
+        "stage": "tts",
+        "segment_ids": [
+          "seg_0001",
+          "seg_0002",
+          "seg_0003"
+        ]
+      },
+      {
+        "stage": "mixing",
+        "scope": "job"
+      }
+    ],
+    "resume_from": "diarization",
+    "requires_review": true
+  },
+  "translation_edit_result": {
+    "job_id": "job_efe8b1528baa",
+    "revision": 4,
+    "edited_segment_ids": [
+      "seg_0002"
+    ],
+    "invalidated": [
+      {
+        "stage": "light_tts",
+        "segment_ids": [
+          "seg_0002"
+        ]
+      },
+      {
+        "stage": "routing",
+        "segment_ids": [
+          "seg_0002"
+        ]
+      },
+      {
+        "stage": "tts",
+        "segment_ids": [
+          "seg_0002"
+        ]
+      }
+    ],
+    "affected": [
+      {
+        "stage": "light_tts",
+        "segment_ids": [
+          "seg_0002"
+        ]
+      },
+      {
+        "stage": "routing",
+        "segment_ids": [
+          "seg_0002"
+        ]
+      },
+      {
+        "stage": "tts",
+        "segment_ids": [
+          "seg_0002"
+        ]
+      },
+      {
+        "stage": "mixing",
+        "scope": "job"
+      }
+    ],
+    "resume_from": "light_tts",
+    "requires_review": true
+  },
+  "completed_job": {
+    "job_id": "job_efe8b1528baa",
+    "revision": 4,
+    "snapshot_sequence": 112,
+    "mode": "review",
+    "status": "completed",
+    "current_stage": "mixing",
+    "resume_from": null,
+    "source_language": "en",
+    "target_language": "zh",
+    "active_operation": null,
+    "mock": true,
+    "video_name": "内置三句模拟样例（无视频）",
+    "stages": [
+      {
+        "id": "separation",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": false,
+        "model": "Demucs htdemucs two-stems",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "asr",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": false,
+        "model": "Qwen3-ASR",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "ocr",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": true,
+        "model": "HunyuanOCR / frozen_b",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "diarization",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": false,
+        "model": "mock",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "emotion",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": true,
+        "model": "emotion2vec_plus_base",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "translation",
+        "status": "succeeded",
+        "attempt": 2,
+        "progress": {
+          "completed": 1,
+          "total": 1,
+          "ratio": 1.0
+        },
+        "review_required": false,
+        "model": "mock",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "light_tts",
+        "status": "succeeded",
+        "attempt": 3,
+        "progress": {
+          "completed": 1,
+          "total": 1,
+          "ratio": 1.0
+        },
+        "review_required": true,
+        "model": "mock",
+        "artifact_ids": [
+          "seg_0001_light_tts_r2_a1",
+          "seg_0002_light_tts_r2_a1",
+          "seg_0003_light_tts_r2_a1",
+          "seg_0002_light_tts_r3_a2",
+          "seg_0002_light_tts_r4_a3"
+        ],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "routing",
+        "status": "succeeded",
+        "attempt": 2,
+        "progress": {
+          "completed": 1,
+          "total": 1,
+          "ratio": 1.0
+        },
+        "review_required": true,
+        "model": "Scheme3 router",
+        "artifact_ids": [],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "tts",
+        "status": "succeeded",
+        "attempt": 2,
+        "progress": {
+          "completed": 1,
+          "total": 1,
+          "ratio": 1.0
+        },
+        "review_required": true,
+        "model": "Scheme3",
+        "artifact_ids": [
+          "seg_0001_tts_r2_a1",
+          "seg_0002_tts_r2_a1",
+          "seg_0003_tts_r2_a1",
+          "seg_0002_tts_r4_a2"
+        ],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      },
+      {
+        "id": "mixing",
+        "status": "succeeded",
+        "attempt": 1,
+        "progress": null,
+        "review_required": false,
+        "model": "mock",
+        "artifact_ids": [
+          "job_mixing_r4_a1"
+        ],
+        "started_at": "2026-10-09T18:30:40+08:00",
+        "finished_at": "2026-10-09T18:30:40+08:00"
+      }
+    ],
+    "capabilities": {
+      "edit_source_text": true,
+      "edit_translation_text": true,
+      "edit_emotion": true,
+      "trial_tts_models": true,
+      "adopt_tts_trial": true,
+      "rerun_tts_segments": true,
+      "rerun_asr_segments": false,
+      "edit_timing": false,
+      "freeform_instruction": false,
+      "rework_stages": [
+        "emotion",
+        "translation",
+        "light_tts",
+        "tts"
+      ]
+    },
+    "tts_engines": [
+      {
+        "engine": "f5tts",
+        "available": true,
+        "languages": [
+          "zh",
+          "en"
+        ],
+        "mock": true
+      },
+      {
+        "engine": "indextts2",
+        "available": true,
+        "languages": [
+          "zh",
+          "en"
+        ],
+        "mock": true
+      },
+      {
+        "engine": "cosyvoice3",
+        "available": true,
+        "languages": [
+          "zh",
+          "en"
+        ],
+        "mock": true
+      },
+      {
+        "engine": "confucius4",
+        "available": true,
+        "languages": [
+          "zh",
+          "en"
+        ],
+        "mock": true
+      },
+      {
+        "engine": "omnivoice",
+        "available": true,
+        "languages": [
+          "zh",
+          "en",
+          "ja"
+        ],
+        "mock": true
+      }
+    ],
+    "artifacts": [
+      {
+        "artifact_id": "seg_0001_light_tts_r2_a1",
+        "kind": "light_tts_placeholder",
+        "segment_id": "seg_0001",
+        "stage": "light_tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "我们还有最后一次机会。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0002_light_tts_r2_a1",
+        "kind": "light_tts_placeholder",
+        "segment_id": "seg_0002",
+        "stage": "light_tts",
+        "url": null,
+        "revision": 2,
+        "stale": true,
+        "mock": true,
+        "text": "【模拟译文 · zh】I cannot hear you.",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0003_light_tts_r2_a1",
+        "kind": "light_tts_placeholder",
+        "segment_id": "seg_0003",
+        "stage": "light_tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0001_tts_r2_a1",
+        "kind": "tts_placeholder",
+        "segment_id": "seg_0001",
+        "stage": "tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "我们还有最后一次机会。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0002_tts_r2_a1",
+        "kind": "tts_placeholder",
+        "segment_id": "seg_0002",
+        "stage": "tts",
+        "url": null,
+        "revision": 2,
+        "stale": true,
+        "mock": true,
+        "text": "【模拟译文 · zh】I cannot hear you.",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0003_tts_r2_a1",
+        "kind": "tts_placeholder",
+        "segment_id": "seg_0003",
+        "stage": "tts",
+        "url": null,
+        "revision": 2,
+        "stale": false,
+        "mock": true,
+        "text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0002_light_tts_r3_a2",
+        "kind": "light_tts_placeholder",
+        "segment_id": "seg_0002",
+        "stage": "light_tts",
+        "url": null,
+        "revision": 3,
+        "stale": true,
+        "mock": true,
+        "text": "【模拟译文 · zh】I cannot hear you.",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0002_light_tts_r4_a3",
+        "kind": "light_tts_placeholder",
+        "segment_id": "seg_0002",
+        "stage": "light_tts",
+        "url": null,
+        "revision": 4,
+        "stale": false,
+        "mock": true,
+        "text": "我听不见你。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "seg_0002_tts_r4_a2",
+        "kind": "tts_placeholder",
+        "segment_id": "seg_0002",
+        "stage": "tts",
+        "url": null,
+        "revision": 4,
+        "stale": false,
+        "mock": true,
+        "text": "我听不见你。",
+        "placeholder_reason": "模拟结果，无真实媒体"
+      },
+      {
+        "artifact_id": "job_mixing_r4_a1",
+        "kind": "final_video",
+        "segment_id": null,
+        "stage": "mixing",
+        "url": null,
+        "revision": 4,
+        "stale": false,
+        "mock": true,
+        "text": null,
+        "placeholder_reason": "模拟结果，无真实媒体"
+      }
+    ],
+    "pending_edit": null,
+    "mock_worker_error": null
+  },
+  "segments": [
+    {
+      "segment_id": "seg_0001",
+      "parent_segment_id": null,
+      "revision": 2,
+      "start": 0.0,
+      "end": 4.0,
+      "speaker": "SPEAKER_00",
+      "source": {
+        "raw_asr_text": "We have one last chance.",
+        "ocr_corrected_text": "We have one last chance.",
+        "effective_text": "We have one last chance.",
+        "origin": "ocr",
+        "word_alignment_status": "valid",
+        "audio_artifact_id": null
+      },
+      "ocr": {
+        "available": true,
+        "evidence_artifact_id": null,
+        "guard_reason": "mock_fixture"
+      },
+      "translation": {
+        "text": "我们还有最后一次机会。",
+        "status": "success",
+        "origin": "model",
+        "human_pinned": false,
+        "selected_candidate_id": null,
+        "candidates": [
+          {
+            "candidate_id": "seg_0001_r2_a1_c1",
+            "text": "我们还有最后一次机会。",
+            "light_tts_duration": null,
+            "duration_error": null,
+            "duration_source": "text_estimate",
+            "audio_artifact_id": "seg_0001_light_tts_r2_a1",
+            "stale": false
+          }
+        ],
+        "error": null
+      },
+      "emotion": {
+        "label": "angry",
+        "raw_label": "angry",
+        "recognized_label": "angry",
+        "score": null,
+        "reliable": true,
+        "fallback_reason": null,
+        "origin": "model",
+        "status": "success"
+      },
+      "routing": {
+        "status": "success",
+        "planned_engine": "indextts2",
+        "rule_code": "zh_en_strong_emotion",
+        "rule_version": "scheme3_snapshot_20261008_mock",
+        "inputs": {
+          "target_language": "zh",
+          "emotion": "angry",
+          "tts_complexity": {
+            "language": "zh",
+            "cjk_chars": 10,
+            "words": 0,
+            "clause_count": 1,
+            "is_long": false,
+            "is_complex": false,
+            "is_long_or_complex": false
+          },
+          "thresholds": {
+            "zh_long_chars": 28,
+            "en_long_words": 20,
+            "complex_clause_count": 3
+          }
+        },
+        "reason": "目标语为中文；未命中长句/复杂句，路由采用情绪为 angry，选择情绪表达优先的 IndexTTS2。"
+      },
+      "tts": {
+        "status": "success",
+        "planned_text": "我们还有最后一次机会。",
+        "synthesized_text": "我们还有最后一次机会。",
+        "planned_engine": "indextts2",
+        "actual_engine": "f5tts",
+        "fallback_count": 1,
+        "fallback_reason": "模拟原引擎时长门禁失败",
+        "target_duration": 4.0,
+        "actual_duration": null,
+        "duration_error": null,
+        "duration_quality": "mock_unmeasured",
+        "inference_seconds": null,
+        "rtf": null,
+        "audio_artifact_id": "seg_0001_tts_r2_a1",
+        "error": null
+      },
+      "tts_trials": [],
+      "history": [],
+      "light_tts_status": "success"
+    },
+    {
+      "segment_id": "seg_0002",
+      "parent_segment_id": null,
+      "revision": 4,
+      "start": 5.0,
+      "end": 9.0,
+      "speaker": "SPEAKER_01",
+      "source": {
+        "raw_asr_text": "I can here you.",
+        "ocr_corrected_text": "I can hear you.",
+        "effective_text": "I cannot hear you.",
+        "origin": "human",
+        "word_alignment_status": "stale",
+        "audio_artifact_id": null
+      },
+      "ocr": {
+        "available": true,
+        "evidence_artifact_id": null,
+        "guard_reason": "mock_fixture"
+      },
+      "translation": {
+        "text": "我听不见你。",
+        "status": "success",
+        "origin": "human",
+        "human_pinned": true,
+        "selected_candidate_id": null,
+        "candidates": [
+          {
+            "candidate_id": "seg_0002_human_r4_a3",
+            "text": "我听不见你。",
+            "light_tts_duration": null,
+            "duration_error": null,
+            "duration_source": "text_estimate",
+            "audio_artifact_id": "seg_0002_light_tts_r4_a3",
+            "stale": false
+          }
+        ],
+        "error": null
+      },
+      "emotion": {
+        "label": "neutral",
+        "raw_label": "neutral",
+        "recognized_label": "neutral",
+        "score": null,
+        "reliable": true,
+        "fallback_reason": null,
+        "origin": "model",
+        "status": "success"
+      },
+      "routing": {
+        "status": "success",
+        "planned_engine": "f5tts",
+        "rule_code": "neutral_short",
+        "rule_version": "scheme3_snapshot_20261008_mock",
+        "inputs": {
+          "target_language": "zh",
+          "emotion": "neutral",
+          "tts_complexity": {
+            "language": "zh",
+            "cjk_chars": 5,
+            "words": 0,
+            "clause_count": 1,
+            "is_long": false,
+            "is_complex": false,
+            "is_long_or_complex": false
+          },
+          "thresholds": {
+            "zh_long_chars": 28,
+            "en_long_words": 20,
+            "complex_clause_count": 3
+          }
+        },
+        "reason": "目标语为中文；未命中长句/复杂句，路由采用情绪为 neutral，普通短句优先速度，选择 F5-TTS。"
+      },
+      "tts": {
+        "status": "success",
+        "planned_text": "我听不见你。",
+        "synthesized_text": "我听不见你。",
+        "planned_engine": "f5tts",
+        "actual_engine": "f5tts",
+        "fallback_count": 0,
+        "fallback_reason": null,
+        "target_duration": 4.0,
+        "actual_duration": null,
+        "duration_error": null,
+        "duration_quality": "mock_unmeasured",
+        "inference_seconds": null,
+        "rtf": null,
+        "audio_artifact_id": "seg_0002_tts_r4_a2",
+        "error": null
+      },
+      "tts_trials": [],
+      "history": [
+        {
+          "revision": 1,
+          "source": {
+            "raw_asr_text": "I can here you.",
+            "ocr_corrected_text": "I can hear you.",
+            "effective_text": "I can hear you.",
+            "origin": "ocr",
+            "word_alignment_status": "valid",
+            "audio_artifact_id": null
+          },
+          "translation": {
+            "text": "",
+            "status": "pending",
+            "origin": "model",
+            "human_pinned": false,
+            "selected_candidate_id": null,
+            "candidates": [],
+            "error": null
+          },
+          "tts": {
+            "status": "pending",
+            "audio_artifact_id": null
+          },
+          "emotion": {
+            "label": "neutral",
+            "raw_label": "neutral",
+            "recognized_label": "neutral",
+            "score": null,
+            "reliable": true,
+            "fallback_reason": null,
+            "origin": "model",
+            "status": "pending"
+          },
+          "routing": {},
+          "reason": "工作台人工确认",
+          "timestamp": "2026-10-09T18:30:40+08:00"
+        },
+        {
+          "revision": 3,
+          "source": {
+            "raw_asr_text": "I can here you.",
+            "ocr_corrected_text": "I can hear you.",
+            "effective_text": "I cannot hear you.",
+            "origin": "human",
+            "word_alignment_status": "stale",
+            "audio_artifact_id": null
+          },
+          "translation": {
+            "text": "【模拟译文 · zh】I cannot hear you.",
+            "status": "success",
+            "origin": "model",
+            "human_pinned": false,
+            "selected_candidate_id": null,
+            "candidates": [
+              {
+                "candidate_id": "seg_0002_r3_a2_c1",
+                "text": "【模拟译文 · zh】I cannot hear you.",
+                "light_tts_duration": null,
+                "duration_error": null,
+                "duration_source": "text_estimate",
+                "audio_artifact_id": "seg_0002_light_tts_r3_a2",
+                "stale": false
+              }
+            ],
+            "error": null
+          },
+          "tts": {
+            "status": "stale",
+            "planned_text": "【模拟译文 · zh】I cannot hear you.",
+            "synthesized_text": "【模拟译文 · zh】I cannot hear you.",
+            "planned_engine": "f5tts",
+            "actual_engine": "f5tts",
+            "fallback_count": 0,
+            "fallback_reason": null,
+            "target_duration": 4.0,
+            "actual_duration": null,
+            "duration_error": null,
+            "duration_quality": "mock_unmeasured",
+            "inference_seconds": null,
+            "rtf": null,
+            "audio_artifact_id": "seg_0002_tts_r2_a1",
+            "error": null
+          },
+          "emotion": {
+            "label": "neutral",
+            "raw_label": "neutral",
+            "recognized_label": "neutral",
+            "score": null,
+            "reliable": true,
+            "fallback_reason": null,
+            "origin": "model",
+            "status": "success"
+          },
+          "routing": {
+            "status": "stale",
+            "planned_engine": "f5tts",
+            "rule_code": "neutral_short",
+            "rule_version": "scheme3_snapshot_20261008_mock",
+            "inputs": {
+              "target_language": "zh",
+              "emotion": "neutral",
+              "tts_complexity": {
+                "language": "zh",
+                "cjk_chars": 4,
+                "words": 5,
+                "clause_count": 1,
+                "is_long": false,
+                "is_complex": false,
+                "is_long_or_complex": false
+              },
+              "thresholds": {
+                "zh_long_chars": 28,
+                "en_long_words": 20,
+                "complex_clause_count": 3
+              }
+            },
+            "reason": "目标语为中文；未命中长句/复杂句，路由采用情绪为 neutral，普通短句优先速度，选择 F5-TTS。"
+          },
+          "reason": "工作台人工确认",
+          "timestamp": "2026-10-09T18:30:40+08:00"
+        },
+        {
+          "revision": 4,
+          "tts": {
+            "status": "stale",
+            "planned_text": "【模拟译文 · zh】I cannot hear you.",
+            "synthesized_text": "【模拟译文 · zh】I cannot hear you.",
+            "planned_engine": "f5tts",
+            "actual_engine": "f5tts",
+            "fallback_count": 0,
+            "fallback_reason": null,
+            "target_duration": 4.0,
+            "actual_duration": null,
+            "duration_error": null,
+            "duration_quality": "mock_unmeasured",
+            "inference_seconds": null,
+            "rtf": null,
+            "audio_artifact_id": "seg_0002_tts_r2_a1",
+            "error": null
+          },
+          "reason": "模拟 TTS 重做",
+          "timestamp": "2026-10-09T18:30:40+08:00"
+        }
+      ],
+      "light_tts_status": "success"
+    },
+    {
+      "segment_id": "seg_0003",
+      "parent_segment_id": null,
+      "revision": 2,
+      "start": 10.0,
+      "end": 14.0,
+      "speaker": "SPEAKER_00",
+      "source": {
+        "raw_asr_text": "Before the sun rises, we must cross the river, and bring everyone home safely.",
+        "ocr_corrected_text": "Before the sun rises, we must cross the river, and bring everyone home safely.",
+        "effective_text": "Before the sun rises, we must cross the river, and bring everyone home safely.",
+        "origin": "ocr",
+        "word_alignment_status": "valid",
+        "audio_artifact_id": null
+      },
+      "ocr": {
+        "available": true,
+        "evidence_artifact_id": null,
+        "guard_reason": "mock_fixture"
+      },
+      "translation": {
+        "text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+        "status": "success",
+        "origin": "model",
+        "human_pinned": false,
+        "selected_candidate_id": null,
+        "candidates": [
+          {
+            "candidate_id": "seg_0003_r2_a1_c1",
+            "text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+            "light_tts_duration": null,
+            "duration_error": null,
+            "duration_source": "text_estimate",
+            "audio_artifact_id": "seg_0003_light_tts_r2_a1",
+            "stale": false
+          }
+        ],
+        "error": null
+      },
+      "emotion": {
+        "label": "happy",
+        "raw_label": "happy",
+        "recognized_label": "happy",
+        "score": null,
+        "reliable": true,
+        "fallback_reason": null,
+        "origin": "model",
+        "status": "success"
+      },
+      "routing": {
+        "status": "success",
+        "planned_engine": "confucius4",
+        "rule_code": "long_or_complex",
+        "rule_version": "scheme3_snapshot_20261008_mock",
+        "inputs": {
+          "target_language": "zh",
+          "emotion": "happy",
+          "tts_complexity": {
+            "language": "zh",
+            "cjk_chars": 33,
+            "words": 0,
+            "clause_count": 3,
+            "is_long": true,
+            "is_complex": true,
+            "is_long_or_complex": true
+          },
+          "thresholds": {
+            "zh_long_chars": 28,
+            "en_long_words": 20,
+            "complex_clause_count": 3
+          }
+        },
+        "reason": "目标语为中文；译文含 33 个汉字，达到长句阈值 28；分句数 3，达到复杂句阈值 3；长句/复杂句规则优先于情绪（happy），选择 Confucius4。"
+      },
+      "tts": {
+        "status": "success",
+        "planned_text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+        "synthesized_text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+        "planned_engine": "confucius4",
+        "actual_engine": "confucius4",
+        "fallback_count": 0,
+        "fallback_reason": null,
+        "target_duration": 4.0,
+        "actual_duration": null,
+        "duration_error": null,
+        "duration_quality": "mock_unmeasured",
+        "inference_seconds": null,
+        "rtf": null,
+        "audio_artifact_id": "seg_0003_tts_r2_a1",
+        "error": null
+      },
+      "tts_trials": [],
+      "history": [],
+      "light_tts_status": "success"
+    }
+  ],
+  "event_page": {
+    "items": [
+      {
+        "sequence": 1,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": null,
+        "revision": 1,
+        "stage": null,
+        "segment_id": null,
+        "type": "job.created",
+        "level": "info",
+        "message": "[模拟] 已创建隔离任务；上传内容仅作预览，执行使用内置模拟样例。",
+        "data": {}
+      },
+      {
+        "sequence": 2,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "separation",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从音频分离开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 3,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "separation",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 音频分离运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "Demucs htdemucs two-stems",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 4,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "separation",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 音频分离模拟完成。",
+        "data": {
+          "model": "Demucs htdemucs two-stems",
+          "attempt": 1,
+          "progress": null
+        }
+      },
+      {
+        "sequence": 5,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "asr",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 语音识别运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "Qwen3-ASR",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 6,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "asr",
+        "segment_id": "seg_0001",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0001 语音识别模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 7,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "asr",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 语音识别模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 8,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "asr",
+        "segment_id": "seg_0003",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0003 语音识别模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 9,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "asr",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 语音识别模拟完成。",
+        "data": {
+          "model": "Qwen3-ASR",
+          "attempt": 1,
+          "progress": null
+        }
+      },
+      {
+        "sequence": 10,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "ocr",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] OCR 核对运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "HunyuanOCR / frozen_b",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 11,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "ocr",
+        "segment_id": "seg_0001",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0001 OCR 核对模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 12,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "ocr",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 OCR 核对模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 13,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "ocr",
+        "segment_id": "seg_0003",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0003 OCR 核对模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 14,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "ocr",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] OCR 核对模拟完成。",
+        "data": {
+          "model": "HunyuanOCR / frozen_b",
+          "attempt": 1,
+          "progress": null
+        }
+      },
+      {
+        "sequence": 15,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "ocr",
+        "segment_id": null,
+        "type": "stage.review_required",
+        "level": "info",
+        "message": "[模拟] 等待人工确认，可编辑后继续。",
+        "data": {}
+      },
+      {
+        "sequence": 16,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_480100473fe9",
+        "revision": 1,
+        "stage": "ocr",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      },
+      {
+        "sequence": 17,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": null,
+        "revision": 2,
+        "stage": "diarization",
+        "segment_id": null,
+        "type": "results.invalidated",
+        "level": "info",
+        "message": "[模拟] 后续处理起点：说话人；未生成的步骤保持未开始",
+        "data": {
+          "invalidated": [],
+          "affected": [
+            {
+              "stage": "diarization",
+              "segment_ids": [
+                "seg_0001",
+                "seg_0002",
+                "seg_0003"
+              ]
+            },
+            {
+              "stage": "emotion",
+              "segment_ids": [
+                "seg_0001",
+                "seg_0002",
+                "seg_0003"
+              ]
+            },
+            {
+              "stage": "translation",
+              "segment_ids": [
+                "seg_0001",
+                "seg_0002",
+                "seg_0003"
+              ]
+            },
+            {
+              "stage": "light_tts",
+              "segment_ids": [
+                "seg_0001",
+                "seg_0002",
+                "seg_0003"
+              ]
+            },
+            {
+              "stage": "routing",
+              "segment_ids": [
+                "seg_0001",
+                "seg_0002",
+                "seg_0003"
+              ]
+            },
+            {
+              "stage": "tts",
+              "segment_ids": [
+                "seg_0001",
+                "seg_0002",
+                "seg_0003"
+              ]
+            },
+            {
+              "stage": "mixing",
+              "scope": "job"
+            }
+          ]
+        }
+      },
+      {
+        "sequence": 18,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": null,
+        "revision": 2,
+        "stage": "diarization",
+        "segment_id": "seg_0002",
+        "type": "edit.applied",
+        "level": "info",
+        "message": "[模拟] seg_0002 已保存source_text；人工译文锁定会在返工时保留。",
+        "data": {
+          "field": "source_text",
+          "value": "I cannot hear you."
+        }
+      },
+      {
+        "sequence": 19,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "diarization",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从说话人开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 20,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "diarization",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 说话人运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "mock",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 21,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "diarization",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 说话人模拟完成。",
+        "data": {
+          "model": "mock",
+          "attempt": 1,
+          "progress": null
+        }
+      },
+      {
+        "sequence": 22,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "emotion",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 情绪运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "emotion2vec_plus_base",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 23,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "emotion",
+        "segment_id": "seg_0001",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0001 情绪模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 24,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "emotion",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 情绪模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 25,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "emotion",
+        "segment_id": "seg_0003",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0003 情绪模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 26,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "emotion",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 情绪模拟完成。",
+        "data": {
+          "model": "emotion2vec_plus_base",
+          "attempt": 1,
+          "progress": null
+        }
+      },
+      {
+        "sequence": 27,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "emotion",
+        "segment_id": null,
+        "type": "stage.review_required",
+        "level": "info",
+        "message": "[模拟] 等待人工确认，可编辑后继续。",
+        "data": {}
+      },
+      {
+        "sequence": 28,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_8043211e4051",
+        "revision": 2,
+        "stage": "emotion",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      },
+      {
+        "sequence": 29,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "translation",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从翻译开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 30,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "translation",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 翻译运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "mock",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 31,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "translation",
+        "segment_id": "seg_0001",
+        "type": "log.output",
+        "level": "info",
+        "message": "[模拟] seg_0001 使用有效源文：We have one last chance.；人工译文锁定=False",
+        "data": {}
+      },
+      {
+        "sequence": 32,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "translation",
+        "segment_id": "seg_0001",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0001 翻译模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 33,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "translation",
+        "segment_id": "seg_0002",
+        "type": "log.output",
+        "level": "info",
+        "message": "[模拟] seg_0002 使用有效源文：I cannot hear you.；人工译文锁定=False",
+        "data": {}
+      },
+      {
+        "sequence": 34,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "translation",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 翻译模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 35,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "translation",
+        "segment_id": "seg_0003",
+        "type": "log.output",
+        "level": "info",
+        "message": "[模拟] seg_0003 使用有效源文：Before the sun rises, we must cross the river, and bring everyone home safely.；人工译文锁定=False",
+        "data": {}
+      },
+      {
+        "sequence": 36,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "translation",
+        "segment_id": "seg_0003",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0003 翻译模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 37,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "translation",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 翻译模拟完成。",
+        "data": {
+          "model": "mock",
+          "attempt": 1,
+          "progress": {
+            "completed": 3,
+            "total": 3,
+            "ratio": 1.0
+          }
+        }
+      },
+      {
+        "sequence": 38,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 轻量 TTS运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "mock",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 39,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": "seg_0001",
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 light_tts_placeholder 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "seg_0001_light_tts_r2_a1",
+          "kind": "light_tts_placeholder",
+          "segment_id": "seg_0001",
+          "stage": "light_tts",
+          "url": null,
+          "revision": 2,
+          "stale": false,
+          "mock": true,
+          "text": "我们还有最后一次机会。",
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 40,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": "seg_0001",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0001 轻量 TTS模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 41,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": "seg_0002",
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 light_tts_placeholder 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "seg_0002_light_tts_r2_a1",
+          "kind": "light_tts_placeholder",
+          "segment_id": "seg_0002",
+          "stage": "light_tts",
+          "url": null,
+          "revision": 2,
+          "stale": false,
+          "mock": true,
+          "text": "【模拟译文 · zh】I cannot hear you.",
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 42,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 轻量 TTS模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 43,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": "seg_0003",
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 light_tts_placeholder 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "seg_0003_light_tts_r2_a1",
+          "kind": "light_tts_placeholder",
+          "segment_id": "seg_0003",
+          "stage": "light_tts",
+          "url": null,
+          "revision": 2,
+          "stale": false,
+          "mock": true,
+          "text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 44,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": "seg_0003",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0003 轻量 TTS模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 45,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 轻量 TTS模拟完成。",
+        "data": {
+          "model": "mock",
+          "attempt": 1,
+          "progress": {
+            "completed": 3,
+            "total": 3,
+            "ratio": 1.0
+          }
+        }
+      },
+      {
+        "sequence": 46,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "stage.review_required",
+        "level": "info",
+        "message": "[模拟] 等待人工确认，可编辑后继续。",
+        "data": {}
+      },
+      {
+        "sequence": 47,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_5efa95793b23",
+        "revision": 2,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      },
+      {
+        "sequence": 48,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从模型路由开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 49,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 模型路由运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "Scheme3 router",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 50,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": "seg_0001",
+        "type": "routing.decided",
+        "level": "info",
+        "message": "[模拟] seg_0001 计划 indextts2；zh_en_strong_emotion。",
+        "data": {
+          "status": "success",
+          "planned_engine": "indextts2",
+          "rule_code": "zh_en_strong_emotion",
+          "rule_version": "scheme3_snapshot_20261008_mock",
+          "inputs": {
+            "target_language": "zh",
+            "emotion": "angry",
+            "tts_complexity": {
+              "language": "zh",
+              "cjk_chars": 10,
+              "words": 0,
+              "clause_count": 1,
+              "is_long": false,
+              "is_complex": false,
+              "is_long_or_complex": false
+            },
+            "thresholds": {
+              "zh_long_chars": 28,
+              "en_long_words": 20,
+              "complex_clause_count": 3
+            }
+          },
+          "reason": "目标语为中文；未命中长句/复杂句，路由采用情绪为 angry，选择情绪表达优先的 IndexTTS2。"
+        }
+      },
+      {
+        "sequence": 51,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": "seg_0001",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0001 模型路由模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 52,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": "seg_0002",
+        "type": "routing.decided",
+        "level": "info",
+        "message": "[模拟] seg_0002 计划 f5tts；neutral_short。",
+        "data": {
+          "status": "success",
+          "planned_engine": "f5tts",
+          "rule_code": "neutral_short",
+          "rule_version": "scheme3_snapshot_20261008_mock",
+          "inputs": {
+            "target_language": "zh",
+            "emotion": "neutral",
+            "tts_complexity": {
+              "language": "zh",
+              "cjk_chars": 4,
+              "words": 5,
+              "clause_count": 1,
+              "is_long": false,
+              "is_complex": false,
+              "is_long_or_complex": false
+            },
+            "thresholds": {
+              "zh_long_chars": 28,
+              "en_long_words": 20,
+              "complex_clause_count": 3
+            }
+          },
+          "reason": "目标语为中文；未命中长句/复杂句，路由采用情绪为 neutral，普通短句优先速度，选择 F5-TTS。"
+        }
+      },
+      {
+        "sequence": 53,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 模型路由模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 54,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": "seg_0003",
+        "type": "routing.decided",
+        "level": "info",
+        "message": "[模拟] seg_0003 计划 confucius4；long_or_complex。",
+        "data": {
+          "status": "success",
+          "planned_engine": "confucius4",
+          "rule_code": "long_or_complex",
+          "rule_version": "scheme3_snapshot_20261008_mock",
+          "inputs": {
+            "target_language": "zh",
+            "emotion": "happy",
+            "tts_complexity": {
+              "language": "zh",
+              "cjk_chars": 33,
+              "words": 0,
+              "clause_count": 3,
+              "is_long": true,
+              "is_complex": true,
+              "is_long_or_complex": true
+            },
+            "thresholds": {
+              "zh_long_chars": 28,
+              "en_long_words": 20,
+              "complex_clause_count": 3
+            }
+          },
+          "reason": "目标语为中文；译文含 33 个汉字，达到长句阈值 28；分句数 3，达到复杂句阈值 3；长句/复杂句规则优先于情绪（happy），选择 Confucius4。"
+        }
+      },
+      {
+        "sequence": 55,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": "seg_0003",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0003 模型路由模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 56,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 模型路由模拟完成。",
+        "data": {
+          "model": "Scheme3 router",
+          "attempt": 1,
+          "progress": {
+            "completed": 3,
+            "total": 3,
+            "ratio": 1.0
+          }
+        }
+      },
+      {
+        "sequence": 57,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "stage.review_required",
+        "level": "info",
+        "message": "[模拟] 等待人工确认，可编辑后继续。",
+        "data": {}
+      },
+      {
+        "sequence": 58,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_b2be887169d7",
+        "revision": 2,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      },
+      {
+        "sequence": 59,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从正式 TTS开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 60,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 正式 TTS运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "Scheme3",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 61,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": "seg_0001",
+        "type": "tts.fallback",
+        "level": "info",
+        "message": "[模拟] seg_0001 模拟 indextts2 → f5tts；模拟门禁失败。",
+        "data": {
+          "status": "success",
+          "planned_text": "我们还有最后一次机会。",
+          "synthesized_text": "我们还有最后一次机会。",
+          "planned_engine": "indextts2",
+          "actual_engine": "f5tts",
+          "fallback_count": 1,
+          "fallback_reason": "模拟原引擎时长门禁失败",
+          "target_duration": 4.0,
+          "actual_duration": null,
+          "duration_error": null,
+          "duration_quality": "mock_unmeasured",
+          "inference_seconds": null,
+          "rtf": null,
+          "audio_artifact_id": "seg_0001_tts_r2_a1",
+          "error": null
+        }
+      },
+      {
+        "sequence": 62,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": "seg_0001",
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 tts_placeholder 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "seg_0001_tts_r2_a1",
+          "kind": "tts_placeholder",
+          "segment_id": "seg_0001",
+          "stage": "tts",
+          "url": null,
+          "revision": 2,
+          "stale": false,
+          "mock": true,
+          "text": "我们还有最后一次机会。",
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 63,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": "seg_0001",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0001 正式 TTS模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 64,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": "seg_0002",
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 tts_placeholder 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "seg_0002_tts_r2_a1",
+          "kind": "tts_placeholder",
+          "segment_id": "seg_0002",
+          "stage": "tts",
+          "url": null,
+          "revision": 2,
+          "stale": false,
+          "mock": true,
+          "text": "【模拟译文 · zh】I cannot hear you.",
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 65,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 正式 TTS模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 66,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": "seg_0003",
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 tts_placeholder 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "seg_0003_tts_r2_a1",
+          "kind": "tts_placeholder",
+          "segment_id": "seg_0003",
+          "stage": "tts",
+          "url": null,
+          "revision": 2,
+          "stale": false,
+          "mock": true,
+          "text": "在太阳升起之前，我们必须穿过这条危险的河流，并把每一个人都安全地带回家。",
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 67,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": "seg_0003",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0003 正式 TTS模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 68,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 正式 TTS模拟完成。",
+        "data": {
+          "model": "Scheme3",
+          "attempt": 1,
+          "progress": {
+            "completed": 3,
+            "total": 3,
+            "ratio": 1.0
+          }
+        }
+      },
+      {
+        "sequence": 69,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "stage.review_required",
+        "level": "info",
+        "message": "[模拟] 等待人工确认，可编辑后继续。",
+        "data": {}
+      },
+      {
+        "sequence": 70,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_12b8103df661",
+        "revision": 2,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      },
+      {
+        "sequence": 71,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": null,
+        "revision": 3,
+        "stage": "translation",
+        "segment_id": null,
+        "type": "results.invalidated",
+        "level": "info",
+        "message": "[模拟] 后续处理起点：翻译；已有旧结果待更新：翻译、轻量 TTS、模型路由、正式 TTS",
+        "data": {
+          "invalidated": [
+            {
+              "stage": "translation",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "light_tts",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "routing",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "tts",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            }
+          ],
+          "affected": [
+            {
+              "stage": "translation",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "light_tts",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "routing",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "tts",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "mixing",
+              "scope": "job"
+            }
+          ]
+        }
+      },
+      {
+        "sequence": 72,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": null,
+        "revision": 3,
+        "stage": "translation",
+        "segment_id": null,
+        "type": "rework.requested",
+        "level": "info",
+        "message": "[模拟] 回到翻译，范围：seg_0002；保留人工锁定。",
+        "data": {
+          "segment_ids": [
+            "seg_0002"
+          ],
+          "force": true
+        }
+      },
+      {
+        "sequence": 73,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "translation",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从翻译开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 74,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "translation",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 翻译运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "mock",
+          "attempt": 2
+        }
+      },
+      {
+        "sequence": 75,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "translation",
+        "segment_id": "seg_0002",
+        "type": "log.output",
+        "level": "info",
+        "message": "[模拟] seg_0002 使用有效源文：I cannot hear you.；人工译文锁定=False",
+        "data": {}
+      },
+      {
+        "sequence": 76,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "translation",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 翻译模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 77,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "translation",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 翻译模拟完成。",
+        "data": {
+          "model": "mock",
+          "attempt": 2,
+          "progress": {
+            "completed": 1,
+            "total": 1,
+            "ratio": 1.0
+          }
+        }
+      },
+      {
+        "sequence": 78,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 轻量 TTS运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "mock",
+          "attempt": 2
+        }
+      },
+      {
+        "sequence": 79,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "light_tts",
+        "segment_id": "seg_0002",
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 light_tts_placeholder 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "seg_0002_light_tts_r3_a2",
+          "kind": "light_tts_placeholder",
+          "segment_id": "seg_0002",
+          "stage": "light_tts",
+          "url": null,
+          "revision": 3,
+          "stale": false,
+          "mock": true,
+          "text": "【模拟译文 · zh】I cannot hear you.",
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 80,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "light_tts",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 轻量 TTS模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 81,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 轻量 TTS模拟完成。",
+        "data": {
+          "model": "mock",
+          "attempt": 2,
+          "progress": {
+            "completed": 1,
+            "total": 1,
+            "ratio": 1.0
+          }
+        }
+      },
+      {
+        "sequence": 82,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "stage.review_required",
+        "level": "info",
+        "message": "[模拟] 等待人工确认，可编辑后继续。",
+        "data": {}
+      },
+      {
+        "sequence": 83,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_00a1fb261015",
+        "revision": 3,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      },
+      {
+        "sequence": 84,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": null,
+        "revision": 4,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "results.invalidated",
+        "level": "info",
+        "message": "[模拟] 后续处理起点：轻量 TTS；已有旧结果待更新：轻量 TTS、模型路由、正式 TTS",
+        "data": {
+          "invalidated": [
+            {
+              "stage": "light_tts",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "routing",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "tts",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            }
+          ],
+          "affected": [
+            {
+              "stage": "light_tts",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "routing",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "tts",
+              "segment_ids": [
+                "seg_0002"
+              ]
+            },
+            {
+              "stage": "mixing",
+              "scope": "job"
+            }
+          ]
+        }
+      },
+      {
+        "sequence": 85,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": null,
+        "revision": 4,
+        "stage": "light_tts",
+        "segment_id": "seg_0002",
+        "type": "edit.applied",
+        "level": "info",
+        "message": "[模拟] seg_0002 已保存translation_text；人工译文锁定会在返工时保留。",
+        "data": {
+          "field": "translation_text",
+          "value": "我听不见你。"
+        }
+      },
+      {
+        "sequence": 86,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_db54a065da58",
+        "revision": 4,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从轻量 TTS开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 87,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_db54a065da58",
+        "revision": 4,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 轻量 TTS运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "mock",
+          "attempt": 3
+        }
+      },
+      {
+        "sequence": 88,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_db54a065da58",
+        "revision": 4,
+        "stage": "light_tts",
+        "segment_id": "seg_0002",
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 light_tts_placeholder 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "seg_0002_light_tts_r4_a3",
+          "kind": "light_tts_placeholder",
+          "segment_id": "seg_0002",
+          "stage": "light_tts",
+          "url": null,
+          "revision": 4,
+          "stale": false,
+          "mock": true,
+          "text": "我听不见你。",
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 89,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_db54a065da58",
+        "revision": 4,
+        "stage": "light_tts",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 轻量 TTS模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 90,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_db54a065da58",
+        "revision": 4,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 轻量 TTS模拟完成。",
+        "data": {
+          "model": "mock",
+          "attempt": 3,
+          "progress": {
+            "completed": 1,
+            "total": 1,
+            "ratio": 1.0
+          }
+        }
+      },
+      {
+        "sequence": 91,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_db54a065da58",
+        "revision": 4,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "stage.review_required",
+        "level": "info",
+        "message": "[模拟] 等待人工确认，可编辑后继续。",
+        "data": {}
+      },
+      {
+        "sequence": 92,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_db54a065da58",
+        "revision": 4,
+        "stage": "light_tts",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      },
+      {
+        "sequence": 93,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_24d6a44929dd",
+        "revision": 4,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从模型路由开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 94,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_24d6a44929dd",
+        "revision": 4,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 模型路由运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "Scheme3 router",
+          "attempt": 2
+        }
+      },
+      {
+        "sequence": 95,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_24d6a44929dd",
+        "revision": 4,
+        "stage": "routing",
+        "segment_id": "seg_0002",
+        "type": "routing.decided",
+        "level": "info",
+        "message": "[模拟] seg_0002 计划 f5tts；neutral_short。",
+        "data": {
+          "status": "success",
+          "planned_engine": "f5tts",
+          "rule_code": "neutral_short",
+          "rule_version": "scheme3_snapshot_20261008_mock",
+          "inputs": {
+            "target_language": "zh",
+            "emotion": "neutral",
+            "tts_complexity": {
+              "language": "zh",
+              "cjk_chars": 5,
+              "words": 0,
+              "clause_count": 1,
+              "is_long": false,
+              "is_complex": false,
+              "is_long_or_complex": false
+            },
+            "thresholds": {
+              "zh_long_chars": 28,
+              "en_long_words": 20,
+              "complex_clause_count": 3
+            }
+          },
+          "reason": "目标语为中文；未命中长句/复杂句，路由采用情绪为 neutral，普通短句优先速度，选择 F5-TTS。"
+        }
+      },
+      {
+        "sequence": 96,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_24d6a44929dd",
+        "revision": 4,
+        "stage": "routing",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 模型路由模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 97,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_24d6a44929dd",
+        "revision": 4,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 模型路由模拟完成。",
+        "data": {
+          "model": "Scheme3 router",
+          "attempt": 2,
+          "progress": {
+            "completed": 1,
+            "total": 1,
+            "ratio": 1.0
+          }
+        }
+      },
+      {
+        "sequence": 98,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_24d6a44929dd",
+        "revision": 4,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "stage.review_required",
+        "level": "info",
+        "message": "[模拟] 等待人工确认，可编辑后继续。",
+        "data": {}
+      },
+      {
+        "sequence": 99,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_24d6a44929dd",
+        "revision": 4,
+        "stage": "routing",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      },
+      {
+        "sequence": 100,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_7e424c411c1e",
+        "revision": 4,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从正式 TTS开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 101,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_7e424c411c1e",
+        "revision": 4,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 正式 TTS运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "Scheme3",
+          "attempt": 2
+        }
+      },
+      {
+        "sequence": 102,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_7e424c411c1e",
+        "revision": 4,
+        "stage": "tts",
+        "segment_id": "seg_0002",
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 tts_placeholder 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "seg_0002_tts_r4_a2",
+          "kind": "tts_placeholder",
+          "segment_id": "seg_0002",
+          "stage": "tts",
+          "url": null,
+          "revision": 4,
+          "stale": false,
+          "mock": true,
+          "text": "我听不见你。",
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 103,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_7e424c411c1e",
+        "revision": 4,
+        "stage": "tts",
+        "segment_id": "seg_0002",
+        "type": "segment.updated",
+        "level": "info",
+        "message": "[模拟] seg_0002 正式 TTS模拟结果已更新。",
+        "data": {}
+      },
+      {
+        "sequence": 104,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_7e424c411c1e",
+        "revision": 4,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 正式 TTS模拟完成。",
+        "data": {
+          "model": "Scheme3",
+          "attempt": 2,
+          "progress": {
+            "completed": 1,
+            "total": 1,
+            "ratio": 1.0
+          }
+        }
+      },
+      {
+        "sequence": 105,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_7e424c411c1e",
+        "revision": 4,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "stage.review_required",
+        "level": "info",
+        "message": "[模拟] 等待人工确认，可编辑后继续。",
+        "data": {}
+      },
+      {
+        "sequence": 106,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_7e424c411c1e",
+        "revision": 4,
+        "stage": "tts",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      },
+      {
+        "sequence": 107,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_61d60e0c4843",
+        "revision": 4,
+        "stage": "mixing",
+        "segment_id": null,
+        "type": "operation.started",
+        "level": "info",
+        "message": "[模拟] 从混音合成开始模拟执行。",
+        "data": {}
+      },
+      {
+        "sequence": 108,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_61d60e0c4843",
+        "revision": 4,
+        "stage": "mixing",
+        "segment_id": null,
+        "type": "stage.started",
+        "level": "info",
+        "message": "[模拟] 混音合成运行中；模型字段仅表示模拟调用计划。",
+        "data": {
+          "model": "mock",
+          "attempt": 1
+        }
+      },
+      {
+        "sequence": 109,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_61d60e0c4843",
+        "revision": 4,
+        "stage": "mixing",
+        "segment_id": null,
+        "type": "artifact.created",
+        "level": "info",
+        "message": "[模拟] 已生成 final_video 占位记录，无真实媒体。",
+        "data": {
+          "artifact_id": "job_mixing_r4_a1",
+          "kind": "final_video",
+          "segment_id": null,
+          "stage": "mixing",
+          "url": null,
+          "revision": 4,
+          "stale": false,
+          "mock": true,
+          "text": null,
+          "placeholder_reason": "模拟结果，无真实媒体"
+        }
+      },
+      {
+        "sequence": 110,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_61d60e0c4843",
+        "revision": 4,
+        "stage": "mixing",
+        "segment_id": null,
+        "type": "stage.completed",
+        "level": "info",
+        "message": "[模拟] 混音合成模拟完成。",
+        "data": {
+          "model": "mock",
+          "attempt": 1,
+          "progress": null
+        }
+      },
+      {
+        "sequence": 111,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_61d60e0c4843",
+        "revision": 4,
+        "stage": "mixing",
+        "segment_id": null,
+        "type": "job.completed",
+        "level": "info",
+        "message": "[模拟] 模拟闭环完成；成品为占位记录，无视频输出。",
+        "data": {}
+      },
+      {
+        "sequence": 112,
+        "timestamp": "2026-10-09T18:30:40+08:00",
+        "job_id": "job_efe8b1528baa",
+        "operation_id": "op_61d60e0c4843",
+        "revision": 4,
+        "stage": "mixing",
+        "segment_id": null,
+        "type": "operation.finished",
+        "level": "info",
+        "message": "[模拟] 模拟操作结束。",
+        "data": {
+          "status": "succeeded"
+        }
+      }
+    ],
+    "next_sequence": 112,
+    "has_more": false
+  },
+  "last_operation": {
+    "operation_id": "op_61d60e0c4843",
+    "job_id": "job_efe8b1528baa",
+    "revision": 4,
+    "status": "succeeded",
+    "from_stage": "mixing",
+    "current_stage": "mixing",
+    "affected_segment_ids": [
+      "seg_0001",
+      "seg_0002",
+      "seg_0003"
+    ],
+    "pause_boundary": null,
+    "failure": null,
+    "result_revision": 4
+  }
+}
