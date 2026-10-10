@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Step 2 WeSpeaker 桥接脚本 v2.2
-内嵌自适应聚类 + Qwen3 时间戳拆段 + 碎片合并 + 相邻合并
+Step 2 WeSpeaker bridge.
+
+Speech activity is detected from the complete vocal stem, independently of
+ASR coverage. Qwen3 word gaps provide candidate boundaries, WeSpeaker verifies
+local acoustic changes, and constrained turn clustering protects rare voices
+without requiring a user-supplied speaker count.
 """
 
 import json
@@ -34,6 +38,35 @@ WORK_DIR = os.path.join(TEMP_DIR, "wespeaker_diar")
 WESPEAKER_EXAMPLE_DIR = os.path.join(WESPEAKER_ROOT, "wespeaker", "examples", "voxconverse", "v2")
 
 
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+SAD_MIN_SILENCE_MS = _env_int("AUTODUB_DIAR_SAD_MIN_SILENCE_MS", 350)
+SAD_KEEP_MS = _env_int("AUTODUB_DIAR_SAD_KEEP_MS", 180)
+SAD_MERGE_GAP_MS = _env_int("AUTODUB_DIAR_SAD_MERGE_GAP_MS", 450)
+SAD_MIN_REGION_MS = _env_int("AUTODUB_DIAR_SAD_MIN_REGION_MS", 300)
+SAD_DB_OFFSET = _env_float("AUTODUB_DIAR_SAD_DB_OFFSET", 18.0)
+SAD_FLOOR_DBFS = _env_float("AUTODUB_DIAR_SAD_FLOOR_DBFS", -50.0)
+BOUNDARY_CONTEXT_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_CONTEXT_SECONDS", 2.3)
+BOUNDARY_GUARD_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_GUARD_SECONDS", 0.3)
+BOUNDARY_MIN_TURN_SECONDS = _env_float("AUTODUB_DIAR_MIN_TURN_SECONDS", 0.8)
+BOUNDARY_NMS_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_NMS_SECONDS", 1.15)
+BOUNDARY_SCORE_OVERRIDE = os.getenv("AUTODUB_DIAR_BOUNDARY_SCORE")
+STRONG_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_STRONG_SIMILARITY", 0.52)
+WEAK_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_WEAK_SIMILARITY", 0.36)
+
+
 def load_state():
     with open(os.path.join(TEMP_DIR, "project_state.json"), "r", encoding="utf-8") as f:
         return json.load(f)
@@ -58,6 +91,85 @@ def run_cmd(cmd, env=None, cwd=None, stdout_file=None):
         subprocess.run(cmd, env=full_env, cwd=cwd, check=True)
 
 
+def _merge_time_ranges(ranges, *, max_gap_ms):
+    merged = []
+    for start, end in sorted(ranges):
+        if end <= start:
+            continue
+        if merged and start - merged[-1][1] <= max_gap_ms:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def detect_speech_regions(vocal_path):
+    """Detect speech-bearing regions independently from the ASR transcript.
+
+    These ranges are only an SAD mask for speaker embeddings.  They are not
+    sentence boundaries, so merging a short pause cannot merge speaker labels.
+    """
+    try:
+        import soundfile as sf
+
+        if np is None:
+            raise RuntimeError("numpy 不可用")
+        samples, sample_rate = sf.read(vocal_path, dtype="float32")
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1)
+        if len(samples) <= 0 or sample_rate <= 0:
+            return []
+
+        frame_samples = max(1, round(sample_rate * 0.030))
+        hop_samples = max(1, round(sample_rate * 0.010))
+        starts = np.arange(0, len(samples), hop_samples, dtype=int)
+        rms = np.asarray([
+            math.sqrt(float(np.mean(np.square(samples[start:start + frame_samples]))) + 1e-12)
+            for start in starts
+        ])
+        frame_dbfs = 20.0 * np.log10(np.maximum(rms, 1e-12))
+        reference_rms = math.sqrt(float(np.mean(np.square(samples))) + 1e-12)
+        reference_dbfs = 20.0 * math.log10(max(reference_rms, 1e-12))
+        silence_thresh = max(SAD_FLOOR_DBFS, reference_dbfs - SAD_DB_OFFSET)
+        active = np.flatnonzero(frame_dbfs >= silence_thresh)
+        duration_ms = len(samples) / sample_rate * 1000.0
+        if len(active):
+            raw = []
+            run_start = int(active[0])
+            previous = run_start
+            max_inactive_frames = max(1, round(SAD_MIN_SILENCE_MS / 10.0))
+            for frame_index in map(int, active[1:]):
+                if frame_index - previous > max_inactive_frames:
+                    raw.append([run_start * 10, previous * 10 + 30])
+                    run_start = frame_index
+                previous = frame_index
+            raw.append([run_start * 10, previous * 10 + 30])
+        else:
+            raw = []
+        padded = [
+            [max(0, start - SAD_KEEP_MS), min(duration_ms, end + SAD_KEEP_MS)]
+            for start, end in raw
+        ]
+        merged = _merge_time_ranges(padded, max_gap_ms=SAD_MERGE_GAP_MS)
+        regions = [
+            (start / 1000.0, end / 1000.0)
+            for start, end in merged
+            if end - start >= SAD_MIN_REGION_MS
+        ]
+        if regions:
+            covered = sum(end - start for start, end in regions)
+            print(
+                f"✅ 独立语音活动检测: {len(regions)} 段, "
+                f"覆盖 {covered:.1f}s/{duration_ms / 1000.0:.1f}s, "
+                f"阈值 {silence_thresh:.1f} dBFS"
+            )
+            return regions
+        print("⚠️ 独立语音活动检测未找到有效区域，将使用完整人声音轨。")
+        return [(0.0, duration_ms / 1000.0)]
+    except Exception as exc:
+        raise RuntimeError(f"无法对人声音轨执行独立语音活动检测: {exc}") from exc
+
+
 def prepare_inputs(state):
     os.makedirs(WORK_DIR, exist_ok=True)
     for sub in ["fbank", "embedding", "labels"]:
@@ -74,18 +186,17 @@ def prepare_inputs(state):
     with open(os.path.join(WORK_DIR, "wav.scp"), "w", encoding="utf-8") as f:
         f.write(f"{utt_id} {os.path.abspath(vocal_path)}\n")
 
+    speech_regions = detect_speech_regions(vocal_path)
     with open(os.path.join(WORK_DIR, "oracle_sad"), "w", encoding="utf-8") as f:
-        for idx, seg in enumerate(state["segments_step1"]):
-            s, e = float(seg["start"]), float(seg["end"])
-            if e > s:
-                seg_id = f"{utt_id}-{int(s*1000):08d}-{int(e*1000):08d}"
-                f.write(f"{seg_id} {utt_id} {s:.3f} {e:.3f}\n")
+        for s, e in speech_regions:
+            seg_id = f"{utt_id}-{int(s*1000):08d}-{int(e*1000):08d}"
+            f.write(f"{seg_id} {utt_id} {s:.3f} {e:.3f}\n")
 
     print(f"✅ WeSpeaker 输入已生成: {WORK_DIR}")
     return utt_id
 
 
-def run_wespeaker_pipeline():
+def run_wespeaker_pipeline(segments_step1):
     env = {}
     pp = os.environ.get("PYTHONPATH", "")
     wespeaker_pkg = os.path.join(WESPEAKER_ROOT, "wespeaker")
@@ -116,8 +227,10 @@ def run_wespeaker_pipeline():
         "--subseg-cmn", "true",
     ], env=env, cwd=WESPEAKER_EXAMPLE_DIR)
 
-    print("\n=== [Step 2-W] 自适应 UMAP + HDBSCAN 聚类 ===")
-    run_adaptive_clustering()
+    print("\n=== [Step 2-W] 时序边界 + 稀有说话人保护聚类 ===")
+    if not run_temporal_constrained_clustering(segments_step1):
+        print("⚠️ 词级时间戳或边界证据不足，回退到 UMAP + HDBSCAN 聚类。")
+        run_adaptive_clustering()
 
     print("\n=== [Step 2-W] WeSpeaker: 生成 RTTM ===")
     rttm_path = os.path.join(WORK_DIR, "result.rttm")
@@ -128,6 +241,543 @@ def run_wespeaker_pipeline():
     ], env=env, cwd=WESPEAKER_EXAMPLE_DIR, stdout_file=rttm_path)
 
     return rttm_path
+
+
+def _normalized_rows(values):
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    return values / np.maximum(norms, 1e-12)
+
+
+def _unit_vector(value):
+    vector = np.asarray(value, dtype=np.float32).reshape(-1)
+    return vector / max(float(np.linalg.norm(vector)), 1e-12)
+
+
+def _embedding_window(key, value):
+    """Decode WeSpeaker's SAD/subsegment key into an absolute time window."""
+    match = re.match(r"^(.*)-(\d{8})-(\d{8})-(\d{8})-(\d{8})$", key)
+    if not match:
+        raise ValueError(f"无法解析 WeSpeaker embedding key: {key}")
+    region_start = int(match.group(2)) / 1000.0
+    region_end = int(match.group(3)) / 1000.0
+    start = region_start + int(match.group(4)) / 100.0
+    end = region_start + int(match.group(5)) / 100.0
+    return {
+        "key": key,
+        "region": (match.group(1), region_start, region_end),
+        "start": start,
+        "end": end,
+        "center": (start + end) / 2.0,
+        "embedding": _unit_vector(value),
+    }
+
+
+def _read_embedding_windows(emb_scp):
+    windows = []
+    with kaldiio.ReadHelper(f"scp:{emb_scp}") as reader:
+        for key, value in reader:
+            windows.append(_embedding_window(key, value))
+    windows.sort(key=lambda item: (item["center"], item["start"]))
+    return windows
+
+
+def _timestamp_items(segments):
+    """Collect valid timestamps and recover punctuation from the transcript."""
+    from speaker_alignment import normalize_timestamp_items
+
+    items = []
+    for segment_index, segment in enumerate(segments):
+        transcript = str(segment.get("text", ""))
+        raw_items = list(segment.get("qwen3_time_stamps") or [])
+        try:
+            chunk_start = float(segment.get("start", 0.0))
+            chunk_end = float(segment.get("end", chunk_start))
+        except (TypeError, ValueError):
+            continue
+        normalized, _ = normalize_timestamp_items(
+            raw_items,
+            transcript=transcript,
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+        )
+        for item in normalized:
+            items.append({
+                "start": float(item["start"]),
+                "end": float(item["end"]),
+                "text": str(item.get("text", "")),
+                "punctuation_after": str(item.get("punctuation_after", "none")),
+                "segment_index": segment_index,
+            })
+    items.sort(key=lambda item: (item["start"], item["end"]))
+    deduplicated = []
+    for item in items:
+        signature = (round(item["start"], 3), round(item["end"], 3), item["text"])
+        if deduplicated and signature == deduplicated[-1][0]:
+            continue
+        deduplicated.append((signature, item))
+    return [item for _, item in deduplicated]
+
+
+def _centroid_for_centers(windows, start, end):
+    values = [
+        item["embedding"]
+        for item in windows
+        if start <= item["center"] <= end
+    ]
+    if not values:
+        return None, 0
+    return _unit_vector(np.mean(np.stack(values), axis=0)), len(values)
+
+
+def _candidate_boundary_scores(segments, windows):
+    items = _timestamp_items(segments)
+    if len(items) < 2:
+        return []
+    candidates = []
+    for left, right in zip(items, items[1:]):
+        if right["start"] < left["start"]:
+            continue
+        boundary = (left["end"] + right["start"]) / 2.0
+        left_center, left_count = _centroid_for_centers(
+            windows,
+            boundary - BOUNDARY_CONTEXT_SECONDS,
+            boundary - BOUNDARY_GUARD_SECONDS,
+        )
+        right_center, right_count = _centroid_for_centers(
+            windows,
+            boundary + BOUNDARY_GUARD_SECONDS,
+            boundary + BOUNDARY_CONTEXT_SECONDS,
+        )
+        if left_center is None or right_center is None:
+            continue
+        similarity = float(left_center @ right_center)
+        candidates.append({
+            "time": boundary,
+            "score": 1.0 - similarity,
+            "similarity": similarity,
+            "gap": max(0.0, right["start"] - left["end"]),
+            "left_count": left_count,
+            "right_count": right_count,
+            "left_text": left["text"],
+            "right_text": right["text"],
+            "punctuation": left.get("punctuation_after", "none"),
+        })
+    return candidates
+
+
+def _adaptive_boundary_threshold(candidates):
+    if BOUNDARY_SCORE_OVERRIDE not in (None, ""):
+        try:
+            return float(BOUNDARY_SCORE_OVERRIDE)
+        except ValueError:
+            print(
+                f"⚠️ 忽略无效 AUTODUB_DIAR_BOUNDARY_SCORE="
+                f"{BOUNDARY_SCORE_OVERRIDE!r}"
+            )
+    values = np.asarray([item["score"] for item in candidates], dtype=float)
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    # Estimate ordinary within-speaker variation for one continuous SAD
+    # region.  Punctuation provides the structural evidence; this threshold
+    # only decides whether that textual boundary also has an acoustic change.
+    return min(0.52, max(0.42, median + max(0.04, 0.75 * mad)))
+
+
+def _boundary_location(regions, timestamp):
+    matches = [
+        region for region in regions
+        if region[1] + BOUNDARY_MIN_TURN_SECONDS
+        <= timestamp
+        <= region[2] - BOUNDARY_MIN_TURN_SECONDS
+    ]
+    if matches:
+        return {
+            "region": min(matches, key=lambda item: item[2] - item[1]),
+            "between_regions": None,
+        }
+    for left, right in zip(regions, regions[1:]):
+        if left[2] - 0.20 <= timestamp <= right[1] + 0.20:
+            return {"region": None, "between_regions": (left, right)}
+    return None
+
+
+def _select_change_boundaries(candidates, windows):
+    if not candidates:
+        return [], {}
+    regions = sorted(set(item["region"] for item in windows), key=lambda item: item[1])
+    located = []
+    for candidate in candidates:
+        location = _boundary_location(regions, candidate["time"])
+        if location is None:
+            continue
+        enriched = dict(candidate)
+        enriched.update(location)
+        located.append(enriched)
+
+    def location_key(item):
+        return item["region"] or ("between", *item["between_regions"])
+
+    grouped = defaultdict(list)
+    for candidate in located:
+        grouped[location_key(candidate)].append(candidate)
+    thresholds = {
+        key: _adaptive_boundary_threshold(group)
+        for key, group in grouped.items()
+    }
+
+    eligible = []
+    for candidate in located:
+        key = location_key(candidate)
+        threshold = thresholds[key]
+        punctuation = candidate.get("punctuation", "none")
+        if punctuation == "strong" and candidate["score"] >= threshold:
+            eligible.append(candidate)
+            continue
+
+        # Speaker changes without punctuation remain possible, but need a
+        # sustained pause, a much stronger acoustic peak, and no nearby
+        # punctuated explanation for the same peak.  This prevents cutting
+        # ordinary phrases such as "Wake up" or "by yourself".
+        strict_threshold = max(0.58, threshold + 0.12)
+        if candidate["gap"] < 0.25 or candidate["score"] < strict_threshold:
+            continue
+        punctuated_neighbor = any(
+            other.get("punctuation") == "strong"
+            and location_key(other) == key
+            and abs(other["time"] - candidate["time"]) <= 1.25
+            and other["score"] >= thresholds[key]
+            and other["score"] >= candidate["score"] - 0.10
+            for other in located
+        )
+        if not punctuated_neighbor:
+            eligible.append(candidate)
+
+    # Non-maximum suppression keeps one acoustic peak for one real change.
+    selected = []
+    for candidate in sorted(
+        eligible,
+        key=lambda item: (item.get("punctuation") == "strong", item["score"]),
+        reverse=True,
+    ):
+        key = location_key(candidate)
+        if any(
+            location_key(item) == key
+            and abs(item["time"] - candidate["time"])
+            < BOUNDARY_NMS_SECONDS
+            for item in selected
+        ):
+            continue
+        selected.append(candidate)
+    selected.sort(key=lambda item: item["time"])
+    return selected, thresholds
+
+
+def _build_acoustic_turns(windows, boundaries):
+    by_region = defaultdict(list)
+    for index, window in enumerate(windows):
+        by_region[window["region"]].append(index)
+    boundary_times = defaultdict(list)
+    for item in boundaries:
+        if item["region"] is not None:
+            boundary_times[item["region"]].append(float(item["time"]))
+
+    turns = []
+    cannot_links = set()
+    turns_by_region = {}
+    for region in sorted(by_region, key=lambda item: item[1]):
+        cuts = [region[1], *sorted(boundary_times.get(region, [])), region[2]]
+        region_turns = []
+        for interval_index, (start, end) in enumerate(zip(cuts, cuts[1:])):
+            is_last_interval = interval_index == len(cuts) - 2
+            indices = [
+                index for index in by_region[region]
+                if start <= windows[index]["center"]
+                and (
+                    windows[index]["center"] < end
+                    or (is_last_interval and windows[index]["center"] <= end)
+                )
+            ]
+            if not indices:
+                continue
+            duration = end - start
+            guard = min(BOUNDARY_GUARD_SECONDS, max(0.0, duration * 0.12))
+            interior = [
+                index for index in indices
+                if start + guard <= windows[index]["center"] <= end - guard
+            ]
+            source = interior or indices
+            embedding = _unit_vector(np.mean(np.stack([
+                windows[index]["embedding"] for index in source
+            ]), axis=0))
+            turn_index = len(turns)
+            turns.append({
+                "start": start,
+                "end": end,
+                "duration": duration,
+                "region": region,
+                "window_indices": indices,
+                "embedding": embedding,
+            })
+            region_turns.append(turn_index)
+        for left, right in zip(region_turns, region_turns[1:]):
+            cannot_links.add((min(left, right), max(left, right)))
+        turns_by_region[region] = region_turns
+    for item in boundaries:
+        if item["between_regions"] is None:
+            continue
+        left_region, right_region = item["between_regions"]
+        left_turns = turns_by_region.get(left_region) or []
+        right_turns = turns_by_region.get(right_region) or []
+        if left_turns and right_turns:
+            left = left_turns[-1]
+            right = right_turns[0]
+            cannot_links.add((min(left, right), max(left, right)))
+    return turns, cannot_links
+
+
+def _cluster_centroid(cluster, turns):
+    values = []
+    weights = []
+    for index in cluster:
+        values.append(turns[index]["embedding"])
+        weights.append(max(0.75, math.sqrt(max(turns[index]["duration"], 0.0))))
+    return _unit_vector(np.average(np.stack(values), axis=0, weights=weights))
+
+
+def _clusters_conflict(left, right, cannot_links):
+    return any(
+        (min(a, b), max(a, b)) in cannot_links
+        for a in left
+        for b in right
+    )
+
+
+def _merge_clusters(clusters, left_index, right_index):
+    merged = set(clusters[left_index]) | set(clusters[right_index])
+    return [
+        cluster for index, cluster in enumerate(clusters)
+        if index not in (left_index, right_index)
+    ] + [merged]
+
+
+def _constrained_turn_clusters(turns, cannot_links):
+    clusters = [{index} for index in range(len(turns))]
+
+    # First join only high-confidence identities in the original 256-D space.
+    while True:
+        centroids = [_cluster_centroid(cluster, turns) for cluster in clusters]
+        best = None
+        for left in range(len(clusters)):
+            for right in range(left + 1, len(clusters)):
+                if _clusters_conflict(clusters[left], clusters[right], cannot_links):
+                    continue
+                similarity = float(centroids[left] @ centroids[right])
+                if similarity < STRONG_SPEAKER_SIMILARITY:
+                    continue
+                if best is None or similarity > best[0]:
+                    best = (similarity, left, right)
+        if best is None:
+            break
+        clusters = _merge_clusters(clusters, best[1], best[2])
+
+    # Complete the partition as a constrained graph-colouring problem.  A
+    # strong acoustic change creates a hard edge.  Very dissimilar residual
+    # identities also create an edge.  DSATUR then uses the fewest identities
+    # it can without breaking those edges, so a speaker with only one short
+    # line is not discarded merely because it cannot form a density cluster.
+    centroids = [_cluster_centroid(cluster, turns) for cluster in clusters]
+    conflicts = [set() for _ in clusters]
+    for left in range(len(clusters)):
+        for right in range(left + 1, len(clusters)):
+            similarity = float(centroids[left] @ centroids[right])
+            if (
+                _clusters_conflict(clusters[left], clusters[right], cannot_links)
+                or similarity < WEAK_SPEAKER_SIMILARITY
+            ):
+                conflicts[left].add(right)
+                conflicts[right].add(left)
+
+    colors = {}
+    while len(colors) < len(clusters):
+        uncolored = [index for index in range(len(clusters)) if index not in colors]
+
+        def priority(index):
+            neighbor_colors = {colors[item] for item in conflicts[index] if item in colors}
+            duration = sum(turns[item]["duration"] for item in clusters[index])
+            return (len(neighbor_colors), len(conflicts[index]), duration)
+
+        node = max(uncolored, key=priority)
+        used = sorted(set(colors.values()))
+        available = [
+            color for color in used
+            if all(
+                other not in conflicts[node]
+                for other, other_color in colors.items()
+                if other_color == color
+            )
+        ]
+        if available:
+            def color_similarity(color):
+                members = [index for index, value in colors.items() if value == color]
+                return float(np.mean([
+                    centroids[node] @ centroids[index] for index in members
+                ]))
+
+            colors[node] = max(available, key=color_similarity)
+        else:
+            colors[node] = max(used, default=-1) + 1
+
+    grouped = defaultdict(set)
+    for node, color in colors.items():
+        grouped[color].update(clusters[node])
+    return list(grouped.values())
+
+
+def run_temporal_constrained_clustering(segments):
+    """Cluster speaker turns while preserving local acoustic change evidence."""
+    if not kaldiio or np is None:
+        return False
+    emb_scp = os.path.join(WORK_DIR, "embedding", "emb.scp")
+    labels_out = os.path.join(WORK_DIR, "labels")
+    windows = _read_embedding_windows(emb_scp)
+    if len(windows) < 4:
+        return False
+    candidates = _candidate_boundary_scores(segments, windows)
+    boundaries, thresholds = _select_change_boundaries(candidates, windows)
+    if not boundaries:
+        return False
+
+    threshold_values = list(thresholds.values())
+    if threshold_values:
+        threshold_text = (
+            f"{threshold_values[0]:.3f}"
+            if max(threshold_values) - min(threshold_values) < 0.001
+            else f"{min(threshold_values):.3f}~{max(threshold_values):.3f}"
+        )
+    else:
+        threshold_text = "n/a"
+    print(
+        f"✅ 分区自适应换人阈值: {threshold_text}; "
+        f"{len(candidates)} 个词间候选中保留 {len(boundaries)} 个。"
+    )
+    for item in boundaries:
+        print(
+            f"   换人候选 {item['time']:.3f}s: "
+            f"change={item['score']:.3f}, gap={item['gap']:.3f}s, "
+            f"punctuation={item.get('punctuation', 'none')}, "
+            f"{item['left_text']!r} -> {item['right_text']!r}"
+        )
+
+    turns, cannot_links = _build_acoustic_turns(windows, boundaries)
+    if len(turns) < 2:
+        return False
+    clusters = _constrained_turn_clusters(turns, cannot_links)
+    clusters.sort(key=lambda cluster: min(turns[index]["start"] for index in cluster))
+    turn_labels = {}
+    for label, cluster in enumerate(clusters):
+        for turn_index in cluster:
+            turn_labels[turn_index] = label
+
+    window_labels = {}
+    for turn_index, turn in enumerate(turns):
+        for window_index in turn["window_indices"]:
+            window_labels[window_index] = turn_labels[turn_index]
+    if len(window_labels) != len(windows):
+        return False
+
+    os.makedirs(os.path.dirname(labels_out), exist_ok=True)
+    with open(labels_out, "w", encoding="utf-8") as stream:
+        for index, window in enumerate(windows):
+            stream.write(f"{window['key']} {window_labels[index]}\n")
+
+    print(
+        f"✅ 时序约束聚类: {len(turns)} 个声学话轮 -> "
+        f"{len(clusters)} 位说话人（允许稀有说话人保留）。"
+    )
+    return True
+
+
+def _fill_noise_labels(values, labels):
+    """Attach HDBSCAN noise windows to their nearest stable speaker."""
+    labels = np.asarray(labels, dtype=int).copy()
+    stable = sorted(set(labels) - {-1})
+    if not stable:
+        return np.zeros(len(labels), dtype=int)
+    normalized = _normalized_rows(values)
+    centroids = []
+    for label in stable:
+        centroid = normalized[labels == label].mean(axis=0)
+        centroid /= max(float(np.linalg.norm(centroid)), 1e-12)
+        centroids.append(centroid)
+    for index in np.flatnonzero(labels == -1):
+        labels[index] = stable[int(np.argmax(np.asarray(centroids) @ normalized[index]))]
+    return labels
+
+
+def score_clustering(values, raw_labels):
+    """Score a candidate without knowing the number of speakers in advance."""
+    raw_labels = np.asarray(raw_labels, dtype=int)
+    noise_ratio = float(np.mean(raw_labels == -1)) if len(raw_labels) else 1.0
+    labels = _fill_noise_labels(values, raw_labels)
+    unique = sorted(set(labels.tolist()))
+    normalized = _normalized_rows(values)
+    centroids = {}
+    within_scores = []
+    small_windows = 0
+    for label in unique:
+        mask = labels == label
+        count = int(mask.sum())
+        centroid = normalized[mask].mean(axis=0)
+        centroid /= max(float(np.linalg.norm(centroid)), 1e-12)
+        centroids[label] = centroid
+        within_scores.extend((normalized[mask] @ centroid).tolist())
+        if count < max(2, math.ceil(len(labels) * 0.04)):
+            small_windows += count
+
+    cohesion = float(np.mean(within_scores)) if within_scores else 0.0
+    if len(unique) > 1:
+        similarities = [
+            float(centroids[left] @ centroids[right])
+            for pos, left in enumerate(unique)
+            for right in unique[pos + 1:]
+        ]
+        separation = 1.0 - max(similarities)
+    else:
+        separation = 0.0
+
+    switches = int(np.sum(labels[1:] != labels[:-1])) if len(labels) > 1 else 0
+    switch_ratio = switches / max(1, len(labels) - 1)
+    short_islands = 0
+    run_start = 0
+    for index in range(1, len(labels) + 1):
+        if index == len(labels) or labels[index] != labels[run_start]:
+            if index - run_start <= 1:
+                short_islands += 1
+            run_start = index
+    island_ratio = short_islands / max(1, len(labels))
+    small_ratio = small_windows / max(1, len(labels))
+
+    # Reward compact and separated voices, but penalize unstable timelines,
+    # noise, tiny clusters, and unnecessary model complexity.
+    score = (
+        cohesion
+        + 0.70 * separation
+        - 0.45 * switch_ratio
+        - 0.60 * island_ratio
+        - 0.50 * noise_ratio
+        - 0.45 * small_ratio
+        - 0.025 * max(0, len(unique) - 1)
+    )
+    metrics = {
+        "score": score,
+        "speakers": len(unique),
+        "cohesion": cohesion,
+        "separation": separation,
+        "switch_ratio": switch_ratio,
+        "noise_ratio": noise_ratio,
+        "small_ratio": small_ratio,
+    }
+    return score, labels, metrics
 
 
 def run_adaptive_clustering():
@@ -154,6 +804,12 @@ def run_adaptive_clustering():
         for utt, embs in utt_embs.items():
             X = np.stack(embs)
             n = len(X)
+
+            if n < 4:
+                print(f"⚠️ 仅有 {n} 个声纹窗口，按单说话人保守处理。")
+                for key in utt_keys[utt]:
+                    f.write(f"{key} 0\n")
+                continue
 
             if n < 20:
                 strategies = [
@@ -183,17 +839,21 @@ def run_adaptive_clustering():
                 ]
 
             results = []
+            reduced_cache = {}
             for strategy in strategies:
                 try:
-                    reducer = umap.UMAP(
-                        n_components=min(32, max(2, n - 2)),
-                        metric="cosine",
-                        n_neighbors=min(15, max(5, n // 5)),
-                        min_dist=0.0,
-                        random_state=42,
-                        n_jobs=1,
-                    )
-                    emb_2d = reducer.fit_transform(X)
+                    reducer_key = (min(15, max(2, n // 5)), min(32, max(2, n - 2)))
+                    if reducer_key not in reduced_cache:
+                        reducer = umap.UMAP(
+                            n_components=reducer_key[1],
+                            metric="cosine",
+                            n_neighbors=min(n - 1, reducer_key[0]),
+                            min_dist=0.0,
+                            random_state=42,
+                            n_jobs=1,
+                        )
+                        reduced_cache[reducer_key] = reducer.fit_transform(X)
+                    emb_2d = reduced_cache[reducer_key]
 
                     clusterer = hdbscan.HDBSCAN(
                         min_cluster_size=strategy["mcs"],
@@ -202,33 +862,35 @@ def run_adaptive_clustering():
                         allow_single_cluster=True,
                         core_dist_n_jobs=1,
                     )
-                    labels = clusterer.fit_predict(emb_2d)
-                    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-                    print(f"  尝试 {strategy}: {n_clusters} 个有效簇")
-                    results.append((n_clusters, strategy, labels))
+                    raw_labels = clusterer.fit_predict(emb_2d)
+                    score, labels, metrics = score_clustering(X, raw_labels)
+                    print(
+                        f"  尝试 {strategy}: {metrics['speakers']} 人, "
+                        f"评分={score:.3f}, 类内={metrics['cohesion']:.3f}, "
+                        f"类间={metrics['separation']:.3f}, "
+                        f"切换率={metrics['switch_ratio']:.3f}, "
+                        f"噪声率={metrics['noise_ratio']:.3f}"
+                    )
+                    results.append((score, strategy, labels, metrics))
                 except Exception as e:
                     print(f"  ⚠️ 策略 {strategy} 失败: {e}")
                     continue
 
-            valid = [(n, s, l) for n, s, l in results if n >= 2]
-            if not valid:
-                valid = results
+            # Always compare against the conservative one-speaker explanation.
+            single_score, single_labels, single_metrics = score_clustering(
+                X, np.zeros(n, dtype=int)
+            )
+            results.append((single_score, {"method": "single"}, single_labels, single_metrics))
+            if not results:
+                raise RuntimeError("没有可用的声纹聚类结果")
+            best_score, best_strategy, best_labels, best_metrics = max(
+                results, key=lambda item: item[0]
+            )
 
-            eom_valid = [(n, s, l) for n, s, l in valid if s["method"] == "eom" and n >= 2]
-            if eom_valid:
-                best_n_clusters, best_strategy, best_labels = max(eom_valid, key=lambda x: x[0])
-            else:
-                leaf_valid = [(n, s, l) for n, s, l in valid if s["method"] == "leaf"]
-                if leaf_valid:
-                    mid_leaf = [(n, s, l) for n, s, l in leaf_valid if 3 <= n <= 5]
-                    if mid_leaf:
-                        best_n_clusters, best_strategy, best_labels = max(mid_leaf, key=lambda x: x[0])
-                    else:
-                        best_n_clusters, best_strategy, best_labels = max(leaf_valid, key=lambda x: x[0])
-                else:
-                    best_n_clusters, best_strategy, best_labels = max(valid, key=lambda x: x[0])
-
-            print(f"✅ 选中策略: {best_strategy}, 最终 {best_n_clusters} 个簇")
+            print(
+                f"✅ 自动选择: {best_metrics['speakers']} 位说话人, "
+                f"策略={best_strategy}, 评分={best_score:.3f}"
+            )
 
             for key, label in zip(utt_keys[utt], best_labels):
                 f.write(f"{key} {label}\n")
@@ -245,8 +907,9 @@ def parse_rttm(rttm_path):
             duration = float(parts[4])
             speaker = parts[7]
             spans.append({"start": start, "end": start + duration, "speaker": speaker})
-    spans = sorted(spans, key=lambda x: x["start"])
-    return smooth_short_speaker_islands(spans)
+    from speaker_alignment import smooth_rttm_spans
+
+    return smooth_rttm_spans(spans)
 
 
 def smooth_short_speaker_islands(spans):
@@ -548,37 +1211,25 @@ def merge_adjacent_same_speaker(segments, max_gap=0.5, min_merge_duration=1.5):
 
 
 def assign_speakers(segments, rttm_spans):
-    result = []
-    split_count = 0
-    for source_segment in segments:
-        seg = source_segment.copy()
-        start = float(seg["start"])
-        end = float(seg["end"])
-        overlaps = speaker_overlaps(start, end, rttm_spans)
-        dominant = max(overlaps, key=overlaps.get) if overlaps else "SPEAKER_00"
-        dominant = normalize_speaker(dominant)
-        timestamp_items = list(seg.get("qwen3_time_stamps") or [])
-        split_segments = split_segment_on_speaker_turns(seg, timestamp_items, rttm_spans, dominant)
-        if len(split_segments) > 1:
-            split_count += 1
-            result.extend(split_segments)
-            continue
-        seg["speaker"] = dominant
-        result.append(seg)
+    from speaker_alignment import align_segments_with_rttm, merge_adjacent_speaker_turns
 
-    for new_id, segment in enumerate(result):
-        segment["id"] = new_id
+    result = align_segments_with_rttm(segments, rttm_spans)
+    split_count = max(0, len(result) - len(segments))
+    ambiguous_count = sum(
+        bool(item.get("speaker_boundary_ambiguous")) for item in result
+    )
     if split_count:
-        print(f"✅ 根据 Qwen3 时间戳和 RTTM 换人边界拆分了 {split_count} 个 ASR 片段。")
-
-    result = fix_interjection_speakers(result, rttm_spans)
-    result = merge_fragment_speakers(result)
-    result = merge_adjacent_same_speaker(result, max_gap=0.5, min_merge_duration=1.5)
-    return result
+        print(f"✅ 句子边界与 RTTM 联合分段: 新增 {split_count} 个片段。")
+    if ambiguous_count:
+        print(f"⚠️ {ambiguous_count} 个片段的说话人边界证据不足，已保守保留整段。")
+    merged = merge_adjacent_speaker_turns(result)
+    if len(merged) < len(result):
+        print(f"✅ 同说话人片段重组: {len(result)} -> {len(merged)} 段。")
+    return merged
 
 
 def main():
-    print("=== [Step 2] WeSpeaker + 自适应聚类 说话人分离 ===")
+    print("=== [Step 2] WeSpeaker + 时序约束聚类 说话人分离 ===")
     print(f"当前 Python: {sys.executable}")
     state = load_state()
     if "segments_step1" not in state:
@@ -586,7 +1237,7 @@ def main():
         sys.exit(1)
 
     prepare_inputs(state)
-    rttm_path = run_wespeaker_pipeline()
+    rttm_path = run_wespeaker_pipeline(state["segments_step1"])
     print("\n=== [Step 2-W] 解析 RTTM 回填 AutoDub Segments ===")
     rttm_spans = parse_rttm(rttm_path)
     aligned = assign_speakers(state["segments_step1"], rttm_spans)
