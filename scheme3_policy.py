@@ -25,6 +25,7 @@ POSITIVE_EMOTIONS = frozenset({"happy", "surprised"})
 SCHEME3_ENGINES = frozenset(
     {"f5tts", "indextts2", "cosyvoice3", "confucius4", "omnivoice"}
 )
+SCHEME3_RULE_VERSION = "scheme3-v1"
 REQUIRED_SEGMENT_FIELDS = frozenset(
     {"text", "start", "end", "source_lang", "target_lang", "emotion", "speaker", "tts_engine"}
 )
@@ -191,6 +192,51 @@ def select_scheme3_tts_engine(
     return "f5tts"
 
 
+def describe_scheme3_decision(
+    target_lang: Any,
+    emotion: Any,
+    text: Any,
+    config: Optional[ComplexityConfig] = None,
+) -> dict[str, Any]:
+    """Return the complete, auditable routing decision used by the API."""
+    cfg = config or ComplexityConfig.from_env()
+    language = normalize_language(target_lang)
+    normalized_emotion = normalize_emotion(emotion)
+    complexity = analyze_text_complexity(text, language, cfg)
+    if language not in {"zh", "en"}:
+        engine, rule_code = "omnivoice", "unsupported_primary_language"
+        reason = "The target language is outside the dedicated Chinese/English routes."
+    elif complexity["is_long_or_complex"]:
+        engine, rule_code = "confucius4", "long_or_complex_text"
+        reason = "The translated text meets the configured length or clause threshold."
+    elif normalized_emotion in STRONG_EMOTIONS:
+        engine, rule_code = "indextts2", "strong_emotion"
+        reason = "The effective emotion requires the strong-emotion route."
+    elif normalized_emotion in POSITIVE_EMOTIONS:
+        engine, rule_code = "cosyvoice3", "positive_emotion"
+        reason = "The effective emotion requires the positive-emotion route."
+    else:
+        engine, rule_code = "f5tts", "neutral_short_text"
+        reason = "The text is short or simple and the effective emotion is neutral."
+    return {
+        "status": "success",
+        "planned_engine": engine,
+        "rule_code": rule_code,
+        "rule_version": SCHEME3_RULE_VERSION,
+        "reason": reason,
+        "inputs": {
+            "target_language": language,
+            "emotion": normalized_emotion,
+            "tts_complexity": complexity,
+            "thresholds": {
+                "zh_long_chars": cfg.zh_long_chars,
+                "en_long_words": cfg.en_long_words,
+                "complex_clause_count": cfg.complex_clause_count,
+            },
+        },
+    }
+
+
 def build_scheme3_segments(
     segments: Iterable[Mapping[str, Any]],
     *,
@@ -216,8 +262,9 @@ def build_scheme3_segments(
             emotion = normalize_emotion(raw, score=score, duration=duration)
         text = str(segment.get("text", "")).strip()
         per_segment_source = segment.get("source_lang", source_lang)
-        complexity = analyze_text_complexity(text, canonical_target, config)
-        engine = select_scheme3_tts_engine(canonical_target, emotion, text, config)
+        decision = describe_scheme3_decision(canonical_target, emotion, text, config)
+        complexity = decision["inputs"]["tts_complexity"]
+        engine = decision["planned_engine"]
         segment.update(
             {
                 "id": segment.get("id", index),
@@ -231,6 +278,11 @@ def build_scheme3_segments(
                 "speaker": str(segment.get("speaker", "SPEAKER_00")),
                 "tts_engine": engine,
                 "tts_complexity": complexity,
+                "routing_status": decision["status"],
+                "routing_rule_code": decision["rule_code"],
+                "routing_rule_version": decision["rule_version"],
+                "routing_reason": decision["reason"],
+                "routing_inputs": decision["inputs"],
             }
         )
         if canonical_target == "other":
