@@ -61,6 +61,7 @@ SAD_FLOOR_DBFS = _env_float("AUTODUB_DIAR_SAD_FLOOR_DBFS", -50.0)
 BOUNDARY_CONTEXT_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_CONTEXT_SECONDS", 2.3)
 BOUNDARY_GUARD_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_GUARD_SECONDS", 0.3)
 BOUNDARY_MIN_TURN_SECONDS = _env_float("AUTODUB_DIAR_MIN_TURN_SECONDS", 0.8)
+BOUNDARY_NMS_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_NMS_SECONDS", 1.15)
 BOUNDARY_SCORE_OVERRIDE = os.getenv("AUTODUB_DIAR_BOUNDARY_SCORE")
 STRONG_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_STRONG_SIMILARITY", 0.52)
 WEAK_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_WEAK_SIMILARITY", 0.36)
@@ -281,21 +282,31 @@ def _read_embedding_windows(emb_scp):
 
 
 def _timestamp_items(segments):
-    """Collect valid absolute word timestamps without inventing missing words."""
+    """Collect valid timestamps and recover punctuation from the transcript."""
+    from speaker_alignment import normalize_timestamp_items
+
     items = []
-    for segment in segments:
-        for raw in segment.get("qwen3_time_stamps") or []:
-            try:
-                start = float(raw.get("start"))
-                end = float(raw.get("end", start))
-            except (TypeError, ValueError):
-                continue
-            if not math.isfinite(start) or not math.isfinite(end):
-                continue
+    for segment_index, segment in enumerate(segments):
+        transcript = str(segment.get("text", ""))
+        raw_items = list(segment.get("qwen3_time_stamps") or [])
+        try:
+            chunk_start = float(segment.get("start", 0.0))
+            chunk_end = float(segment.get("end", chunk_start))
+        except (TypeError, ValueError):
+            continue
+        normalized, _ = normalize_timestamp_items(
+            raw_items,
+            transcript=transcript,
+            chunk_start=chunk_start,
+            chunk_end=chunk_end,
+        )
+        for item in normalized:
             items.append({
-                "start": start,
-                "end": max(start, end),
-                "text": str(raw.get("text", "")),
+                "start": float(item["start"]),
+                "end": float(item["end"]),
+                "text": str(item.get("text", "")),
+                "punctuation_after": str(item.get("punctuation_after", "none")),
+                "segment_index": segment_index,
             })
     items.sort(key=lambda item: (item["start"], item["end"]))
     deduplicated = []
@@ -349,6 +360,7 @@ def _candidate_boundary_scores(segments, windows):
             "right_count": right_count,
             "left_text": left["text"],
             "right_text": right["text"],
+            "punctuation": left.get("punctuation_after", "none"),
         })
     return candidates
 
@@ -363,23 +375,12 @@ def _adaptive_boundary_threshold(candidates):
                 f"{BOUNDARY_SCORE_OVERRIDE!r}"
             )
     values = np.asarray([item["score"] for item in candidates], dtype=float)
-    ordered = np.sort(values)
-    minimum_lower = max(2, int(math.ceil(len(ordered) * 0.20)))
-    minimum_upper = max(2, int(math.ceil(len(ordered) * 0.10)))
-    gaps = [
-        (float(ordered[index + 1] - ordered[index]), index)
-        for index in range(minimum_lower - 1, len(ordered) - minimum_upper)
-    ]
-    if gaps:
-        natural_gap, gap_index = max(gaps)
-        if natural_gap >= 0.06:
-            midpoint = float((ordered[gap_index] + ordered[gap_index + 1]) / 2.0)
-            return min(0.60, max(0.42, midpoint))
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
-    # The threshold follows each video's own score distribution.  The bounds
-    # are model-level safety rails, not an assumed number of speakers.
-    return min(0.62, max(0.44, median + max(0.06, 1.2 * mad)))
+    # Estimate ordinary within-speaker variation for one continuous SAD
+    # region.  Punctuation provides the structural evidence; this threshold
+    # only decides whether that textual boundary also has an acoustic change.
+    return min(0.52, max(0.42, median + max(0.04, 0.75 * mad)))
 
 
 def _boundary_location(regions, timestamp):
@@ -402,36 +403,73 @@ def _boundary_location(regions, timestamp):
 
 def _select_change_boundaries(candidates, windows):
     if not candidates:
-        return [], None
-    threshold = _adaptive_boundary_threshold(candidates)
+        return [], {}
     regions = sorted(set(item["region"] for item in windows), key=lambda item: item[1])
-    eligible = []
+    located = []
     for candidate in candidates:
         location = _boundary_location(regions, candidate["time"])
         if location is None:
             continue
-        required = threshold
-        if candidate["gap"] >= 0.60:
-            required -= 0.025
-        if candidate["score"] >= required:
-            enriched = dict(candidate)
-            enriched.update(location)
-            eligible.append(enriched)
+        enriched = dict(candidate)
+        enriched.update(location)
+        located.append(enriched)
+
+    def location_key(item):
+        return item["region"] or ("between", *item["between_regions"])
+
+    grouped = defaultdict(list)
+    for candidate in located:
+        grouped[location_key(candidate)].append(candidate)
+    thresholds = {
+        key: _adaptive_boundary_threshold(group)
+        for key, group in grouped.items()
+    }
+
+    eligible = []
+    for candidate in located:
+        key = location_key(candidate)
+        threshold = thresholds[key]
+        punctuation = candidate.get("punctuation", "none")
+        if punctuation == "strong" and candidate["score"] >= threshold:
+            eligible.append(candidate)
+            continue
+
+        # Speaker changes without punctuation remain possible, but need a
+        # sustained pause, a much stronger acoustic peak, and no nearby
+        # punctuated explanation for the same peak.  This prevents cutting
+        # ordinary phrases such as "Wake up" or "by yourself".
+        strict_threshold = max(0.58, threshold + 0.12)
+        if candidate["gap"] < 0.25 or candidate["score"] < strict_threshold:
+            continue
+        punctuated_neighbor = any(
+            other.get("punctuation") == "strong"
+            and location_key(other) == key
+            and abs(other["time"] - candidate["time"]) <= 1.25
+            and other["score"] >= thresholds[key]
+            and other["score"] >= candidate["score"] - 0.10
+            for other in located
+        )
+        if not punctuated_neighbor:
+            eligible.append(candidate)
 
     # Non-maximum suppression keeps one acoustic peak for one real change.
     selected = []
-    for candidate in sorted(eligible, key=lambda item: item["score"], reverse=True):
-        location_key = candidate["region"] or candidate["between_regions"]
+    for candidate in sorted(
+        eligible,
+        key=lambda item: (item.get("punctuation") == "strong", item["score"]),
+        reverse=True,
+    ):
+        key = location_key(candidate)
         if any(
-            (item["region"] or item["between_regions"]) == location_key
+            location_key(item) == key
             and abs(item["time"] - candidate["time"])
-            < BOUNDARY_MIN_TURN_SECONDS
+            < BOUNDARY_NMS_SECONDS
             for item in selected
         ):
             continue
         selected.append(candidate)
     selected.sort(key=lambda item: item["time"])
-    return selected, threshold
+    return selected, thresholds
 
 
 def _build_acoustic_turns(windows, boundaries):
@@ -605,18 +643,28 @@ def run_temporal_constrained_clustering(segments):
     if len(windows) < 4:
         return False
     candidates = _candidate_boundary_scores(segments, windows)
-    boundaries, threshold = _select_change_boundaries(candidates, windows)
+    boundaries, thresholds = _select_change_boundaries(candidates, windows)
     if not boundaries:
         return False
 
+    threshold_values = list(thresholds.values())
+    if threshold_values:
+        threshold_text = (
+            f"{threshold_values[0]:.3f}"
+            if max(threshold_values) - min(threshold_values) < 0.001
+            else f"{min(threshold_values):.3f}~{max(threshold_values):.3f}"
+        )
+    else:
+        threshold_text = "n/a"
     print(
-        f"✅ 自适应换人阈值: {threshold:.3f}; "
+        f"✅ 分区自适应换人阈值: {threshold_text}; "
         f"{len(candidates)} 个词间候选中保留 {len(boundaries)} 个。"
     )
     for item in boundaries:
         print(
             f"   换人候选 {item['time']:.3f}s: "
             f"change={item['score']:.3f}, gap={item['gap']:.3f}s, "
+            f"punctuation={item.get('punctuation', 'none')}, "
             f"{item['left_text']!r} -> {item['right_text']!r}"
         )
 

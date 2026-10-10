@@ -122,6 +122,24 @@ def normalize_timestamp_items(
         previous_start = start
 
     transcript_lexical = _lexical_count(transcript)
+    for index, item in enumerate(normalized):
+        char_end = item.get("char_end")
+        if char_end is None:
+            item["punctuation_after"] = "none"
+            continue
+        if index + 1 < len(normalized):
+            next_start = normalized[index + 1].get("char_start")
+            separator_end = int(next_start) if next_start is not None else int(char_end)
+        else:
+            separator_end = len(transcript)
+        separator = transcript[int(char_end):separator_end].strip()
+        if STRONG_PUNCTUATION.search(separator):
+            item["punctuation_after"] = "strong"
+        elif WEAK_PUNCTUATION.search(separator):
+            item["punctuation_after"] = "weak"
+        else:
+            item["punctuation_after"] = "none"
+
     coverage = (
         min(1.0, mapped_lexical / transcript_lexical)
         if transcript_lexical
@@ -169,8 +187,9 @@ def sentence_boundary_indices(
         left = str(items[index - 1].get("text", "")).strip()
         gap = _gap_seconds(items, index)
         elapsed = float(items[index - 1].get("end", group_start)) - group_start
-        strong = bool(STRONG_PUNCTUATION.search(left))
-        weak = bool(WEAK_PUNCTUATION.search(left))
+        punctuation = str(items[index - 1].get("punctuation_after", "none"))
+        strong = punctuation == "strong" or bool(STRONG_PUNCTUATION.search(left))
+        weak = punctuation == "weak" or bool(WEAK_PUNCTUATION.search(left))
         should_split = False
         if strong and elapsed >= config.minimum_sentence_seconds:
             should_split = True
@@ -339,8 +358,15 @@ def _boundary_score(
         float(left.get("end", change_time)) + float(right.get("start", change_time))
     ) / 2.0
     distance_score = max(0.0, 1.0 - abs(gap_time - change_time) / max(radius, 0.001))
-    punctuation_score = 1.5 if STRONG_PUNCTUATION.search(str(left.get("text", "")).strip()) else 0.0
-    if not punctuation_score and WEAK_PUNCTUATION.search(str(left.get("text", "")).strip()):
+    punctuation = str(left.get("punctuation_after", "none"))
+    punctuation_score = 1.5 if (
+        punctuation == "strong"
+        or STRONG_PUNCTUATION.search(str(left.get("text", "")).strip())
+    ) else 0.0
+    if not punctuation_score and (
+        punctuation == "weak"
+        or WEAK_PUNCTUATION.search(str(left.get("text", "")).strip())
+    ):
         punctuation_score = 0.6
     silence_score = min(1.0, gap / 0.6)
     return distance_score + punctuation_score + silence_score
@@ -381,7 +407,14 @@ def _text_for_group(
         return None
     if "char_start" not in group[0] or "char_end" not in group[-1]:
         return None
-    return transcript[int(group[0]["char_start"]):int(group[-1]["char_end"])].strip()
+    char_start = int(group[0]["char_start"])
+    if end_index < len(items) and "char_start" in items[end_index]:
+        # The next token begins after the separator, so this keeps terminal
+        # punctuation on the left group while strip() removes only whitespace.
+        char_end = int(items[end_index]["char_start"])
+    else:
+        char_end = len(transcript)
+    return transcript[char_start:char_end].strip()
 
 
 def align_segments_with_rttm(
