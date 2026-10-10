@@ -217,6 +217,32 @@ def sentence_candidates(
     return result
 
 
+def long_turn_boundary_indices(
+    items: Sequence[Mapping[str, Any]],
+    sentence_boundaries: Sequence[int],
+    *,
+    config: AlignmentConfig = AlignmentConfig(),
+) -> List[int]:
+    """Keep only safe sentence boundaries needed to cap a long speaker turn."""
+    if not items or not sentence_boundaries:
+        return []
+    result: List[int] = []
+    group_start = float(items[0].get("start", 0.0))
+    candidates: List[int] = []
+    for index in sentence_boundaries:
+        boundary_end = float(items[index - 1].get("end", group_start))
+        if boundary_end - group_start < config.maximum_sentence_seconds:
+            candidates.append(index)
+            continue
+        # Prefer the latest safe textual boundary before the turn becomes too
+        # long.  Ordinary punctuation does not split a coherent speaker turn.
+        chosen = candidates[-1] if candidates else index
+        result.append(chosen)
+        group_start = float(items[chosen].get("start", boundary_end))
+        candidates = [] if chosen == index else [index]
+    return result
+
+
 def speaker_overlaps(
     start: float, end: float, spans: Sequence[Mapping[str, Any]]
 ) -> Dict[str, float]:
@@ -398,7 +424,14 @@ def align_segments_with_rttm(
             output.append(segment)
             continue
 
-        sentence_splits = set(sentence_boundary_indices(items, config=config))
+        sentence_candidates_for_turn = sentence_boundary_indices(items, config=config)
+        sentence_splits = set(
+            long_turn_boundary_indices(
+                items,
+                sentence_candidates_for_turn,
+                config=config,
+            )
+        )
         speaker_splits: Dict[int, Dict[str, Any]] = {}
         for change in segment_changes:
             boundary = _snap_change_to_gap(items, float(change["time"]), config=config)
@@ -456,3 +489,63 @@ def align_segments_with_rttm(
     for index, segment in enumerate(output):
         segment["id"] = index
     return output
+
+
+def _join_transcript(left: str, right: str) -> str:
+    left = str(left or "").rstrip()
+    right = str(right or "").lstrip()
+    if not left:
+        return right
+    if not right:
+        return left
+    if right[0] in ",.;:!?，。；：！？、)]}\u2019\u201d":
+        return left + right
+    return left + " " + right
+
+
+def merge_adjacent_speaker_turns(
+    segments: Iterable[Mapping[str, Any]],
+    *,
+    max_gap_seconds: float = 0.80,
+    maximum_turn_seconds: float = 12.0,
+) -> List[Dict[str, Any]]:
+    """Reassemble transport/sentence fragments belonging to one speaker."""
+    merged: List[Dict[str, Any]] = []
+    for source in segments:
+        segment = dict(source)
+        if not merged:
+            merged.append(segment)
+            continue
+        left = merged[-1]
+        gap = float(segment["start"]) - float(left["end"])
+        combined_duration = float(segment["end"]) - float(left["start"])
+        if (
+            normalize_speaker(left.get("speaker"))
+            == normalize_speaker(segment.get("speaker"))
+            and gap <= max_gap_seconds
+            and combined_duration <= maximum_turn_seconds
+            and not left.get("speaker_boundary_ambiguous")
+            and not segment.get("speaker_boundary_ambiguous")
+        ):
+            parent_ids = list(left.get("parent_segment_ids") or [])
+            if not parent_ids and left.get("parent_segment_id") is not None:
+                parent_ids.append(left.get("parent_segment_id"))
+            next_parent = segment.get("parent_segment_id")
+            if next_parent is not None and next_parent not in parent_ids:
+                parent_ids.append(next_parent)
+            left["parent_segment_ids"] = parent_ids
+            left["end"] = segment["end"]
+            left["text"] = _join_transcript(left.get("text", ""), segment.get("text", ""))
+            left["qwen3_time_stamps"] = list(left.get("qwen3_time_stamps") or []) + list(
+                segment.get("qwen3_time_stamps") or []
+            )
+            left["speaker_turn_merged"] = True
+            left["segment_split_reasons"] = sorted(
+                set(left.get("segment_split_reasons") or [])
+                | set(segment.get("segment_split_reasons") or [])
+            )
+        else:
+            merged.append(segment)
+    for index, segment in enumerate(merged):
+        segment["id"] = index
+    return merged
