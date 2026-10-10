@@ -245,8 +245,9 @@ def parse_rttm(rttm_path):
             duration = float(parts[4])
             speaker = parts[7]
             spans.append({"start": start, "end": start + duration, "speaker": speaker})
-    spans = sorted(spans, key=lambda x: x["start"])
-    return smooth_short_speaker_islands(spans)
+    from speaker_alignment import smooth_rttm_spans
+
+    return smooth_rttm_spans(spans)
 
 
 def smooth_short_speaker_islands(spans):
@@ -548,32 +549,17 @@ def merge_adjacent_same_speaker(segments, max_gap=0.5, min_merge_duration=1.5):
 
 
 def assign_speakers(segments, rttm_spans):
-    result = []
-    split_count = 0
-    for source_segment in segments:
-        seg = source_segment.copy()
-        start = float(seg["start"])
-        end = float(seg["end"])
-        overlaps = speaker_overlaps(start, end, rttm_spans)
-        dominant = max(overlaps, key=overlaps.get) if overlaps else "SPEAKER_00"
-        dominant = normalize_speaker(dominant)
-        timestamp_items = list(seg.get("qwen3_time_stamps") or [])
-        split_segments = split_segment_on_speaker_turns(seg, timestamp_items, rttm_spans, dominant)
-        if len(split_segments) > 1:
-            split_count += 1
-            result.extend(split_segments)
-            continue
-        seg["speaker"] = dominant
-        result.append(seg)
+    from speaker_alignment import align_segments_with_rttm
 
-    for new_id, segment in enumerate(result):
-        segment["id"] = new_id
+    result = align_segments_with_rttm(segments, rttm_spans)
+    split_count = max(0, len(result) - len(segments))
+    ambiguous_count = sum(
+        bool(item.get("speaker_boundary_ambiguous")) for item in result
+    )
     if split_count:
-        print(f"✅ 根据 Qwen3 时间戳和 RTTM 换人边界拆分了 {split_count} 个 ASR 片段。")
-
-    result = fix_interjection_speakers(result, rttm_spans)
-    result = merge_fragment_speakers(result)
-    result = merge_adjacent_same_speaker(result, max_gap=0.5, min_merge_duration=1.5)
+        print(f"✅ 句子边界与 RTTM 联合分段: 新增 {split_count} 个片段。")
+    if ambiguous_count:
+        print(f"⚠️ {ambiguous_count} 个片段的说话人边界证据不足，已保守保留整段。")
     return result
 
 

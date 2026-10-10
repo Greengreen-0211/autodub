@@ -446,7 +446,7 @@ class Qwen3ASRProcessor:
             }
             if timestamps:
                 chunk_offset = start_ms / 1000.0
-                segment["qwen3_time_stamps"] = [
+                raw_timestamp_items = [
                     {
                         "text": item["text"],
                         "start": round(chunk_offset + float(item["start"]), 3),
@@ -454,6 +454,25 @@ class Qwen3ASRProcessor:
                     }
                     for item in timestamps
                 ]
+                from speaker_alignment import (
+                    normalize_timestamp_items,
+                    sentence_candidates,
+                )
+
+                normalized_items, alignment = normalize_timestamp_items(
+                    raw_timestamp_items,
+                    transcript=text,
+                    chunk_start=float(segment["start"]),
+                    chunk_end=float(segment["end"]),
+                )
+                segment["qwen3_time_stamps_raw"] = raw_timestamp_items
+                segment["qwen3_time_stamps"] = normalized_items
+                segment["timestamp_alignment_status"] = alignment["status"]
+                segment["timestamp_coverage_ratio"] = alignment["coverage_ratio"]
+                segment["timestamp_warning_codes"] = alignment["warning_codes"]
+                segment["qwen3_sentence_candidates"] = sentence_candidates(
+                    normalized_items
+                )
                 timestamp_segment_count += 1
             segments.append(segment)
             print(f"[Qwen3-ASR {idx:03d}] {segment['start']:.2f}-{segment['end']:.2f}: {text}")
@@ -1170,11 +1189,17 @@ class SpeakerDiarization:
         self.rttm_island_max_seconds = _env_float("AUTODUB_RTTM_ISLAND_MAX_SECONDS", 0.0)
         self.rttm_island_max_gap = _env_float("AUTODUB_RTTM_ISLAND_MAX_GAP", 0.15)
         self.rttm_snap_max_tokens = _env_int("AUTODUB_RTTM_SNAP_MAX_TOKENS", 3)
-        self.rttm_snap_max_seconds = _env_float("AUTODUB_RTTM_SNAP_MAX_SECONDS", 1.20)
+        self.rttm_snap_max_seconds = _env_float("AUTODUB_RTTM_SNAP_MAX_SECONDS", 0.80)
         self.rttm_snap_min_following_tokens = _env_int("AUTODUB_RTTM_SNAP_MIN_FOLLOWING_TOKENS", 2)
         self.sentence_speaker_coherence = _env_bool("AUTODUB_SENTENCE_SPEAKER_COHERENCE", False)
         self.sentence_speaker_max_seconds = _env_float("AUTODUB_SENTENCE_SPEAKER_MAX_SECONDS", 8.0)
         self.sentence_speaker_min_ratio = _env_float("AUTODUB_SENTENCE_SPEAKER_MIN_RATIO", 0.60)
+        self.timestamp_weak_gap_seconds = _env_float("AUTODUB_TIMESTAMP_WEAK_GAP_SECONDS", 0.35)
+        self.timestamp_strong_gap_seconds = _env_float("AUTODUB_TIMESTAMP_STRONG_GAP_SECONDS", 0.60)
+        self.minimum_sentence_seconds = _env_float("AUTODUB_MIN_SENTENCE_SECONDS", 0.80)
+        self.target_sentence_seconds = _env_float("AUTODUB_TARGET_SENTENCE_SECONDS", 8.0)
+        self.maximum_sentence_seconds = _env_float("AUTODUB_MAX_SENTENCE_SECONDS", 12.0)
+        self.minimum_speaker_turn_seconds = _env_float("AUTODUB_MIN_SPEAKER_TURN_SECONDS", 0.75)
 
     def run(self, vocal_path: str, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self.backend == "wespeaker":
@@ -1250,8 +1275,19 @@ echo "=== [Step 2-W] WeSpeaker 流水线完成 ==="
                 duration = float(parts[4])
                 speaker = parts[7]
                 spans.append({"start": start, "end": start + duration, "speaker": speaker})
-        spans = sorted(spans, key=lambda x: x["start"])
-        return self._smooth_short_speaker_islands(spans)
+        from speaker_alignment import AlignmentConfig, smooth_rttm_spans
+
+        return smooth_rttm_spans(
+            spans,
+            config=AlignmentConfig(
+                island_max_seconds=(
+                    self.rttm_island_max_seconds
+                    if self.rttm_island_max_seconds > 0
+                    else 0.50
+                ),
+                island_max_gap_seconds=self.rttm_island_max_gap,
+            ),
+        )
 
     def _smooth_short_speaker_islands(self, spans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if len(spans) < 3 or self.rttm_island_max_seconds <= 0:
@@ -1285,38 +1321,35 @@ echo "=== [Step 2-W] WeSpeaker 流水线完成 ==="
         return smoothed
 
     def _assign_speakers_from_rttm(self, segments: List[Dict[str, Any]], rttm_spans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        result: List[Dict[str, Any]] = []
-        split_count = 0
-        ambiguous_count = 0
-        for source_segment in segments:
-            seg = source_segment.copy()
-            start = float(seg["start"])
-            end = float(seg["end"])
-            overlaps = self._speaker_overlaps(start, end, rttm_spans)
-            dominant = max(overlaps, key=overlaps.get) if overlaps else "SPEAKER_00"
-            dominant = self._normalize_speaker(dominant)
-            timestamp_items = list(seg.get("qwen3_time_stamps") or [])
-            split_segments = self._split_segment_on_speaker_turns(seg, timestamp_items, rttm_spans, dominant)
-            if len(split_segments) > 1:
-                split_count += 1
-                result.extend(split_segments)
-                continue
-            seg["speaker"] = dominant
-            normalized_overlaps = {self._normalize_speaker(speaker): round(duration, 3) for speaker, duration in overlaps.items()}
-            seg["speaker_overlap_seconds"] = normalized_overlaps
-            total_overlap = sum(overlaps.values())
-            meaningful_speakers = [speaker for speaker, duration in overlaps.items() if duration >= self.multi_speaker_min_overlap and (total_overlap <= 0 or duration / total_overlap >= self.multi_speaker_min_ratio)]
-            if len(meaningful_speakers) > 1 and not timestamp_items:
-                seg["speaker_boundary_ambiguous"] = True
-                ambiguous_count += 1
-                print(f"⚠️ ASR 片段内检测到多人，但没有 Qwen3 ForcedAligner 时间戳，暂按主说话人保留: {start:.2f}-{end:.2f}s {normalized_overlaps}")
-            result.append(seg)
-        for new_id, segment in enumerate(result):
-            segment["id"] = new_id
+        from speaker_alignment import AlignmentConfig, align_segments_with_rttm
+
+        result = align_segments_with_rttm(
+            segments,
+            rttm_spans,
+            config=AlignmentConfig(
+                weak_gap_seconds=self.timestamp_weak_gap_seconds,
+                strong_gap_seconds=self.timestamp_strong_gap_seconds,
+                minimum_sentence_seconds=self.minimum_sentence_seconds,
+                target_sentence_seconds=self.target_sentence_seconds,
+                maximum_sentence_seconds=self.maximum_sentence_seconds,
+                speaker_snap_radius_seconds=self.rttm_snap_max_seconds,
+                minimum_speaker_turn_seconds=self.minimum_speaker_turn_seconds,
+                island_max_seconds=(
+                    self.rttm_island_max_seconds
+                    if self.rttm_island_max_seconds > 0
+                    else 0.50
+                ),
+                island_max_gap_seconds=self.rttm_island_max_gap,
+            ),
+        )
+        split_count = max(0, len(result) - len(segments))
+        ambiguous_count = sum(
+            bool(item.get("speaker_boundary_ambiguous")) for item in result
+        )
         if split_count:
-            print(f"✅ 根据 Qwen3 时间戳和 RTTM 换人边界拆分了 {split_count} 个 ASR 片段。")
+            print(f"✅ 句子边界与 RTTM 联合分段: 新增 {split_count} 个片段。")
         if ambiguous_count:
-            print(f"⚠️ 仍有 {ambiguous_count} 个多人片段无法可靠拆词。请配置 QWEN3_FORCED_ALIGNER_MODEL_DIR 后重跑 Step 1a。")
+            print(f"⚠️ {ambiguous_count} 个片段的说话人边界证据不足，已保守保留整段。")
         return result
 
     @staticmethod
