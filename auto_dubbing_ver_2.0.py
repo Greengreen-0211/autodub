@@ -1962,6 +1962,115 @@ def run_step_emotion(config: DubbingConfig, force: bool = False) -> None:
     print(f"✅ Step 2.5 完成: {success}/{len(recognized)} 个 segment 已识别情绪。")
 
 
+def _routing_report_rows(routed_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten every routing input/output into one auditable row per segment."""
+    rows = []
+    for index, segment in enumerate(routed_segments):
+        inputs = segment.get("routing_inputs") or {}
+        complexity = inputs.get("tts_complexity") or {}
+        rows.append({
+            "index": index,
+            "id": str(segment.get("id", index)),
+            "speaker": segment.get("speaker"),
+            "start": segment.get("start"),
+            "end": segment.get("end"),
+            "target_language": inputs.get("target_language"),
+            "emotion": inputs.get("emotion", segment.get("emotion")),
+            "emotion_reliable": segment.get("emotion_reliable"),
+            "emotion_raw_label": segment.get("emotion_raw_label"),
+            "emotion_score": segment.get("emotion_score"),
+            "is_long": complexity.get("is_long"),
+            "is_complex": complexity.get("is_complex"),
+            "cjk_chars": complexity.get("cjk_chars"),
+            "words": complexity.get("words"),
+            "clause_count": complexity.get("clause_count"),
+            "rule_code": segment.get("routing_rule_code"),
+            "planned_engine": segment.get("tts_engine"),
+            "emotion_overridden_by_complexity": bool(
+                segment.get("emotion_overridden_by_complexity")
+            ),
+            "translation_status": segment.get("translation_status"),
+            "text": segment.get("text", ""),
+        })
+    return rows
+
+
+def summarize_routing(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate counts that show whether the emotion routes actually fire."""
+    from scheme3_policy import SCHEME3_RULE_VERSION
+
+    def tally(key):
+        counts: Dict[str, int] = {}
+        for row in rows:
+            value = str(row.get(key))
+            counts[value] = counts.get(value, 0) + 1
+        return dict(sorted(counts.items()))
+
+    unreliable = sum(1 for row in rows if row.get("emotion_reliable") is False)
+    engines = tally("planned_engine")
+    return {
+        "version": "scheme3-routing-report-v1",
+        "rule_version": SCHEME3_RULE_VERSION,
+        "total_segments": len(rows),
+        "by_engine": engines,
+        "by_rule_code": tally("rule_code"),
+        "by_effective_emotion": tally("emotion"),
+        "emotion_reliability": {
+            "reliable_segments": len(rows) - unreliable,
+            "unreliable_segments": unreliable,
+        },
+        "emotion_routed_segments": sum(engines.get(name, 0) for name in ("indextts2", "cosyvoice3")),
+        "emotion_overridden_by_complexity": sum(
+            1 for row in rows if row.get("emotion_overridden_by_complexity")
+        ),
+        "rows": rows,
+    }
+
+
+def print_routing_report(
+    routed_segments: List[Dict[str, Any]],
+    report_path: str = "",
+) -> Dict[str, Any]:
+    """Print the per-sentence routing thinking process, then an aggregate summary."""
+    rows = _routing_report_rows(routed_segments)
+    summary = summarize_routing(rows)
+    print("--- [Step 3] TTS 路由决策（逐句）---")
+    for row in rows:
+        reliability = ""
+        if row.get("emotion_reliable") is False:
+            reliability = "(unreliable→neutral)"
+        elif row.get("emotion_reliable") is True:
+            reliability = "(reliable)"
+        override = "  ⚠️情绪被长/复杂规则覆盖" if row["emotion_overridden_by_complexity"] else ""
+        print(
+            f"[Router {row['index'] + 1:03d}] id={row['id']} speaker={row['speaker']} "
+            f"lang={row['target_language']} emotion={row['emotion']}{reliability} "
+            f"len={row['cjk_chars']}字/{row['words']}词 clauses={row['clause_count']} "
+            f"long={row['is_long']} complex={row['is_complex']} → {row['planned_engine']} "
+            f"rule={row['rule_code']}{override}  text={row['text']!r}"
+        )
+    print("--- [Step 3] TTS 路由分布统计 ---")
+    print(f"按引擎: {summary['by_engine']}")
+    print(f"按规则: {summary['by_rule_code']}")
+    print(
+        f"情绪路由命中: {summary['emotion_routed_segments']}/{summary['total_segments']} 句 "
+        f"(indextts2/cosyvoice3)"
+    )
+    print(
+        f"情绪可信度: reliable={summary['emotion_reliability']['reliable_segments']} "
+        f"unreliable={summary['emotion_reliability']['unreliable_segments']}"
+    )
+    print(f"情绪被长/复杂规则覆盖: {summary['emotion_overridden_by_complexity']} 句")
+    if report_path:
+        try:
+            with open(report_path, "w", encoding="utf-8") as handle:
+                json.dump(summary, handle, ensure_ascii=False, indent=2)
+            print(f"✅ TTS 路由报告: {report_path}")
+        except OSError as exc:
+            print(f"⚠️ TTS 路由报告写入失败: {exc}")
+    return summary
+
+
 def run_step_3(config: DubbingConfig) -> None:
     state_mgr = StateManager(config)
     state = state_mgr.load()
@@ -1990,8 +2099,15 @@ def run_step_3(config: DubbingConfig) -> None:
         cached=cached_candidates if isinstance(cached_candidates, list) else [],
         checkpoint=checkpoint, force_ids=getattr(config, "retranslate_ids", set()),
     )
-    from translation_quality import require_translated
-    require_translated(final_segments, config.target_lang, src_lang)
+    from translation_quality import is_skipped, require_translated
+
+    # fail_fast (default) still raises here; skip_failed marks and continues.
+    skipped_segments = require_translated(final_segments, config.target_lang, src_lang)
+    if skipped_segments:
+        print("   ↳ 降级句子清单: " + ", ".join(
+            f"{segment.get('id')}({segment.get('translation_skip_reason', '')})"
+            for segment in skipped_segments
+        ))
     light_tts_results = []
     light_tts_results_path = None
     if config.light_tts_enabled:
@@ -2001,10 +2117,22 @@ def run_step_3(config: DubbingConfig) -> None:
             config.temp_dir,
             backend_name=config.light_tts_backend,
         )
-        final_segments, light_tts_results = selector.select(
-            final_segments,
+        # Skipped segments have neither translation text nor candidates, so they
+        # must never reach the selector.  They are merged back in place after.
+        active_segments = [s for s in final_segments if not is_skipped(s)]
+        selected_segments, light_tts_results = selector.select(
+            active_segments,
             target_language=config.target_lang,
         )
+        if len(selected_segments) != len(active_segments):
+            raise RuntimeError("LightTTS 输出的句子数与输入不一致，拒绝继续")
+        if skipped_segments:
+            by_id = {str(s.get("id")): s for s in selected_segments}
+            if len(by_id) != len(selected_segments):
+                raise RuntimeError("LightTTS 输出的 segment id 不唯一，无法与降级句子合并")
+            final_segments = [by_id.get(str(s.get("id")), s) for s in final_segments]
+        else:
+            final_segments = selected_segments
         light_tts_results_path = str(selector.results_path)
     else:
         print("⚠️ 轻量 TTS 候选筛选已通过 AUTODUB_LIGHT_TTS_ENABLED=0 关闭。")
@@ -2015,8 +2143,17 @@ def run_step_3(config: DubbingConfig) -> None:
         source_lang=src_lang,
         target_lang=config.target_lang,
     )
+    for segment in routed_segments:
+        if is_skipped(segment):
+            # Routing stays schema-valid, but Step 4 must not synthesize it.
+            segment["tts_status"] = "skipped"
+            segment["dubbing_enabled"] = False
     json_path = os.path.join(config.output_dir, f"{config.project_name}_segments.json")
     write_segments_json(json_path, routed_segments)
+    routing_report_path = os.path.join(
+        config.output_dir, f"{config.project_name}_routing_report.json"
+    )
+    routing_summary = print_routing_report(routed_segments, routing_report_path)
     state_mgr.delete_keys(["audio_clips", "tts_router_results", "tts_backend"])
     state_mgr.save({
         "segments_step3": routed_segments,
@@ -2024,6 +2161,8 @@ def run_step_3(config: DubbingConfig) -> None:
         "segments_json_path": json_path,
         "light_tts_selector_results": light_tts_results,
         "light_tts_selector_results_path": light_tts_results_path,
+        "tts_routing_summary": {k: v for k, v in routing_summary.items() if k != "rows"},
+        "tts_routing_report_path": routing_report_path,
     })
     print(f"✅ Scheme 3 segments JSON: {json_path}")
 
@@ -2034,7 +2173,7 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
     if not state or "segments_step3" not in state:
         print("❌ 请先运行 Step 3")
         return
-    from translation_quality import require_translated
+    from translation_quality import is_skipped, require_translated
     require_translated(state["segments_step3"], config.target_lang, state.get("src_lang", ""))
     if backend in {"indextts", "router", "scheme2", "scheme3"}:
         from tts_router import TTSRouter
@@ -2042,14 +2181,24 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
         scheme = "baseline" if backend == "indextts" else ("scheme3" if backend == "scheme3" else "scheme2")
         print(f"--- [Step 4] 语音合成 (TTS Router: {scheme}) ---")
         config.source_lang = state.get("src_lang", "unknown")
+        # Segments skipped by the translation policy keep their original audio;
+        # synthesizing them is exactly what the policy is avoiding.
+        dubbing_segments = [s for s in state["segments_step3"] if not is_skipped(s)]
+        undubbed = len(state["segments_step3"]) - len(dubbing_segments)
+        if undubbed:
+            print(f"⚠️ {undubbed} 句翻译已降级跳过，本轮不配音（Step 5 将保留其原声）。")
         clips, router_results = TTSRouter(config, scheme=scheme).run(
-            state["segments_step3"], state["vocals_path"], force=force
+            dubbing_segments, state["vocals_path"], force=force
         )
         result_by_id = {str(item.get("segment_id")): item for item in router_results}
         enriched_segments = []
         for index, segment in enumerate(state["segments_step3"]):
             updated = segment.copy()
             metadata = result_by_id.get(str(segment.get("id", index)), {})
+            if is_skipped(segment) and not metadata:
+                updated.update({"tts_status": "skipped", "dubbing_enabled": False})
+                enriched_segments.append(updated)
+                continue
             if metadata:
                 updated.update({
                     "tts_status": metadata.get("status"),
@@ -2091,6 +2240,41 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
     raise ValueError(f"unsupported TTS backend: {backend}")
 
 
+def restore_skipped_vocals(state: Dict[str, Any], config: DubbingConfig) -> str:
+    """Return an accompaniment with the original vocals put back for skipped lines.
+
+    A line whose translation was skipped has no dub.  Leaving the gap silent
+    would make the output unusable, so the separated vocal is overlaid back
+    onto the accompaniment for exactly those spans.
+    """
+    accomp_path = str(state.get("accomp_path") or "")
+    skipped = [s for s in state.get("segments_step3", []) if s.get("translation_status") == "skipped"]
+    if not skipped:
+        return accomp_path
+    vocals_path = str(state.get("vocals_path") or "")
+    if not os.path.isfile(accomp_path) or not os.path.isfile(vocals_path):
+        print(f"⚠️ 缺少伴奏/人声文件，{len(skipped)} 句跳过的翻译将没有原声。")
+        return accomp_path
+    try:
+        vocals = AudioSegment.from_wav(vocals_path)
+        restored = AudioSegment.from_wav(accomp_path)
+        applied = 0
+        for segment in skipped:
+            start = max(0, int(float(segment["start"]) * 1000))
+            end = min(len(vocals), int(float(segment["end"]) * 1000))
+            if end <= start:
+                continue
+            restored = restored.overlay(vocals[start:end], position=start)
+            applied += 1
+        path = os.path.join(config.temp_dir, "accomp_with_skipped_vocals.wav")
+        restored.export(path, format="wav")
+        print(f"↩️ 已为 {applied}/{len(skipped)} 句跳过的翻译恢复原始人声: {path}")
+        return path
+    except Exception as exc:
+        print(f"⚠️ 恢复跳过句原声失败，改用纯伴奏: {exc}")
+        return accomp_path
+
+
 def run_step_5(config: DubbingConfig, input_file: str) -> None:
     state_mgr = StateManager(config)
     state = state_mgr.load()
@@ -2102,7 +2286,7 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
     from tts_quality import validate_mix_state
     validate_mix_state(state, config, allow_missing=getattr(config, "allow_missing_tts", False))
     mixer = Mixer(config)
-    mixer.run(state["audio_clips"], state["accomp_path"], input_file, state["duration"])
+    mixer.run(state["audio_clips"], restore_skipped_vocals(state, config), input_file, state["duration"])
 
 
 def main() -> None:
@@ -2136,9 +2320,27 @@ def main() -> None:
     parser.add_argument("--retranslate-ids", default="", help="仅重新翻译指定 segment IDs（逗号分隔）")
     parser.add_argument("--disable-tts-fallback", action="store_true", help="关闭 TTS 模型 fallback")
     parser.add_argument("--allow-missing-tts", action="store_true", help="显式允许不完整 TTS 混音")
+    parser.add_argument(
+        "--translation-failure-policy",
+        choices=["fail_fast", "skip_failed"],
+        default=None,
+        help="单句翻译失败时：fail_fast=整阶段失败(默认)，skip_failed=该句不配音并保留原声",
+    )
+    parser.add_argument(
+        "--emotion-precedence",
+        choices=["complexity_first", "strong_emotion_first"],
+        default=None,
+        help="路由优先级：complexity_first=长/复杂句优先(默认)，strong_emotion_first=强情绪优先",
+    )
     args = parser.parse_args()
     if args.tts_backend not in {"indextts", "router", "scheme2", "scheme3"}:
         parser.error("invalid AUTODUB_TTS_BACKEND")
+    # Both switches are read from the environment by the modules that own them,
+    # so the CLI simply publishes the choice before anything imports them.
+    if args.translation_failure_policy:
+        os.environ["AUTODUB_TRANSLATION_FAILURE_POLICY"] = args.translation_failure_policy
+    if args.emotion_precedence:
+        os.environ["AUTODUB_SCHEME3_EMOTION_PRECEDENCE"] = args.emotion_precedence
 
     config = DubbingConfig(args.input_file)
     config.target_lang = args.lang

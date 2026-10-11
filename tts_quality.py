@@ -41,10 +41,19 @@ def validate_mix_state(state, config, *, allow_missing=False):
     by_id={str(c.get("segment_id")):c for c in clips}
     ids=[str(s.get("id",i)) for i,s in enumerate(rows)]
     results={str(r.get("segment_id")):r for r in state.get("tts_router_results",[])}
+    # Segments degraded by the translation policy are expected to have no dub;
+    # they are excluded from the completeness arithmetic but must not gain one.
+    skipped={str(s.get("id",i)) for i,s in enumerate(rows)
+             if s.get("translation_status")=="skipped"}
+    dubbing=[sid for sid in ids if sid not in skipped]
     issues=[]
     if len(by_id)!=len(clips) or len(set(ids))!=len(ids) or set(by_id)-set(ids):
         raise RuntimeError("Step5 blocked: duplicate/unknown segment IDs in TTS clips")
     for sid in ids:
+        if sid in skipped:
+            if sid in by_id or sid in results:
+                issues.append(f"{sid}:skipped segment unexpectedly produced TTS audio")
+            continue
         result=results.get(sid,{})
         clip=by_id.get(sid,{})
         try:
@@ -62,8 +71,9 @@ def validate_mix_state(state, config, *, allow_missing=False):
                 raise ValueError("WAV content checksum mismatch")
         except Exception as exc:
             issues.append(f"{sid}:{exc}")
-    if manifest.get("success")!=len(rows) or len(clips)!=len(rows):
-        issues.append(f"incomplete Step4: {manifest.get('success')}/{len(rows)}")
+    if manifest.get("success")!=len(dubbing) or len(clips)!=len(dubbing):
+        issues.append(f"incomplete Step4: {manifest.get('success')}/{len(dubbing)} dubbing segments"
+                      f" (of {len(rows)} total, {len(skipped)} skipped)")
     if issues and not allow_missing:
         raise RuntimeError("Step5 blocked: " + "; ".join(issues))
     if issues:

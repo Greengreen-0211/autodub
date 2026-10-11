@@ -344,8 +344,11 @@ class TTSRouter:
         return references
 
     def run(self, segments: Iterable[Dict[str, Any]], vocal_path: str, *, force: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        from translation_quality import require_translated
-        segment_list = [dict(segment) for segment in segments]
+        from translation_quality import is_skipped, require_translated
+        # Segments degraded by the translation policy keep their original audio
+        # and must never reach a TTS engine: by construction they carry no
+        # validated text.
+        segment_list = [dict(segment) for segment in segments if not is_skipped(segment)]
         require_translated(segment_list, self.config.target_lang, getattr(self.config, "source_lang", ""))
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.final_dir.mkdir(parents=True, exist_ok=True)
