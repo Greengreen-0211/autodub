@@ -1,6 +1,8 @@
 """Regression tests for v2.2.1 issues, with no API/GPU/model downloads."""
 import argparse
 import ast
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -15,7 +17,7 @@ import wave
 from translation_quality import translate_segments, require_translated, validate_target_text
 from light_tts_selector import LightTTSSelector, EspeakBackend
 from emotion_recognizer import apply_emotion_reliability
-from scheme3_policy import build_scheme3_segments
+from scheme3_policy import build_scheme3_segments, describe_scheme3_decision
 import tts_router
 from tts_quality import duration_quality, stage_fingerprint, validate_mix_state
 from tts_preflight import cache_environment, check_model, cached_file, requirements
@@ -114,6 +116,32 @@ class TranslationTests(unittest.TestCase):
         rows=translate_segments([source(0),source(1)],"en","zh","test",request,retries=0)
         self.assertEqual([r["translation_status"] for r in rows],["success","failed"])
 
+    def test_skip_failed_policy_marks_and_unblocks_later_stages(self):
+        rows=translate_segments([source(0),source(1)],"en","zh","test",None)
+        with patch.dict(os.environ,{"AUTODUB_TRANSLATION_FAILURE_POLICY":"skip_failed"}):
+            skipped=require_translated(rows,"zh","en")
+            self.assertEqual([str(s["id"]) for s in skipped],["0","1"])
+            self.assertEqual([r["translation_status"] for r in rows],["skipped","skipped"])
+            self.assertTrue(all(r["dubbing_enabled"] is False for r in rows))
+            # Step 4 re-runs the same gate; degraded segments are not re-reported.
+            self.assertEqual(require_translated(rows,"zh","en"),[])
+
+    def test_skip_policy_leaves_valid_segments_alone(self):
+        rows=translate_segments([source(0)],"en","zh","test",
+                                lambda items:{"translations":[translation(0)]})
+        with patch.dict(os.environ,{"AUTODUB_TRANSLATION_FAILURE_POLICY":"skip_failed"}):
+            self.assertEqual(require_translated(rows,"zh","en"),[])
+        self.assertEqual(rows[0]["translation_status"],"success")
+        self.assertNotIn("dubbing_enabled",rows[0])
+
+    def test_fail_fast_stays_the_default_and_unknown_values_are_safe(self):
+        rows=translate_segments([source()],"en","zh","test",None)
+        with patch.dict(os.environ,{},clear=False):
+            os.environ.pop("AUTODUB_TRANSLATION_FAILURE_POLICY",None)
+            with self.assertRaises(RuntimeError):require_translated(rows,"zh","en")
+        with patch.dict(os.environ,{"AUTODUB_TRANSLATION_FAILURE_POLICY":"nonsense"}):
+            with self.assertRaises(RuntimeError):require_translated(rows,"zh","en")
+
 
 class LightTests(unittest.TestCase):
     def test_zh_voice_detection_and_selftest(self):
@@ -176,6 +204,50 @@ class EmotionTests(unittest.TestCase):
         out=apply_emotion_reliability([dict(source(),raw_emotion="angry",emotion_score=float("nan"),emotion_status="success")])
         self.assertFalse(out[0]["emotion_reliable"])
         self.assertEqual(out[0]["emotion"],"neutral")
+
+
+LONG_EN="alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon"
+
+
+class RoutingPolicyTests(unittest.TestCase):
+    def decision(self,text,emotion):
+        return describe_scheme3_decision("en",emotion,text)
+
+    def test_default_precedence_keeps_complexity_first_and_flags_the_override(self):
+        d=self.decision(LONG_EN,"angry")
+        self.assertEqual(d["planned_engine"],"confucius4")
+        self.assertEqual(d["rule_code"],"long_or_complex_text")
+        self.assertEqual(d["inputs"]["emotion_precedence"],"complexity_first")
+        self.assertTrue(d["inputs"]["emotion_overridden_by_complexity"])
+
+    def test_strong_emotion_first_is_opt_in_and_strong_only(self):
+        with patch.dict(os.environ,{"AUTODUB_SCHEME3_EMOTION_PRECEDENCE":"strong_emotion_first"}):
+            strong=self.decision(LONG_EN,"angry")
+            positive=self.decision(LONG_EN,"happy")
+        self.assertEqual(strong["planned_engine"],"indextts2")
+        self.assertEqual(strong["rule_code"],"strong_emotion")
+        self.assertFalse(strong["inputs"]["emotion_overridden_by_complexity"])
+        # A positive emotion is not a strong emotion; complexity still wins.
+        self.assertEqual(positive["planned_engine"],"confucius4")
+
+    def test_unknown_precedence_falls_back_to_the_shipped_rule(self):
+        with patch.dict(os.environ,{"AUTODUB_SCHEME3_EMOTION_PRECEDENCE":"nonsense"}):
+            d=self.decision("short line","angry")
+        self.assertEqual(d["inputs"]["emotion_precedence"],"complexity_first")
+        self.assertEqual(d["planned_engine"],"indextts2")
+
+    def test_neutral_long_text_is_not_an_emotion_override(self):
+        d=self.decision(LONG_EN,"neutral")
+        self.assertEqual(d["planned_engine"],"confucius4")
+        self.assertFalse(d["inputs"]["emotion_overridden_by_complexity"])
+
+    def test_build_scheme3_segments_accepts_an_explicit_precedence(self):
+        routed=build_scheme3_segments([dict(source(),text=LONG_EN,emotion="angry")],
+                                      source_lang="en",target_lang="en",
+                                      emotion_precedence="strong_emotion_first")
+        self.assertEqual(routed[0]["tts_engine"],"indextts2")
+        self.assertEqual(routed[0]["routing_inputs"]["emotion_precedence"],"strong_emotion_first")
+        self.assertFalse(routed[0]["emotion_overridden_by_complexity"])
 
 
 class RouterTests(unittest.TestCase):
@@ -297,6 +369,16 @@ class QualityTests(unittest.TestCase):
             data=bytearray(path.read_bytes()); data[-1]=1; path.write_bytes(data)
             with self.assertRaises(RuntimeError):validate_mix_state(state,config)
 
+    def test_skipped_segment_is_allowed_to_have_no_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state,config=self.mix(tmp)
+            state["segments_step3"].append(dict(source(1),translation_status="skipped",dubbing_enabled=False))
+            state["tts_stage_manifest"]={"fingerprint":stage_fingerprint(state,config,"scheme3"),"success":1}
+            validate_mix_state(state,config)
+            # A skipped segment that somehow produced audio is still an error.
+            state["audio_clips"].append(dict(state["audio_clips"][0],segment_id="1"))
+            with self.assertRaises(RuntimeError):validate_mix_state(state,config)
+
     def test_cache_environment_and_proxy_isolation(self):
         with patch.dict(os.environ,{"AUTODUB_F5_HF_HOME":"/custom/f5","PYTHONPATH":"/bad","HTTP_PROXY":"http://bad","AUTODUB_TTS_OFFLINE_MODE":"strict_offline"}):
             env=tts_router._worker_environment("f5tts")
@@ -387,7 +469,8 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self,c):pass
                 def run(self,*args):mixed.append(args)
             config=SimpleNamespace(temp_dir=tmp,target_lang="en",disable_tts_fallback=False)
-            globals=self.functions({"run_step_4","run_step_5"},{"StateManager":Manager,"Mixer":Mixer})
+            globals=self.functions({"run_step_4","run_step_5","restore_skipped_vocals"},
+                                   {"StateManager":Manager,"Mixer":Mixer})
             worker=RouterTests().worker([],{"confucius4"})
             with patch("tts_router.preflight_models"),patch("tts_router._run_worker",side_effect=worker),patch.object(tts_router.TTSRouter,"_speaker_references",return_value={"A":{"audio":str(ref),"text":"source"}}),patch("scheme3_policy.write_segments_json"):
                 config.output_dir=tmp;config.project_name="test"
@@ -396,6 +479,68 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(state["segments_step3"][0]["actual_engine"],"f5tts")
                 globals["run_step_5"](config,"unused.mp4")
             self.assertEqual(len(mixed),1)
+
+    def test_skipped_segment_gets_no_tts_and_keeps_its_original_vocal(self):
+        from pydub import AudioSegment
+        with tempfile.TemporaryDirectory() as tmp:
+            # Long enough that the skipped span (1.0s-2.0s) is actually overlaid.
+            ref=Path(tmp)/"reference.wav";wav(ref,3.0)
+            dub=dict(source(0),tts_engine="confucius4",translation_status="success")
+            skipped=dict(source(1),tts_engine="f5tts",translation_status="skipped",dubbing_enabled=False)
+            state={"segments_step3":[dub,skipped],"src_lang":"en","vocals_path":str(ref),
+                   "accomp_path":str(ref),"duration":1.0}
+            class Manager:
+                def __init__(self,c):pass
+                def load(self):return json.loads(json.dumps(state))
+                def save(self,data):state.update(json.loads(json.dumps(data)))
+            mixed=[]
+            class Mixer:
+                def __init__(self,c):pass
+                def run(self,*args):mixed.append(args)
+            config=SimpleNamespace(temp_dir=tmp,target_lang="en",disable_tts_fallback=False)
+            globals=self.functions({"run_step_4","run_step_5","restore_skipped_vocals"},
+                                   {"StateManager":Manager,"Mixer":Mixer,"AudioSegment":AudioSegment})
+            with patch("tts_router.preflight_models"),patch("tts_router._run_worker",side_effect=RouterTests().worker([],{})),patch.object(tts_router.TTSRouter,"_speaker_references",return_value={"A":{"audio":str(ref),"text":"source"}}),patch("scheme3_policy.write_segments_json"),patch.object(sys.modules["tts_quality"],"validate_mix_state"):
+                config.output_dir=tmp;config.project_name="test"
+                globals["run_step_4"](config,backend="scheme3")
+                self.assertEqual(state["segments_step3"][1]["tts_status"],"skipped")
+                self.assertEqual([c["segment_id"] for c in state["audio_clips"]],["0"])
+                self.assertEqual(state["tts_stage_manifest"]["total"],2)
+                captured=io.StringIO()
+                with redirect_stdout(captured):
+                    globals["run_step_5"](config,"unused.mp4")
+            self.assertEqual(len(mixed),1)
+            restored=Path(mixed[0][1])
+            self.assertEqual(restored.name,"accomp_with_skipped_vocals.wav")
+            self.assertTrue(restored.is_file())
+            # The skipped span was really overlaid, not silently dropped.
+            self.assertIn("已为 1/1 句跳过的翻译恢复原始人声",captured.getvalue())
+            self.assertAlmostEqual(len(AudioSegment.from_wav(restored))/1000.0,3.0,places=2)
+
+    def test_routing_report_summarizes_emotion_coverage(self):
+        neutral=dict(source(0),text="hello",emotion="neutral",emotion_reliable=False,
+                     tts_engine="f5tts",routing_rule_code="neutral_short_text",
+                     routing_inputs={"target_language":"en","emotion":"neutral",
+                                     "tts_complexity":{"is_long":False,"is_complex":False,
+                                                       "cjk_chars":0,"words":1,"clause_count":1}})
+        overridden=dict(source(1),text=LONG_EN,emotion="angry",emotion_raw_label="angry",
+                        emotion_reliable=True,tts_engine="confucius4",
+                        routing_rule_code="long_or_complex_text",emotion_overridden_by_complexity=True,
+                        routing_inputs={"target_language":"en","emotion":"angry",
+                                        "tts_complexity":{"is_long":True,"is_complex":False,
+                                                          "cjk_chars":0,"words":21,"clause_count":1}})
+        globals=self.functions({"_routing_report_rows","summarize_routing","print_routing_report"},{})
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/"routing.json"
+            summary=globals["print_routing_report"]([neutral,overridden],str(path))
+            self.assertEqual(summary["by_engine"],{"confucius4":1,"f5tts":1})
+            self.assertEqual(summary["by_rule_code"],{"long_or_complex_text":1,"neutral_short_text":1})
+            self.assertEqual(summary["emotion_routed_segments"],0)
+            self.assertEqual(summary["emotion_overridden_by_complexity"],1)
+            self.assertEqual(summary["emotion_reliability"],{"reliable_segments":1,"unreliable_segments":1})
+            written=json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(written["rows"][1]["rule_code"],"long_or_complex_text")
+            self.assertEqual(written["rows"][1]["words"],21)
 
     def test_worker_does_not_reuse_mismatched_request(self):
         import tts_worker

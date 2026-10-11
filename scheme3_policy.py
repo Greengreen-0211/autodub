@@ -30,6 +30,14 @@ REQUIRED_SEGMENT_FIELDS = frozenset(
     {"text", "start", "end", "source_lang", "target_lang", "emotion", "speaker", "tts_engine"}
 )
 
+# Routing precedence.  ``complexity_first`` is the shipped scheme-three rule:
+# long or clause-heavy text always takes the long-text model.  The opt-in
+# ``strong_emotion_first`` lets a reliable strong emotion outrank complexity,
+# because indextts2 is the emotion-specialised engine.  The default is
+# unchanged, so existing routing decisions and fingerprints stay valid.
+EMOTION_PRECEDENCES = ("complexity_first", "strong_emotion_first")
+DEFAULT_EMOTION_PRECEDENCE = "complexity_first"
+
 LANGUAGE_ALIASES = {
     "chinese": "zh",
     "cmn": "zh",
@@ -173,17 +181,36 @@ def is_long_or_complex(
     return bool(analyze_text_complexity(text, target_lang, config)["is_long_or_complex"])
 
 
+def resolve_emotion_precedence(explicit: Any = None) -> str:
+    """Resolve routing precedence; unknown values keep the shipped default."""
+    value = explicit if explicit is not None else os.getenv("AUTODUB_SCHEME3_EMOTION_PRECEDENCE", "")
+    value = str(value or "").strip().lower()
+    return value if value in EMOTION_PRECEDENCES else DEFAULT_EMOTION_PRECEDENCE
+
+
+def emotion_outranks_complexity(emotion: Any, precedence: Any = None) -> bool:
+    """True when a strong emotion should win over a long/complex sentence."""
+    return (
+        resolve_emotion_precedence(precedence) == "strong_emotion_first"
+        and normalize_emotion(emotion) in STRONG_EMOTIONS
+    )
+
+
 def select_scheme3_tts_engine(
     target_lang: Any,
     emotion: Any,
     text: Any,
     config: Optional[ComplexityConfig] = None,
+    *,
+    precedence: Any = None,
 ) -> str:
     lang = normalize_language(target_lang)
     normalized_emotion = normalize_emotion(emotion)
     if lang not in {"zh", "en"}:
         return "omnivoice"
-    if is_long_or_complex(text, lang, config):
+    if is_long_or_complex(text, lang, config) and not emotion_outranks_complexity(
+        normalized_emotion, precedence
+    ):
         return "confucius4"
     if normalized_emotion in STRONG_EMOTIONS:
         return "indextts2"
@@ -197,22 +224,30 @@ def describe_scheme3_decision(
     emotion: Any,
     text: Any,
     config: Optional[ComplexityConfig] = None,
+    *,
+    precedence: Any = None,
 ) -> dict[str, Any]:
     """Return the complete, auditable routing decision used by the API."""
     cfg = config or ComplexityConfig.from_env()
     language = normalize_language(target_lang)
     normalized_emotion = normalize_emotion(emotion)
+    resolved_precedence = resolve_emotion_precedence(precedence)
     complexity = analyze_text_complexity(text, language, cfg)
+    strong = normalized_emotion in STRONG_EMOTIONS
+    positive = normalized_emotion in POSITIVE_EMOTIONS
+    emotion_candidate = strong or positive
     if language not in {"zh", "en"}:
         engine, rule_code = "omnivoice", "unsupported_primary_language"
         reason = "The target language is outside the dedicated Chinese/English routes."
-    elif complexity["is_long_or_complex"]:
+    elif complexity["is_long_or_complex"] and not (
+        strong and resolved_precedence == "strong_emotion_first"
+    ):
         engine, rule_code = "confucius4", "long_or_complex_text"
         reason = "The translated text meets the configured length or clause threshold."
-    elif normalized_emotion in STRONG_EMOTIONS:
+    elif strong:
         engine, rule_code = "indextts2", "strong_emotion"
         reason = "The effective emotion requires the strong-emotion route."
-    elif normalized_emotion in POSITIVE_EMOTIONS:
+    elif positive:
         engine, rule_code = "cosyvoice3", "positive_emotion"
         reason = "The effective emotion requires the positive-emotion route."
     else:
@@ -227,6 +262,13 @@ def describe_scheme3_decision(
         "inputs": {
             "target_language": language,
             "emotion": normalized_emotion,
+            "emotion_precedence": resolved_precedence,
+            # Recorded so the log can show when a real emotion lost to the
+            # complexity rule -- the case the emotion routes are easiest to
+            # under-count without.
+            "emotion_overridden_by_complexity": bool(
+                emotion_candidate and complexity["is_long_or_complex"] and engine == "confucius4"
+            ),
             "tts_complexity": complexity,
             "thresholds": {
                 "zh_long_chars": cfg.zh_long_chars,
@@ -243,6 +285,7 @@ def build_scheme3_segments(
     source_lang: Any,
     target_lang: Any,
     config: Optional[ComplexityConfig] = None,
+    emotion_precedence: Any = None,
 ) -> list[dict[str, Any]]:
     canonical_target = normalize_language(target_lang)
     target_detail = str(target_lang or "").strip().lower().replace("_", "-") or "other"
@@ -262,7 +305,9 @@ def build_scheme3_segments(
             emotion = normalize_emotion(raw, score=score, duration=duration)
         text = str(segment.get("text", "")).strip()
         per_segment_source = segment.get("source_lang", source_lang)
-        decision = describe_scheme3_decision(canonical_target, emotion, text, config)
+        decision = describe_scheme3_decision(
+            canonical_target, emotion, text, config, precedence=emotion_precedence
+        )
         complexity = decision["inputs"]["tts_complexity"]
         engine = decision["planned_engine"]
         segment.update(
@@ -283,6 +328,9 @@ def build_scheme3_segments(
                 "routing_rule_version": decision["rule_version"],
                 "routing_reason": decision["reason"],
                 "routing_inputs": decision["inputs"],
+                "emotion_overridden_by_complexity": bool(
+                    decision["inputs"]["emotion_overridden_by_complexity"]
+                ),
             }
         )
         if canonical_target == "other":
