@@ -65,6 +65,27 @@ BOUNDARY_NMS_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_NMS_SECONDS", 1.15)
 BOUNDARY_SCORE_OVERRIDE = os.getenv("AUTODUB_DIAR_BOUNDARY_SCORE")
 STRONG_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_STRONG_SIMILARITY", 0.52)
 WEAK_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_WEAK_SIMILARITY", 0.36)
+SOFT_BOUNDARY_MERGE_SIMILARITY = _env_float(
+    "AUTODUB_DIAR_SOFT_BOUNDARY_MERGE_SIMILARITY", 0.58
+)
+LOW_QUALITY_ASSIGN_SIMILARITY = _env_float(
+    "AUTODUB_DIAR_LOW_QUALITY_ASSIGN_SIMILARITY", 0.46
+)
+LOW_QUALITY_ASSIGN_MARGIN = _env_float(
+    "AUTODUB_DIAR_LOW_QUALITY_ASSIGN_MARGIN", 0.04
+)
+RELIABLE_TURN_MIN_SECONDS = _env_float(
+    "AUTODUB_DIAR_RELIABLE_TURN_MIN_SECONDS", 1.8
+)
+RELIABLE_TURN_MIN_WINDOWS = _env_int(
+    "AUTODUB_DIAR_RELIABLE_TURN_MIN_WINDOWS", 2
+)
+RELIABLE_TURN_MIN_COHESION = _env_float(
+    "AUTODUB_DIAR_RELIABLE_TURN_MIN_COHESION", 0.55
+)
+CLUSTERING_DIAGNOSTICS_PATH = os.path.join(
+    WORK_DIR, "speaker_clustering_diagnostics.json"
+)
 
 
 def load_state():
@@ -172,6 +193,8 @@ def detect_speech_regions(vocal_path):
 
 def prepare_inputs(state):
     os.makedirs(WORK_DIR, exist_ok=True)
+    if os.path.exists(CLUSTERING_DIAGNOSTICS_PATH):
+        os.unlink(CLUSTERING_DIAGNOSTICS_PATH)
     for sub in ["fbank", "embedding", "labels"]:
         p = os.path.join(WORK_DIR, sub)
         if os.path.exists(p):
@@ -429,8 +452,15 @@ def _select_change_boundaries(candidates, windows):
     for candidate in located:
         key = location_key(candidate)
         threshold = thresholds[key]
+        candidate["threshold"] = threshold
         punctuation = candidate.get("punctuation", "none")
         if punctuation == "strong" and candidate["score"] >= threshold:
+            candidate["constraint"] = (
+                "hard"
+                if candidate["score"] >= threshold + 0.03
+                and min(candidate["left_count"], candidate["right_count"]) >= 2
+                else "soft"
+            )
             eligible.append(candidate)
             continue
 
@@ -450,6 +480,9 @@ def _select_change_boundaries(candidates, windows):
             for other in located
         )
         if not punctuated_neighbor:
+            # A non-punctuated acoustic peak can locate a useful split, but is
+            # not strong enough to permanently assert two different identities.
+            candidate["constraint"] = "soft"
             eligible.append(candidate)
 
     # Non-maximum suppression keeps one acoustic peak for one real change.
@@ -476,16 +509,24 @@ def _build_acoustic_turns(windows, boundaries):
     by_region = defaultdict(list)
     for index, window in enumerate(windows):
         by_region[window["region"]].append(index)
-    boundary_times = defaultdict(list)
+    boundaries_by_region = defaultdict(list)
     for item in boundaries:
         if item["region"] is not None:
-            boundary_times[item["region"]].append(float(item["time"]))
+            boundaries_by_region[item["region"]].append(item)
 
     turns = []
-    cannot_links = set()
+    hard_cannot_links = set()
+    soft_cannot_links = set()
     turns_by_region = {}
     for region in sorted(by_region, key=lambda item: item[1]):
-        cuts = [region[1], *sorted(boundary_times.get(region, [])), region[2]]
+        region_boundaries = sorted(
+            boundaries_by_region.get(region, []), key=lambda item: item["time"]
+        )
+        cuts = [
+            region[1],
+            *[float(item["time"]) for item in region_boundaries],
+            region[2],
+        ]
         region_turns = []
         for interval_index, (start, end) in enumerate(zip(cuts, cuts[1:])):
             is_last_interval = interval_index == len(cuts) - 2
@@ -506,9 +547,20 @@ def _build_acoustic_turns(windows, boundaries):
                 if start + guard <= windows[index]["center"] <= end - guard
             ]
             source = interior or indices
-            embedding = _unit_vector(np.mean(np.stack([
+            source_embeddings = np.stack([
                 windows[index]["embedding"] for index in source
-            ]), axis=0))
+            ])
+            embedding = _unit_vector(np.mean(source_embeddings, axis=0))
+            cohesion = float(np.mean(source_embeddings @ embedding))
+            duration_score = min(1.0, max(0.0, duration) / 3.0)
+            window_score = min(1.0, len(source) / 3.0)
+            cohesion_score = min(1.0, max(0.0, (cohesion - 0.25) / 0.55))
+            quality = 0.40 * duration_score + 0.25 * window_score + 0.35 * cohesion_score
+            reliable = (
+                duration >= RELIABLE_TURN_MIN_SECONDS
+                and len(source) >= RELIABLE_TURN_MIN_WINDOWS
+                and cohesion >= RELIABLE_TURN_MIN_COHESION
+            )
             turn_index = len(turns)
             turns.append({
                 "start": start,
@@ -517,10 +569,33 @@ def _build_acoustic_turns(windows, boundaries):
                 "region": region,
                 "window_indices": indices,
                 "embedding": embedding,
+                "embedding_window_count": len(source),
+                "embedding_cohesion": cohesion,
+                "embedding_quality": quality,
+                "embedding_reliable": reliable,
             })
             region_turns.append(turn_index)
-        for left, right in zip(region_turns, region_turns[1:]):
-            cannot_links.add((min(left, right), max(left, right)))
+        for boundary in region_boundaries:
+            boundary_time = float(boundary["time"])
+            left_candidates = [
+                index
+                for index in region_turns
+                if turns[index]["end"] <= boundary_time + 1e-6
+            ]
+            right_candidates = [
+                index
+                for index in region_turns
+                if turns[index]["start"] >= boundary_time - 1e-6
+            ]
+            if not left_candidates or not right_candidates:
+                continue
+            left = max(left_candidates, key=lambda index: turns[index]["end"])
+            right = min(right_candidates, key=lambda index: turns[index]["start"])
+            edge = (min(left, right), max(left, right))
+            if boundary.get("constraint") == "hard":
+                hard_cannot_links.add(edge)
+            else:
+                soft_cannot_links.add(edge)
         turns_by_region[region] = region_turns
     for item in boundaries:
         if item["between_regions"] is None:
@@ -531,8 +606,12 @@ def _build_acoustic_turns(windows, boundaries):
         if left_turns and right_turns:
             left = left_turns[-1]
             right = right_turns[0]
-            cannot_links.add((min(left, right), max(left, right)))
-    return turns, cannot_links
+            edge = (min(left, right), max(left, right))
+            if item.get("constraint") == "hard":
+                hard_cannot_links.add(edge)
+            else:
+                soft_cannot_links.add(edge)
+    return turns, hard_cannot_links, soft_cannot_links
 
 
 def _cluster_centroid(cluster, turns):
@@ -550,6 +629,23 @@ def _clusters_conflict(left, right, cannot_links):
         for a in left
         for b in right
     )
+
+
+def _cluster_reliability(cluster, turns):
+    members = list(cluster)
+    durations = [max(0.0, float(turns[index]["duration"])) for index in members]
+    weights = [max(0.75, math.sqrt(duration)) for duration in durations]
+    qualities = [
+        float(turns[index].get("embedding_quality", 0.0)) for index in members
+    ]
+    quality = float(np.average(qualities, weights=weights)) if qualities else 0.0
+    reliable_duration = sum(
+        duration
+        for index, duration in zip(members, durations)
+        if turns[index].get("embedding_reliable")
+    )
+    reliable = reliable_duration >= RELIABLE_TURN_MIN_SECONDS
+    return quality, reliable
 
 
 def _merge_clusters(clusters, left_index, right_index):
@@ -580,11 +676,8 @@ def _constrained_turn_clusters(turns, cannot_links):
             break
         clusters = _merge_clusters(clusters, best[1], best[2])
 
-    # Complete the partition as a constrained graph-colouring problem.  A
-    # strong acoustic change creates a hard edge.  Very dissimilar residual
-    # identities also create an edge.  DSATUR then uses the fewest identities
-    # it can without breaking those edges, so a speaker with only one short
-    # line is not discarded merely because it cannot form a density cluster.
+    # Preserve the existing turn labels for RTTM generation.  These labels
+    # retain every accepted local change so sentence alignment stays stable.
     centroids = [_cluster_centroid(cluster, turns) for cluster in clusters]
     conflicts = [set() for _ in clusters]
     for left in range(len(clusters)):
@@ -633,6 +726,146 @@ def _constrained_turn_clusters(turns, cannot_links):
     return list(grouped.values())
 
 
+def _reconcile_turn_clusters(
+    raw_clusters, turns, hard_cannot_links, soft_cannot_links
+):
+    """Merge raw identities globally without changing the RTTM turn labels."""
+    identity_nodes = [{index} for index in range(len(raw_clusters))]
+    merge_history = []
+
+    def turn_members(nodes):
+        return {
+            turn_index
+            for raw_index in nodes
+            for turn_index in raw_clusters[raw_index]
+        }
+
+    while len(identity_nodes) > 1:
+        turn_groups = [turn_members(nodes) for nodes in identity_nodes]
+        centroids = [_cluster_centroid(group, turns) for group in turn_groups]
+        reliability = [_cluster_reliability(group, turns) for group in turn_groups]
+        similarities = {}
+        for left in range(len(identity_nodes)):
+            for right in range(left + 1, len(identity_nodes)):
+                if _clusters_conflict(
+                    turn_groups[left], turn_groups[right], hard_cannot_links
+                ):
+                    continue
+                similarities[(left, right)] = float(
+                    centroids[left] @ centroids[right]
+                )
+
+        if not similarities:
+            break
+
+        ranked_by_node = defaultdict(list)
+        for (left, right), similarity in similarities.items():
+            ranked_by_node[left].append((similarity, right))
+            ranked_by_node[right].append((similarity, left))
+        for values in ranked_by_node.values():
+            values.sort(reverse=True)
+
+        best = None
+        for (left, right), similarity in similarities.items():
+            left_reliable = reliability[left][1]
+            right_reliable = reliability[right][1]
+            soft_boundary = _clusters_conflict(
+                turn_groups[left], turn_groups[right], soft_cannot_links
+            )
+            if left_reliable and right_reliable:
+                threshold = STRONG_SPEAKER_SIMILARITY
+                reason = "reliable_prototype_match"
+            elif left_reliable or right_reliable:
+                threshold = LOW_QUALITY_ASSIGN_SIMILARITY
+                reason = "short_turn_prototype_match"
+            else:
+                threshold = STRONG_SPEAKER_SIMILARITY + 0.04
+                reason = "low_quality_mutual_match"
+            if soft_boundary:
+                threshold = max(threshold, SOFT_BOUNDARY_MERGE_SIMILARITY)
+                reason = "soft_boundary_override"
+            if similarity < threshold:
+                continue
+
+            # An unreliable identity may merge only when the target is its
+            # unambiguous best match.  This keeps one-word rare speakers from
+            # being absorbed merely to reduce the number of identities.
+            ambiguous = False
+            for node, reliable in ((left, left_reliable), (right, right_reliable)):
+                if reliable:
+                    continue
+                ranked = ranked_by_node[node]
+                if not ranked or ranked[0][1] not in {left, right}:
+                    ambiguous = True
+                    break
+                if (
+                    len(ranked) > 1
+                    and ranked[0][0] - ranked[1][0]
+                    < LOW_QUALITY_ASSIGN_MARGIN
+                ):
+                    ambiguous = True
+                    break
+            if ambiguous:
+                continue
+            if best is None or similarity > best[0]:
+                best = (similarity, left, right, threshold, reason)
+
+        if best is None:
+            break
+        similarity, left, right, threshold, reason = best
+        merged = identity_nodes[left] | identity_nodes[right]
+        merge_history.append({
+            "raw_speakers": [
+                f"SPEAKER_{index:02d}" for index in sorted(merged)
+            ],
+            "similarity": round(similarity, 4),
+            "threshold": round(threshold, 4),
+            "reason": reason,
+        })
+        identity_nodes = [
+            nodes
+            for index, nodes in enumerate(identity_nodes)
+            if index not in (left, right)
+        ] + [merged]
+
+    ordered_identity_nodes = sorted(
+        identity_nodes,
+        key=lambda nodes: min(
+            turns[turn_index]["start"]
+            for raw_index in nodes
+            for turn_index in raw_clusters[raw_index]
+        ),
+    )
+    identity_clusters = []
+    raw_to_final = {}
+    for final_label, nodes in enumerate(ordered_identity_nodes):
+        combined = set()
+        for raw_index in nodes:
+            raw_to_final[raw_index] = final_label
+            combined.update(raw_clusters[raw_index])
+        identity_clusters.append(combined)
+
+    reliable_turns = sum(bool(turn.get("embedding_reliable")) for turn in turns)
+    diagnostics = {
+        "algorithm": "quality_aware_temporal_clustering_v1",
+        "turn_count": len(turns),
+        "raw_speaker_count": len(raw_clusters),
+        "speaker_count": len(identity_clusters),
+        "hard_constraint_count": len(hard_cannot_links),
+        "soft_constraint_count": len(soft_cannot_links),
+        "reliable_turn_count": reliable_turns,
+        "low_quality_turn_count": len(turns) - reliable_turns,
+        "speaker_count_lower_bound": 2 if hard_cannot_links else 1,
+        "speaker_count_confidence": round(
+            sum(float(turn.get("embedding_quality", 0.0)) for turn in turns)
+            / max(1, len(turns)),
+            4,
+        ),
+        "identity_merges": merge_history,
+    }
+    return identity_clusters, raw_to_final, diagnostics
+
+
 def run_temporal_constrained_clustering(segments):
     """Cluster speaker turns while preserving local acoustic change evidence."""
     if not kaldiio or np is None:
@@ -665,25 +898,86 @@ def run_temporal_constrained_clustering(segments):
             f"   换人候选 {item['time']:.3f}s: "
             f"change={item['score']:.3f}, gap={item['gap']:.3f}s, "
             f"punctuation={item.get('punctuation', 'none')}, "
+            f"constraint={item.get('constraint', 'soft')}, "
             f"{item['left_text']!r} -> {item['right_text']!r}"
         )
 
-    turns, cannot_links = _build_acoustic_turns(windows, boundaries)
+    turns, hard_cannot_links, soft_cannot_links = _build_acoustic_turns(
+        windows, boundaries
+    )
     if len(turns) < 2:
         return False
-    clusters = _constrained_turn_clusters(turns, cannot_links)
-    clusters.sort(key=lambda cluster: min(turns[index]["start"] for index in cluster))
-    turn_labels = {}
-    for label, cluster in enumerate(clusters):
+    raw_clusters = _constrained_turn_clusters(
+        turns, hard_cannot_links | soft_cannot_links
+    )
+    raw_clusters.sort(
+        key=lambda cluster: min(turns[index]["start"] for index in cluster)
+    )
+    identity_clusters, raw_to_final, diagnostics = _reconcile_turn_clusters(
+        raw_clusters, turns, hard_cannot_links, soft_cannot_links
+    )
+    raw_turn_labels = {}
+    final_turn_labels = {}
+    for raw_label, cluster in enumerate(raw_clusters):
         for turn_index in cluster:
-            turn_labels[turn_index] = label
+            raw_turn_labels[turn_index] = raw_label
+            final_turn_labels[turn_index] = raw_to_final[raw_label]
 
     window_labels = {}
     for turn_index, turn in enumerate(turns):
         for window_index in turn["window_indices"]:
-            window_labels[window_index] = turn_labels[turn_index]
+            # RTTM intentionally keeps raw labels so identity reconciliation
+            # cannot remove a sentence/speaker boundary.
+            window_labels[window_index] = raw_turn_labels[turn_index]
     if len(window_labels) != len(windows):
         return False
+
+    speaker_profiles = {}
+    for label, cluster in enumerate(identity_clusters):
+        quality, reliable = _cluster_reliability(cluster, turns)
+        speaker_profiles[f"SPEAKER_{label:02d}"] = {
+            "turn_count": len(cluster),
+            "duration": round(sum(turns[index]["duration"] for index in cluster), 3),
+            "embedding_quality": round(quality, 4),
+            "reliable": reliable,
+        }
+    diagnostics["speaker_count"] = len(identity_clusters)
+    diagnostics["speaker_count_preferred"] = len(identity_clusters)
+    diagnostics["speaker_count_range"] = [
+        diagnostics["speaker_count_lower_bound"],
+        len(identity_clusters),
+    ]
+    diagnostics["speaker_profiles"] = speaker_profiles
+    diagnostics["speaker_identity_map"] = {
+        f"SPEAKER_{raw_label:02d}": f"SPEAKER_{final_label:02d}"
+        for raw_label, final_label in sorted(raw_to_final.items())
+    }
+    diagnostics["turns"] = [
+        {
+            "start": round(turn["start"], 3),
+            "end": round(turn["end"], 3),
+            "duration": round(turn["duration"], 3),
+            "embedding_window_count": turn["embedding_window_count"],
+            "embedding_cohesion": round(turn["embedding_cohesion"], 4),
+            "embedding_quality": round(turn["embedding_quality"], 4),
+            "embedding_reliable": bool(turn["embedding_reliable"]),
+            "speaker_raw": f"SPEAKER_{raw_turn_labels[index]:02d}",
+            "speaker": f"SPEAKER_{final_turn_labels[index]:02d}",
+        }
+        for index, turn in enumerate(turns)
+    ]
+    diagnostics["boundaries"] = [
+        {
+            "time": round(float(item["time"]), 3),
+            "score": round(float(item["score"]), 4),
+            "threshold": round(float(item.get("threshold", 0.0)), 4),
+            "punctuation": item.get("punctuation", "none"),
+            "constraint": item.get("constraint", "soft"),
+        }
+        for item in boundaries
+    ]
+    with open(CLUSTERING_DIAGNOSTICS_PATH, "w", encoding="utf-8") as stream:
+        json.dump(diagnostics, stream, ensure_ascii=False, indent=2)
 
     os.makedirs(os.path.dirname(labels_out), exist_ok=True)
     with open(labels_out, "w", encoding="utf-8") as stream:
@@ -692,7 +986,9 @@ def run_temporal_constrained_clustering(segments):
 
     print(
         f"✅ 时序约束聚类: {len(turns)} 个声学话轮 -> "
-        f"{len(clusters)} 位说话人（允许稀有说话人保留）。"
+        f"{len(raw_clusters)} 个原始身份 -> {len(identity_clusters)} 位全局说话人"
+        f"（硬约束 {len(hard_cannot_links)}, "
+        f"软约束 {len(soft_cannot_links)}, 可靠话轮 {diagnostics['reliable_turn_count']}）。"
     )
     return True
 
@@ -1228,6 +1524,43 @@ def assign_speakers(segments, rttm_spans):
     return merged
 
 
+def load_clustering_diagnostics():
+    if not os.path.isfile(CLUSTERING_DIAGNOSTICS_PATH):
+        return None
+    try:
+        with open(CLUSTERING_DIAGNOSTICS_PATH, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError) as exc:
+        print(f"⚠️ 无法读取说话人聚类诊断: {exc}")
+        return None
+
+
+def attach_speaker_confidence(segments, diagnostics):
+    """Map global identities without changing text, timing, or segment count."""
+    profiles = diagnostics.get("speaker_profiles") or {}
+    identity_map = diagnostics.get("speaker_identity_map") or {}
+    enriched = []
+    for source in segments:
+        segment = source.copy()
+        raw_speaker = normalize_speaker(segment.get("speaker"))
+        final_speaker = normalize_speaker(
+            identity_map.get(raw_speaker, raw_speaker)
+        )
+        segment["speaker_raw"] = raw_speaker
+        segment["speaker"] = final_speaker
+        profile = profiles.get(final_speaker) or {}
+        if profile:
+            segment["speaker_confidence"] = float(
+                profile.get("embedding_quality", 0.0)
+            )
+            segment["speaker_assignment"] = diagnostics.get(
+                "algorithm", "quality_aware_temporal_clustering_v1"
+            )
+        enriched.append(segment)
+    return enriched
+
+
 def main():
     print("=== [Step 2] WeSpeaker + 时序约束聚类 说话人分离 ===")
     print(f"当前 Python: {sys.executable}")
@@ -1241,11 +1574,33 @@ def main():
     print("\n=== [Step 2-W] 解析 RTTM 回填 AutoDub Segments ===")
     rttm_spans = parse_rttm(rttm_path)
     aligned = assign_speakers(state["segments_step1"], rttm_spans)
+    diagnostics = load_clustering_diagnostics()
+    if diagnostics:
+        aligned = attach_speaker_confidence(aligned, diagnostics)
 
     unique = sorted(set(s["speaker"] for s in aligned))
     print(f"🔍 最终识别出 {len(unique)} 个说话人: {unique}")
 
     state["segments_step2"] = aligned
+    if diagnostics:
+        state["speaker_clustering"] = diagnostics
+        state["estimated_speaker_count"] = diagnostics.get(
+            "speaker_count_preferred", len(unique)
+        )
+        state["estimated_speaker_range"] = diagnostics.get(
+            "speaker_count_range", [len(unique), len(unique)]
+        )
+        state["speaker_count_confidence"] = diagnostics.get(
+            "speaker_count_confidence", 0.0
+        )
+    else:
+        for key in (
+            "speaker_clustering",
+            "estimated_speaker_count",
+            "estimated_speaker_range",
+            "speaker_count_confidence",
+        ):
+            state.pop(key, None)
     save_state(state)
     print("\n✅ Step 2 完成。请切回 autodub_server 环境继续运行 Step 3。")
 
