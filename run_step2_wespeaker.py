@@ -65,6 +65,36 @@ BOUNDARY_NMS_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_NMS_SECONDS", 1.15)
 BOUNDARY_SCORE_OVERRIDE = os.getenv("AUTODUB_DIAR_BOUNDARY_SCORE")
 STRONG_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_STRONG_SIMILARITY", 0.52)
 WEAK_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_WEAK_SIMILARITY", 0.36)
+PROTOTYPE_MERGE_SIMILARITY = _env_float(
+    "AUTODUB_DIAR_PROTOTYPE_MERGE_SIMILARITY", 0.48
+)
+LOW_QUALITY_ASSIGN_SIMILARITY = _env_float(
+    "AUTODUB_DIAR_LOW_QUALITY_ASSIGN_SIMILARITY", 0.36
+)
+LOW_QUALITY_ASSIGN_MARGIN = _env_float(
+    "AUTODUB_DIAR_LOW_QUALITY_ASSIGN_MARGIN", 0.025
+)
+SENTENCE_CONTINUITY_SIMILARITY = _env_float(
+    "AUTODUB_DIAR_SENTENCE_CONTINUITY_SIMILARITY", 0.34
+)
+PROTOTYPE_ANCHOR_MIN_SECONDS = _env_float(
+    "AUTODUB_DIAR_PROTOTYPE_ANCHOR_MIN_SECONDS", 4.0
+)
+PROTOTYPE_ANCHOR_MIN_TURNS = _env_int(
+    "AUTODUB_DIAR_PROTOTYPE_ANCHOR_MIN_TURNS", 2
+)
+RELIABLE_TURN_MIN_SECONDS = _env_float(
+    "AUTODUB_DIAR_RELIABLE_TURN_MIN_SECONDS", 1.8
+)
+RELIABLE_TURN_MIN_WINDOWS = _env_int(
+    "AUTODUB_DIAR_RELIABLE_TURN_MIN_WINDOWS", 2
+)
+RELIABLE_TURN_MIN_COHESION = _env_float(
+    "AUTODUB_DIAR_RELIABLE_TURN_MIN_COHESION", 0.55
+)
+CLUSTERING_DIAGNOSTICS_PATH = os.path.join(
+    WORK_DIR, "speaker_clustering_diagnostics.json"
+)
 
 
 def load_state():
@@ -172,6 +202,8 @@ def detect_speech_regions(vocal_path):
 
 def prepare_inputs(state):
     os.makedirs(WORK_DIR, exist_ok=True)
+    if os.path.exists(CLUSTERING_DIAGNOSTICS_PATH):
+        os.unlink(CLUSTERING_DIAGNOSTICS_PATH)
     for sub in ["fbank", "embedding", "labels"]:
         p = os.path.join(WORK_DIR, sub)
         if os.path.exists(p):
@@ -361,6 +393,11 @@ def _candidate_boundary_scores(segments, windows):
             "left_text": left["text"],
             "right_text": right["text"],
             "punctuation": left.get("punctuation_after", "none"),
+            "left_segment_index": left.get("segment_index"),
+            "right_segment_index": right.get("segment_index"),
+            "same_asr_segment": (
+                left.get("segment_index") == right.get("segment_index")
+            ),
         })
     return candidates
 
@@ -429,8 +466,15 @@ def _select_change_boundaries(candidates, windows):
     for candidate in located:
         key = location_key(candidate)
         threshold = thresholds[key]
+        candidate["threshold"] = threshold
         punctuation = candidate.get("punctuation", "none")
         if punctuation == "strong" and candidate["score"] >= threshold:
+            candidate["constraint"] = (
+                "hard"
+                if candidate["score"] >= threshold + 0.03
+                and min(candidate["left_count"], candidate["right_count"]) >= 2
+                else "soft"
+            )
             eligible.append(candidate)
             continue
 
@@ -450,6 +494,9 @@ def _select_change_boundaries(candidates, windows):
             for other in located
         )
         if not punctuated_neighbor:
+            # A non-punctuated acoustic peak can locate a useful split, but is
+            # not strong enough to permanently assert two different identities.
+            candidate["constraint"] = "soft"
             eligible.append(candidate)
 
     # Non-maximum suppression keeps one acoustic peak for one real change.
@@ -476,16 +523,25 @@ def _build_acoustic_turns(windows, boundaries):
     by_region = defaultdict(list)
     for index, window in enumerate(windows):
         by_region[window["region"]].append(index)
-    boundary_times = defaultdict(list)
+    boundaries_by_region = defaultdict(list)
     for item in boundaries:
         if item["region"] is not None:
-            boundary_times[item["region"]].append(float(item["time"]))
+            boundaries_by_region[item["region"]].append(item)
 
     turns = []
-    cannot_links = set()
+    hard_cannot_links = set()
+    soft_cannot_links = set()
+    boundary_evidence = {}
     turns_by_region = {}
     for region in sorted(by_region, key=lambda item: item[1]):
-        cuts = [region[1], *sorted(boundary_times.get(region, [])), region[2]]
+        region_boundaries = sorted(
+            boundaries_by_region.get(region, []), key=lambda item: item["time"]
+        )
+        cuts = [
+            region[1],
+            *[float(item["time"]) for item in region_boundaries],
+            region[2],
+        ]
         region_turns = []
         for interval_index, (start, end) in enumerate(zip(cuts, cuts[1:])):
             is_last_interval = interval_index == len(cuts) - 2
@@ -506,9 +562,20 @@ def _build_acoustic_turns(windows, boundaries):
                 if start + guard <= windows[index]["center"] <= end - guard
             ]
             source = interior or indices
-            embedding = _unit_vector(np.mean(np.stack([
+            source_embeddings = np.stack([
                 windows[index]["embedding"] for index in source
-            ]), axis=0))
+            ])
+            embedding = _unit_vector(np.mean(source_embeddings, axis=0))
+            cohesion = float(np.mean(source_embeddings @ embedding))
+            duration_score = min(1.0, max(0.0, duration) / 3.0)
+            window_score = min(1.0, len(source) / 3.0)
+            cohesion_score = min(1.0, max(0.0, (cohesion - 0.25) / 0.55))
+            quality = 0.40 * duration_score + 0.25 * window_score + 0.35 * cohesion_score
+            reliable = (
+                duration >= RELIABLE_TURN_MIN_SECONDS
+                and len(source) >= RELIABLE_TURN_MIN_WINDOWS
+                and cohesion >= RELIABLE_TURN_MIN_COHESION
+            )
             turn_index = len(turns)
             turns.append({
                 "start": start,
@@ -517,10 +584,34 @@ def _build_acoustic_turns(windows, boundaries):
                 "region": region,
                 "window_indices": indices,
                 "embedding": embedding,
+                "embedding_window_count": len(source),
+                "embedding_cohesion": cohesion,
+                "embedding_quality": quality,
+                "embedding_reliable": reliable,
             })
             region_turns.append(turn_index)
-        for left, right in zip(region_turns, region_turns[1:]):
-            cannot_links.add((min(left, right), max(left, right)))
+        for boundary in region_boundaries:
+            boundary_time = float(boundary["time"])
+            left_candidates = [
+                index
+                for index in region_turns
+                if turns[index]["end"] <= boundary_time + 1e-6
+            ]
+            right_candidates = [
+                index
+                for index in region_turns
+                if turns[index]["start"] >= boundary_time - 1e-6
+            ]
+            if not left_candidates or not right_candidates:
+                continue
+            left = max(left_candidates, key=lambda index: turns[index]["end"])
+            right = min(right_candidates, key=lambda index: turns[index]["start"])
+            edge = (min(left, right), max(left, right))
+            if boundary.get("constraint") == "hard":
+                hard_cannot_links.add(edge)
+            else:
+                soft_cannot_links.add(edge)
+            boundary_evidence[edge] = boundary
         turns_by_region[region] = region_turns
     for item in boundaries:
         if item["between_regions"] is None:
@@ -531,8 +622,13 @@ def _build_acoustic_turns(windows, boundaries):
         if left_turns and right_turns:
             left = left_turns[-1]
             right = right_turns[0]
-            cannot_links.add((min(left, right), max(left, right)))
-    return turns, cannot_links
+            edge = (min(left, right), max(left, right))
+            if item.get("constraint") == "hard":
+                hard_cannot_links.add(edge)
+            else:
+                soft_cannot_links.add(edge)
+            boundary_evidence[edge] = item
+    return turns, hard_cannot_links, soft_cannot_links, boundary_evidence
 
 
 def _cluster_centroid(cluster, turns):
@@ -549,6 +645,67 @@ def _clusters_conflict(left, right, cannot_links):
         (min(a, b), max(a, b)) in cannot_links
         for a in left
         for b in right
+    )
+
+
+def _cluster_reliability(cluster, turns):
+    members = list(cluster)
+    durations = [max(0.0, float(turns[index]["duration"])) for index in members]
+    weights = [max(0.75, math.sqrt(duration)) for duration in durations]
+    qualities = [
+        float(turns[index].get("embedding_quality", 0.0)) for index in members
+    ]
+    quality = float(np.average(qualities, weights=weights)) if qualities else 0.0
+    reliable_duration = sum(
+        duration
+        for index, duration in zip(members, durations)
+        if turns[index].get("embedding_reliable")
+    )
+    reliable = reliable_duration >= RELIABLE_TURN_MIN_SECONDS
+    return quality, reliable
+
+
+def _identity_profile(cluster, turns):
+    members = sorted(cluster)
+    duration = sum(max(0.0, float(turns[index]["duration"])) for index in members)
+    reliable_members = [
+        index for index in members if turns[index].get("embedding_reliable")
+    ]
+    reliable_duration = sum(
+        max(0.0, float(turns[index]["duration"]))
+        for index in reliable_members
+    )
+    quality, _ = _cluster_reliability(cluster, turns)
+    anchor = (
+        reliable_duration >= PROTOTYPE_ANCHOR_MIN_SECONDS
+        or (
+            len(members) >= PROTOTYPE_ANCHOR_MIN_TURNS
+            and reliable_duration >= RELIABLE_TURN_MIN_SECONDS
+        )
+    )
+    return {
+        "turn_count": len(members),
+        "duration": duration,
+        "reliable_turn_count": len(reliable_members),
+        "reliable_duration": reliable_duration,
+        "quality": quality,
+        "anchor": anchor,
+    }
+
+
+def _adaptive_identity_threshold(similarities):
+    if not similarities:
+        return PROTOTYPE_MERGE_SIMILARITY
+    values = np.asarray(similarities, dtype=float)
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    # Speaker embeddings are not calibrated equally across clips.  Keep the
+    # threshold conservative, but derive it from this clip instead of applying
+    # the same cutoff to every voice and recording condition.
+    estimate = median + 0.50 * max(0.02, mad)
+    return min(
+        PROTOTYPE_MERGE_SIMILARITY + 0.04,
+        max(PROTOTYPE_MERGE_SIMILARITY - 0.02, estimate),
     )
 
 
@@ -580,11 +737,8 @@ def _constrained_turn_clusters(turns, cannot_links):
             break
         clusters = _merge_clusters(clusters, best[1], best[2])
 
-    # Complete the partition as a constrained graph-colouring problem.  A
-    # strong acoustic change creates a hard edge.  Very dissimilar residual
-    # identities also create an edge.  DSATUR then uses the fewest identities
-    # it can without breaking those edges, so a speaker with only one short
-    # line is not discarded merely because it cannot form a density cluster.
+    # Preserve the existing turn labels for RTTM generation.  These labels
+    # retain every accepted local change so sentence alignment stays stable.
     centroids = [_cluster_centroid(cluster, turns) for cluster in clusters]
     conflicts = [set() for _ in clusters]
     for left in range(len(clusters)):
@@ -633,6 +787,312 @@ def _constrained_turn_clusters(turns, cannot_links):
     return list(grouped.values())
 
 
+def _reconcile_turn_clusters(
+    raw_clusters,
+    turns,
+    hard_cannot_links,
+    soft_cannot_links,
+    boundary_evidence,
+):
+    """Resolve global identities while leaving local RTTM boundaries intact.
+
+    Raw identities are deliberately kept for sentence alignment.  Global
+    identity resolution uses three different kinds of evidence in order:
+    sentence continuity across a soft split, mutually matching reliable
+    prototypes, and finally unique assignment of a short/weak identity to a
+    reliable prototype.
+    """
+    identity_nodes = [{index} for index in range(len(raw_clusters))]
+    merge_history = []
+
+    def turn_members(nodes):
+        return {
+            turn_index
+            for raw_index in nodes
+            for turn_index in raw_clusters[raw_index]
+        }
+
+    def edge_evidence(left_turns, right_turns):
+        matches = []
+        for left_turn in left_turns:
+            for right_turn in right_turns:
+                edge = (
+                    min(left_turn, right_turn), max(left_turn, right_turn)
+                )
+                if edge in boundary_evidence:
+                    matches.append(boundary_evidence[edge])
+        return matches
+
+    initial_turn_groups = [turn_members(nodes) for nodes in identity_nodes]
+    initial_centroids = [
+        _cluster_centroid(group, turns) for group in initial_turn_groups
+    ]
+    unconstrained_similarities = []
+    for left in range(len(initial_turn_groups)):
+        for right in range(left + 1, len(initial_turn_groups)):
+            if _clusters_conflict(
+                initial_turn_groups[left],
+                initial_turn_groups[right],
+                hard_cannot_links,
+            ):
+                continue
+            unconstrained_similarities.append(float(
+                initial_centroids[left] @ initial_centroids[right]
+            ))
+    prototype_threshold = _adaptive_identity_threshold(
+        unconstrained_similarities
+    )
+    assignment_threshold = max(
+        LOW_QUALITY_ASSIGN_SIMILARITY, prototype_threshold - 0.11
+    )
+
+    identity_candidates = []
+    initial_profiles = [
+        _identity_profile(group, turns) for group in initial_turn_groups
+    ]
+    for left in range(len(initial_turn_groups)):
+        for right in range(left + 1, len(initial_turn_groups)):
+            left_group = initial_turn_groups[left]
+            right_group = initial_turn_groups[right]
+            evidence = edge_evidence(left_group, right_group)
+            hard_conflict = _clusters_conflict(
+                left_group, right_group, hard_cannot_links
+            )
+            soft_conflict = _clusters_conflict(
+                left_group, right_group, soft_cannot_links
+            )
+            continuity = any(
+                bool(item.get("same_asr_segment"))
+                and item.get("punctuation", "none") != "strong"
+                for item in evidence
+            )
+            similarity = float(initial_centroids[left] @ initial_centroids[right])
+            if hard_conflict:
+                initial_decision = "blocked_by_hard_boundary"
+            elif continuity:
+                initial_decision = (
+                    "sentence_continuity_candidate"
+                    if similarity >= SENTENCE_CONTINUITY_SIMILARITY
+                    else "below_sentence_continuity_threshold"
+                )
+            elif initial_profiles[left]["anchor"] and initial_profiles[right]["anchor"]:
+                initial_decision = (
+                    "prototype_candidate"
+                    if similarity >= prototype_threshold
+                    else "below_prototype_threshold"
+                )
+            elif initial_profiles[left]["anchor"] or initial_profiles[right]["anchor"]:
+                initial_decision = (
+                    "short_turn_assignment_candidate"
+                    if similarity >= assignment_threshold
+                    else "below_short_turn_threshold"
+                )
+            else:
+                initial_decision = "no_reliable_prototype"
+            identity_candidates.append({
+                "left_raw_speaker": f"SPEAKER_{left:02d}",
+                "right_raw_speaker": f"SPEAKER_{right:02d}",
+                "similarity": round(similarity, 4),
+                "hard_conflict": hard_conflict,
+                "soft_conflict": soft_conflict,
+                "sentence_continuity": continuity,
+                "left_anchor": initial_profiles[left]["anchor"],
+                "right_anchor": initial_profiles[right]["anchor"],
+                "initial_decision": initial_decision,
+            })
+
+    while len(identity_nodes) > 1:
+        turn_groups = [turn_members(nodes) for nodes in identity_nodes]
+        centroids = [_cluster_centroid(group, turns) for group in turn_groups]
+        profiles = [_identity_profile(group, turns) for group in turn_groups]
+        similarities = {}
+        evidence_by_pair = {}
+        for left in range(len(identity_nodes)):
+            for right in range(left + 1, len(identity_nodes)):
+                if _clusters_conflict(
+                    turn_groups[left], turn_groups[right], hard_cannot_links
+                ):
+                    continue
+                similarities[(left, right)] = float(
+                    centroids[left] @ centroids[right]
+                )
+                evidence_by_pair[(left, right)] = edge_evidence(
+                    turn_groups[left], turn_groups[right]
+                )
+
+        if not similarities:
+            break
+
+        # Phase 1: undo a likely false local split inside one ASR sentence.
+        # This targets cases such as "Yeah, yeah, I did / leave my wallet..."
+        # without removing the sentence/turn boundary itself.
+        best = None
+        for (left, right), similarity in similarities.items():
+            continuity = any(
+                bool(item.get("same_asr_segment"))
+                and item.get("punctuation", "none") != "strong"
+                for item in evidence_by_pair[(left, right)]
+            )
+            if not continuity or similarity < SENTENCE_CONTINUITY_SIMILARITY:
+                continue
+            if best is None or similarity > best[0]:
+                best = (
+                    similarity,
+                    left,
+                    right,
+                    SENTENCE_CONTINUITY_SIMILARITY,
+                    "same_sentence_soft_boundary",
+                )
+
+        # Phase 2: merge only mutually closest reliable prototypes.  This is
+        # intentionally separate from short-turn assignment: established
+        # speakers should not be collapsed merely to hit a smaller count.
+        if best is None:
+            anchor_rankings = defaultdict(list)
+            for (left, right), similarity in similarities.items():
+                if profiles[left]["anchor"] and profiles[right]["anchor"]:
+                    anchor_rankings[left].append((similarity, right))
+                    anchor_rankings[right].append((similarity, left))
+            for values in anchor_rankings.values():
+                values.sort(reverse=True)
+            for (left, right), similarity in similarities.items():
+                if not (profiles[left]["anchor"] and profiles[right]["anchor"]):
+                    continue
+                if similarity < prototype_threshold:
+                    continue
+                if (
+                    not anchor_rankings[left]
+                    or anchor_rankings[left][0][1] != right
+                    or not anchor_rankings[right]
+                    or anchor_rankings[right][0][1] != left
+                ):
+                    continue
+                if best is None or similarity > best[0]:
+                    best = (
+                        similarity,
+                        left,
+                        right,
+                        prototype_threshold,
+                        "mutual_reliable_prototype_match",
+                    )
+
+        # Phase 3: a short or weak identity may join an established prototype
+        # only when its best legal match is unique.  No target speaker count is
+        # supplied or forced.
+        if best is None:
+            assignments = []
+            for source in range(len(identity_nodes)):
+                if profiles[source]["anchor"]:
+                    continue
+                ranked = []
+                for target in range(len(identity_nodes)):
+                    if not profiles[target]["anchor"] or source == target:
+                        continue
+                    pair = (min(source, target), max(source, target))
+                    if pair not in similarities:
+                        continue
+                    ranked.append((similarities[pair], target))
+                ranked.sort(reverse=True)
+                if not ranked:
+                    continue
+                similarity, target = ranked[0]
+                margin = (
+                    similarity - ranked[1][0]
+                    if len(ranked) > 1 else 1.0
+                )
+                if similarity < assignment_threshold:
+                    continue
+                if margin < LOW_QUALITY_ASSIGN_MARGIN:
+                    continue
+                assignments.append((similarity, source, target, margin))
+            if assignments:
+                similarity, source, target, margin = max(assignments)
+                best = (
+                    similarity,
+                    min(source, target),
+                    max(source, target),
+                    assignment_threshold,
+                    "unique_short_turn_to_prototype",
+                )
+
+        if best is None:
+            break
+        similarity, left, right, threshold, reason = best
+        if left == right:
+            # Defensive guard for future changes to assignment selection.
+            break
+        merged = identity_nodes[left] | identity_nodes[right]
+        merge_history.append({
+            "raw_speakers": [
+                f"SPEAKER_{index:02d}" for index in sorted(merged)
+            ],
+            "similarity": round(similarity, 4),
+            "threshold": round(threshold, 4),
+            "reason": reason,
+        })
+        identity_nodes = [
+            nodes
+            for index, nodes in enumerate(identity_nodes)
+            if index not in (left, right)
+        ] + [merged]
+
+    ordered_identity_nodes = sorted(
+        identity_nodes,
+        key=lambda nodes: min(
+            turns[turn_index]["start"]
+            for raw_index in nodes
+            for turn_index in raw_clusters[raw_index]
+        ),
+    )
+    identity_clusters = []
+    raw_to_final = {}
+    for final_label, nodes in enumerate(ordered_identity_nodes):
+        combined = set()
+        for raw_index in nodes:
+            raw_to_final[raw_index] = final_label
+            combined.update(raw_clusters[raw_index])
+        identity_clusters.append(combined)
+
+    reliable_turns = sum(bool(turn.get("embedding_reliable")) for turn in turns)
+    diagnostics = {
+        "algorithm": "prototype_identity_clustering_v2",
+        "turn_count": len(turns),
+        "raw_speaker_count": len(raw_clusters),
+        "speaker_count": len(identity_clusters),
+        "hard_constraint_count": len(hard_cannot_links),
+        "soft_constraint_count": len(soft_cannot_links),
+        "reliable_turn_count": reliable_turns,
+        "low_quality_turn_count": len(turns) - reliable_turns,
+        "speaker_count_lower_bound": 2 if hard_cannot_links else 1,
+        "speaker_count_confidence": round(
+            sum(float(turn.get("embedding_quality", 0.0)) for turn in turns)
+            / max(1, len(turns)),
+            4,
+        ),
+        "identity_merges": merge_history,
+        "prototype_similarity_threshold": round(prototype_threshold, 4),
+        "short_turn_assignment_threshold": round(assignment_threshold, 4),
+        "sentence_continuity_threshold": round(
+            SENTENCE_CONTINUITY_SIMILARITY, 4
+        ),
+        "identity_candidates": identity_candidates,
+        "raw_speaker_profiles": {
+            f"SPEAKER_{index:02d}": {
+                "turn_count": profile["turn_count"],
+                "duration": round(profile["duration"], 3),
+                "reliable_turn_count": profile["reliable_turn_count"],
+                "reliable_duration": round(
+                    profile["reliable_duration"], 3
+                ),
+                "embedding_quality": round(profile["quality"], 4),
+                "prototype_anchor": bool(profile["anchor"]),
+            }
+            for index, profile in enumerate(initial_profiles)
+        },
+    }
+    return identity_clusters, raw_to_final, diagnostics
+
+
 def run_temporal_constrained_clustering(segments):
     """Cluster speaker turns while preserving local acoustic change evidence."""
     if not kaldiio or np is None:
@@ -665,25 +1125,94 @@ def run_temporal_constrained_clustering(segments):
             f"   换人候选 {item['time']:.3f}s: "
             f"change={item['score']:.3f}, gap={item['gap']:.3f}s, "
             f"punctuation={item.get('punctuation', 'none')}, "
+            f"constraint={item.get('constraint', 'soft')}, "
             f"{item['left_text']!r} -> {item['right_text']!r}"
         )
 
-    turns, cannot_links = _build_acoustic_turns(windows, boundaries)
+    (
+        turns,
+        hard_cannot_links,
+        soft_cannot_links,
+        boundary_evidence,
+    ) = _build_acoustic_turns(windows, boundaries)
     if len(turns) < 2:
         return False
-    clusters = _constrained_turn_clusters(turns, cannot_links)
-    clusters.sort(key=lambda cluster: min(turns[index]["start"] for index in cluster))
-    turn_labels = {}
-    for label, cluster in enumerate(clusters):
+    raw_clusters = _constrained_turn_clusters(
+        turns, hard_cannot_links | soft_cannot_links
+    )
+    raw_clusters.sort(
+        key=lambda cluster: min(turns[index]["start"] for index in cluster)
+    )
+    identity_clusters, raw_to_final, diagnostics = _reconcile_turn_clusters(
+        raw_clusters,
+        turns,
+        hard_cannot_links,
+        soft_cannot_links,
+        boundary_evidence,
+    )
+    raw_turn_labels = {}
+    final_turn_labels = {}
+    for raw_label, cluster in enumerate(raw_clusters):
         for turn_index in cluster:
-            turn_labels[turn_index] = label
+            raw_turn_labels[turn_index] = raw_label
+            final_turn_labels[turn_index] = raw_to_final[raw_label]
 
     window_labels = {}
     for turn_index, turn in enumerate(turns):
         for window_index in turn["window_indices"]:
-            window_labels[window_index] = turn_labels[turn_index]
+            # RTTM intentionally keeps raw labels so identity reconciliation
+            # cannot remove a sentence/speaker boundary.
+            window_labels[window_index] = raw_turn_labels[turn_index]
     if len(window_labels) != len(windows):
         return False
+
+    speaker_profiles = {}
+    for label, cluster in enumerate(identity_clusters):
+        quality, reliable = _cluster_reliability(cluster, turns)
+        speaker_profiles[f"SPEAKER_{label:02d}"] = {
+            "turn_count": len(cluster),
+            "duration": round(sum(turns[index]["duration"] for index in cluster), 3),
+            "embedding_quality": round(quality, 4),
+            "reliable": reliable,
+        }
+    diagnostics["speaker_count"] = len(identity_clusters)
+    diagnostics["speaker_count_preferred"] = len(identity_clusters)
+    diagnostics["speaker_count_range"] = [
+        diagnostics["speaker_count_lower_bound"],
+        len(identity_clusters),
+    ]
+    diagnostics["speaker_profiles"] = speaker_profiles
+    diagnostics["speaker_identity_map"] = {
+        f"SPEAKER_{raw_label:02d}": f"SPEAKER_{final_label:02d}"
+        for raw_label, final_label in sorted(raw_to_final.items())
+    }
+    diagnostics["turns"] = [
+        {
+            "start": round(turn["start"], 3),
+            "end": round(turn["end"], 3),
+            "duration": round(turn["duration"], 3),
+            "embedding_window_count": turn["embedding_window_count"],
+            "embedding_cohesion": round(turn["embedding_cohesion"], 4),
+            "embedding_quality": round(turn["embedding_quality"], 4),
+            "embedding_reliable": bool(turn["embedding_reliable"]),
+            "speaker_raw": f"SPEAKER_{raw_turn_labels[index]:02d}",
+            "speaker": f"SPEAKER_{final_turn_labels[index]:02d}",
+        }
+        for index, turn in enumerate(turns)
+    ]
+    diagnostics["boundaries"] = [
+        {
+            "time": round(float(item["time"]), 3),
+            "score": round(float(item["score"]), 4),
+            "threshold": round(float(item.get("threshold", 0.0)), 4),
+            "punctuation": item.get("punctuation", "none"),
+            "constraint": item.get("constraint", "soft"),
+            "same_asr_segment": bool(item.get("same_asr_segment")),
+        }
+        for item in boundaries
+    ]
+    with open(CLUSTERING_DIAGNOSTICS_PATH, "w", encoding="utf-8") as stream:
+        json.dump(diagnostics, stream, ensure_ascii=False, indent=2)
 
     os.makedirs(os.path.dirname(labels_out), exist_ok=True)
     with open(labels_out, "w", encoding="utf-8") as stream:
@@ -692,8 +1221,26 @@ def run_temporal_constrained_clustering(segments):
 
     print(
         f"✅ 时序约束聚类: {len(turns)} 个声学话轮 -> "
-        f"{len(clusters)} 位说话人（允许稀有说话人保留）。"
+        f"{len(raw_clusters)} 个原始身份 -> {len(identity_clusters)} 位全局说话人"
+        f"（硬约束 {len(hard_cannot_links)}, "
+        f"软约束 {len(soft_cannot_links)}, 可靠话轮 {diagnostics['reliable_turn_count']}）。"
     )
+    print(
+        f"   全局身份阈值: prototype={diagnostics['prototype_similarity_threshold']:.3f}, "
+        f"short={diagnostics['short_turn_assignment_threshold']:.3f}, "
+        f"sentence={diagnostics['sentence_continuity_threshold']:.3f}"
+    )
+    if diagnostics["identity_merges"]:
+        for item in diagnostics["identity_merges"]:
+            print(
+                "   身份合并 "
+                f"{'+'.join(item['raw_speakers'])}: "
+                f"similarity={item['similarity']:.3f}, "
+                f"threshold={item['threshold']:.3f}, "
+                f"reason={item['reason']}"
+            )
+    else:
+        print("   身份合并: 无候选满足全局身份规则。")
     return True
 
 
@@ -1228,6 +1775,43 @@ def assign_speakers(segments, rttm_spans):
     return merged
 
 
+def load_clustering_diagnostics():
+    if not os.path.isfile(CLUSTERING_DIAGNOSTICS_PATH):
+        return None
+    try:
+        with open(CLUSTERING_DIAGNOSTICS_PATH, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError) as exc:
+        print(f"⚠️ 无法读取说话人聚类诊断: {exc}")
+        return None
+
+
+def attach_speaker_confidence(segments, diagnostics):
+    """Map global identities without changing text, timing, or segment count."""
+    profiles = diagnostics.get("speaker_profiles") or {}
+    identity_map = diagnostics.get("speaker_identity_map") or {}
+    enriched = []
+    for source in segments:
+        segment = source.copy()
+        raw_speaker = normalize_speaker(segment.get("speaker"))
+        final_speaker = normalize_speaker(
+            identity_map.get(raw_speaker, raw_speaker)
+        )
+        segment["speaker_raw"] = raw_speaker
+        segment["speaker"] = final_speaker
+        profile = profiles.get(final_speaker) or {}
+        if profile:
+            segment["speaker_confidence"] = float(
+                profile.get("embedding_quality", 0.0)
+            )
+            segment["speaker_assignment"] = diagnostics.get(
+                "algorithm", "prototype_identity_clustering_v2"
+            )
+        enriched.append(segment)
+    return enriched
+
+
 def main():
     print("=== [Step 2] WeSpeaker + 时序约束聚类 说话人分离 ===")
     print(f"当前 Python: {sys.executable}")
@@ -1241,11 +1825,33 @@ def main():
     print("\n=== [Step 2-W] 解析 RTTM 回填 AutoDub Segments ===")
     rttm_spans = parse_rttm(rttm_path)
     aligned = assign_speakers(state["segments_step1"], rttm_spans)
+    diagnostics = load_clustering_diagnostics()
+    if diagnostics:
+        aligned = attach_speaker_confidence(aligned, diagnostics)
 
     unique = sorted(set(s["speaker"] for s in aligned))
     print(f"🔍 最终识别出 {len(unique)} 个说话人: {unique}")
 
     state["segments_step2"] = aligned
+    if diagnostics:
+        state["speaker_clustering"] = diagnostics
+        state["estimated_speaker_count"] = diagnostics.get(
+            "speaker_count_preferred", len(unique)
+        )
+        state["estimated_speaker_range"] = diagnostics.get(
+            "speaker_count_range", [len(unique), len(unique)]
+        )
+        state["speaker_count_confidence"] = diagnostics.get(
+            "speaker_count_confidence", 0.0
+        )
+    else:
+        for key in (
+            "speaker_clustering",
+            "estimated_speaker_count",
+            "estimated_speaker_range",
+            "speaker_count_confidence",
+        ):
+            state.pop(key, None)
     save_state(state)
     print("\n✅ Step 2 完成。请切回 autodub_server 环境继续运行 Step 3。")
 

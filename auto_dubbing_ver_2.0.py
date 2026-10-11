@@ -1880,6 +1880,16 @@ def run_step_2(config: DubbingConfig) -> None:
             print("--- [Step 2-W] 检测到已有 WeSpeaker RTTM，直接解析回填 ---")
             diar = SpeakerDiarization(config)
             aligned = diar._assign_speakers_from_rttm(state["segments_step1"], diar._parse_rttm(rttm_path))
+            from run_step2_wespeaker import (
+                attach_speaker_confidence,
+                load_clustering_diagnostics,
+            )
+
+            clustering_diagnostics = load_clustering_diagnostics()
+            if clustering_diagnostics:
+                aligned = attach_speaker_confidence(
+                    aligned, clustering_diagnostics
+                )
             unique = sorted(set(s["speaker"] for s in aligned))
             print(f"🔍 WeSpeaker 识别出 {len(unique)} 个说话人: {unique}")
             state_mgr.delete_keys([
@@ -1889,7 +1899,21 @@ def run_step_2(config: DubbingConfig) -> None:
                 "light_tts_selector_results", "light_tts_selector_results_path",
                 "emotion_results", "tts_router_results", "tts_backend",
             ])
-            state_mgr.save({"segments_step2": aligned})
+            checkpoint = {"segments_step2": aligned}
+            if clustering_diagnostics:
+                checkpoint.update({
+                    "speaker_clustering": clustering_diagnostics,
+                    "estimated_speaker_count": clustering_diagnostics.get(
+                        "speaker_count_preferred", len(unique)
+                    ),
+                    "estimated_speaker_range": clustering_diagnostics.get(
+                        "speaker_count_range", [len(unique), len(unique)]
+                    ),
+                    "speaker_count_confidence": clustering_diagnostics.get(
+                        "speaker_count_confidence", 0.0
+                    ),
+                })
+            state_mgr.save(checkpoint)
             return
         print("--- [Step 2-W] 生成 WeSpeaker 输入文件 ---")
         os.makedirs(work_dir, exist_ok=True)
