@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 
-REFERENCE_VERSION = "ocr-translation-reference-v1"
+REFERENCE_VERSION = "ocr-translation-reference-v2"
 _REF_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
@@ -181,6 +181,75 @@ def _time_score(timestamp: float, start: float, end: float) -> float:
     return max(0.0, 1.0 - distance / 0.8)
 
 
+def _join_subtitle_lines(values: list[str]) -> str:
+    """Join consecutive subtitle cards without altering their wording."""
+    output = ""
+    for value in values:
+        value = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not value:
+            continue
+        if output and not re.search(r"\s$", output):
+            output += " "
+        output += value
+    return output.strip()
+
+
+def _composed_groups(
+    pairs: list[dict[str, Any]], start: float, end: float, asr: str,
+) -> list[dict[str, Any]]:
+    """Build contiguous multi-card subtitle references for one final sentence."""
+    nearby = [
+        pair for pair in pairs
+        if start - 0.8 <= float(pair["timestamp"]) <= end + 0.8
+    ]
+    by_time: dict[float, list[dict[str, Any]]] = defaultdict(list)
+    for pair in nearby:
+        by_time[round(float(pair["timestamp"]), 3)].append(pair)
+    events = []
+    for timestamp in sorted(by_time):
+        # Normally there is one bilingual pair per subtitle card.  If OCR found
+        # several, spatial alignment is the safest deterministic representative.
+        best = max(
+            by_time[timestamp],
+            key=lambda item: (
+                _source_similarity(asr, item["source_text"]),
+                float(item["spatial_score"]),
+            ),
+        )
+        key = (_normalize(best["source_text"]), _normalize(best["target_text"]))
+        if events and events[-1]["key"] == key:
+            events[-1]["timestamps"].append(timestamp)
+            continue
+        events.append({"key": key, "pair": best, "timestamps": [timestamp]})
+
+    groups = []
+    for left in range(len(events)):
+        for right in range(left + 1, min(len(events), left + 6)):
+            selected = events[left:right + 1]
+            first = selected[0]["timestamps"][0]
+            last = selected[-1]["timestamps"][-1]
+            if last - first > max(4.0, (end - start) + 1.6):
+                break
+            source_text = _join_subtitle_lines([item["pair"]["source_text"] for item in selected])
+            target_text = _join_subtitle_lines([item["pair"]["target_text"] for item in selected])
+            similarity = _source_similarity(asr, source_text)
+            if similarity < 0.55:
+                continue
+            timestamps = sorted({value for item in selected for value in item["timestamps"]})
+            spatial = sum(float(item["pair"]["spatial_score"]) for item in selected) / len(selected)
+            midpoint = (first + last) / 2.0
+            score = 0.72 * similarity + 0.18 * _time_score(midpoint, start, end) + 0.10 * spatial
+            groups.append({
+                "source_text": source_text,
+                "target_text": target_text,
+                "scores": [score],
+                "source_similarities": [similarity],
+                "timestamps": timestamps,
+                "composed": True,
+            })
+    return groups
+
+
 def _atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -318,6 +387,16 @@ def prepare_ocr_translation_references(
             group["scores"].append(score)
             group["source_similarities"].append(source_similarity)
             group["timestamps"].append(pair["timestamp"])
+        for group in _composed_groups(pairs, start, end, asr):
+            key = (_normalize(group["source_text"]), _normalize(group["target_text"]))
+            existing = grouped.get(key)
+            if existing:
+                existing["scores"].extend(group["scores"])
+                existing["source_similarities"].extend(group["source_similarities"])
+                existing["timestamps"].extend(group["timestamps"])
+                existing["composed"] = existing.get("composed", False) or group["composed"]
+            else:
+                grouped[key] = group
         candidates = []
         for group in grouped.values():
             support = len(set(group["timestamps"]))
@@ -333,6 +412,7 @@ def prepare_ocr_translation_references(
                 "source_text": group["source_text"], "target_text": group["target_text"],
                 "confidence": confidence, "score": round(score, 6),
                 "source_similarity": round(source_similarity, 6), "frame_support": support,
+                "composed": bool(group.get("composed", False)),
                 "timestamps": sorted(set(round(value, 3) for value in group["timestamps"])),
             })
         candidates.sort(key=lambda item: (item["score"], item["frame_support"]), reverse=True)

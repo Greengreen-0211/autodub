@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Type
@@ -145,7 +146,7 @@ def _source_language(config: Any, text: str) -> str:
 
 
 class OCRV211Client:
-    """Three-frame HunyuanOCR client with per-frame fingerprinted cache."""
+    """Adaptive HunyuanOCR client with per-frame fingerprinted cache."""
 
     def __init__(self, config: Any) -> None:
         self.config = config
@@ -206,6 +207,20 @@ class OCRV211Client:
             raise RuntimeError("OCR 服务版本过旧，不支持按 ASR 时间抽帧；请上传并重启新版 ocr_server_v2.py")
         return str(data.get("text") or data.get("ocr_text") or data.get("ocr_result") or "").strip()
 
+    @staticmethod
+    def _sample_times(start: float, end: float) -> List[float]:
+        """Sample long ASR chunks densely enough to observe changing subtitles."""
+        duration = max(0.0, end - start)
+        if duration <= 0:
+            return [round(start, 3)]
+        interval = max(0.75, float(os.getenv("AUTODUB_OCR_SAMPLE_INTERVAL", "1.5")))
+        maximum = max(3, int(os.getenv("AUTODUB_OCR_MAX_FRAMES_PER_SEGMENT", "12")))
+        count = min(maximum, max(3, int(math.ceil(duration / interval))))
+        return [
+            round(start + (index + 0.5) * duration / count, 3)
+            for index in range(count)
+        ]
+
     def extract_texts(self, video_path: str, segments: List[Dict[str, Any]]) -> Dict[str, str]:
         if not self.config.ocr_enabled:
             print("⚠️ OCR 已关闭，跳过 HunyuanOCR 辅助。")
@@ -226,14 +241,14 @@ class OCRV211Client:
         for index, segment in enumerate(selected, start=1):
             segment_id = str(segment.get("id", index - 1))
             start, end = float(segment["start"]), float(segment["end"])
-            times = sorted({round(start + (end - start) * ratio, 3) for ratio in (0.2, 0.5, 0.8)})
+            times = self._sample_times(start, end)
             texts: List[str] = []
             for frame_number, timestamp in enumerate(times, start=1):
                 key = _ocr_digest({
                     "media": media_key,
                     "time": timestamp,
                     "service": self.config.ocr_url,
-                    "sampling": "three-fractions-v1",
+                    "sampling": "adaptive-subtitle-v2",
                     "frame_index": self.config.ocr_frame_index,
                 })
                 cached = cache.get(key)
@@ -243,7 +258,8 @@ class OCRV211Client:
                     continue
                 else:
                     print(
-                        f"[HunyuanOCR {index:03d}/{len(selected):03d} frame {frame_number}/3] "
+                        f"[HunyuanOCR {index:03d}/{len(selected):03d} "
+                        f"frame {frame_number}/{len(times)}] "
                         f"抽取 {timestamp:.2f}s 画面文字..."
                     )
                     try:
@@ -276,7 +292,7 @@ class OCRV211Client:
                     texts.append(text)
             outputs[segment_id] = "\n".join(texts)
         success_count = sum(bool(text.strip()) for text in outputs.values())
-        print(f"✅ OCR 完成: {success_count}/{len(selected)} 个片段获得文本，三帧记录保存至: {cache_path}")
+        print(f"✅ OCR 完成: {success_count}/{len(selected)} 个片段获得文本，自适应抽帧记录保存至: {cache_path}")
         if self.config.ocr_required and success_count == 0:
             raise RuntimeError("已要求 OCR 必须成功，但本轮没有获得任何 OCR 文本。")
         return outputs

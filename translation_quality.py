@@ -228,7 +228,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                             f"ocr_preferred_reference_rejected:{exc}"
                         )
                     else:
-                        candidates = [{"text": direct}]
+                        # Internal-only marker: LightTTS may prefer this trusted
+                        # subtitle only after its measured duration is acceptable.
+                        candidates = [{"text": direct, "_selection_priority": "ocr_high"}]
                         seen = {re.sub(r"[\W_]+", "", direct.casefold())}
                         for candidate in valid["translations_candidates"]:
                             key = re.sub(r"[\W_]+", "", candidate["text"].casefold())

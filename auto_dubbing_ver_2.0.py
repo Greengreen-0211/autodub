@@ -2146,7 +2146,7 @@ def run_step_3(config: DubbingConfig) -> None:
         reference_manifest = reference_result["manifest"]
     except Exception as exc:
         reference_manifest = {
-            "version": "ocr-translation-reference-v1",
+            "version": "ocr-translation-reference-v2",
             "status": "error",
             "reason": f"{type(exc).__name__}:{exc}",
             "accepted_segments": 0,
