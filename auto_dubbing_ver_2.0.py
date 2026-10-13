@@ -1651,6 +1651,17 @@ class AdvancedTranslator:
                     "Render acronyms with their established target-language name or clear translated expansion, "
                     "optionally retaining the acronym when natural. Use official localized forms for brands, "
                     "organizations and fictional names; otherwise use a faithful transliteration or translation. "
+                    "Use neutral, standard, contemporary target-language dialogue matching the source register. "
+                    "Do not make a line slangier, cuter, more dramatic or more colloquial merely to change its "
+                    "duration. Do not add discourse fillers, sentence-final particles, emphasis or attitude that "
+                    "the source does not express. For Chinese, forms such as 啥、嘛、呢、呀、呗、哟 must not "
+                    "be introduced unless the source clearly carries the corresponding meaning or tone. "
+                    "The text field is the preferred standard-register translation. Candidate variants may change "
+                    "length through faithful syntax or wording, but must preserve the same register and tone as text. "
+                    "ocr_source_spelling_hints contain source-side OCR only. Use them solely to resolve a nearby "
+                    "proper name, acronym or term whose ASR spelling is plausibly noisy. They are not translations, "
+                    "must not add new content, and do not override clear ASR context. Once an entity is identified, "
+                    "use its established official target-language name consistently across the batch. "
                     "ocr_translation_references are optional subtitle translation hints already matched by "
                     "time and source text. Use them only when their source_subtitle is semantically consistent "
                     "with text_asr_corrected. They may be stale, incorrect, a watermark, UI text, or belong "
@@ -1658,8 +1669,14 @@ class AdvancedTranslator:
                     "replace, complete, or rewrite the ASR source from OCR. Duration is only a soft preference; "
                     "never remove meaning merely to make the translation shorter. "
                     "For an OCR reference marked usage_policy=preferred_if_complete, compare it against the full "
-                    "ASR meaning. If it covers every meaningful element, use that target_subtitle_reference "
-                    "verbatim as text and as the first candidate, and set ocr_reference_complete=true. If it "
+                    "ASR meaning. Judge semantic coverage in natural target-language usage, not word-for-word "
+                    "surface alignment: implicit subjects, idiomatic compression and normal target-language "
+                    "word order are allowed when no meaning is lost. If it covers every meaningful element, "
+                    "normally use that target_subtitle_reference verbatim as text and as the first candidate, "
+                    "and set ocr_reference_complete=true. Exception: if the reference uses a non-established "
+                    "rendering of a proper name for which an official localized form is known, set "
+                    "ocr_reference_complete=false and return a standard translation with the official name "
+                    "instead of copying the reference verbatim. If the reference "
                     "omits or changes anything, set ocr_reference_complete=false and only reuse trustworthy "
                     "terminology or phrasing while restoring all missing ASR meaning. References marked "
                     "usage_policy=terminology_hint must never be copied wholesale. "
@@ -1700,7 +1717,7 @@ def _translation_candidates_fingerprint(
     config: DubbingConfig,
 ) -> str:
     payload = {
-        "version": "translation-v2.3.1:target-script-v2:full-localization-ocr-v2",
+        "version": "translation-v2.3.2:target-script-v2:neutral-dubbing-ocr-v3",
         "source_language": src_lang,
         "target_language": target_lang,
         "model": config.model_name,
@@ -1713,6 +1730,7 @@ def _translation_candidates_fingerprint(
                 "end": segment.get("end"),
                 "speaker": segment.get("speaker"),
                 "ocr_translation_references": segment.get("_ocr_translation_references", []),
+                "ocr_source_spelling_hints": segment.get("_ocr_source_spelling_hints", []),
             }
             for index, segment in enumerate(segments)
         ],
@@ -2133,6 +2151,7 @@ def run_step_3(config: DubbingConfig) -> None:
     # OCR is an optional translation hint only.  Build references against the
     # final Step 2 boundaries, and keep all diagnostics out of public segments.
     references_by_segment = {}
+    source_hints_by_segment = {}
     try:
         from ocr_translation_reference import prepare_ocr_translation_references
 
@@ -2143,10 +2162,11 @@ def run_step_3(config: DubbingConfig) -> None:
             config.target_lang,
         )
         references_by_segment = reference_result["references_by_segment"]
+        source_hints_by_segment = reference_result.get("source_hints_by_segment", {})
         reference_manifest = reference_result["manifest"]
     except Exception as exc:
         reference_manifest = {
-            "version": "ocr-translation-reference-v2",
+            "version": "ocr-translation-reference-v3",
             "status": "error",
             "reason": f"{type(exc).__name__}:{exc}",
             "accepted_segments": 0,
@@ -2158,6 +2178,9 @@ def run_step_3(config: DubbingConfig) -> None:
         references = references_by_segment.get(str(segment.get("id", index)), [])
         if references:
             enriched["_ocr_translation_references"] = references
+        source_hints = source_hints_by_segment.get(str(segment.get("id", index)), [])
+        if source_hints:
+            enriched["_ocr_source_spelling_hints"] = source_hints
         translation_segments.append(enriched)
     print(
         "OCR 翻译参考: "

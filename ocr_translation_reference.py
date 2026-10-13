@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 
-REFERENCE_VERSION = "ocr-translation-reference-v2"
+REFERENCE_VERSION = "ocr-translation-reference-v3"
 _REF_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
@@ -158,6 +158,19 @@ def _source_similarity(left: Any, right: Any) -> float:
     if left_norm in right_norm or right_norm in left_norm:
         containment = min(1.0, containment + 0.15)
     return min(1.0, 0.68 * sequence + 0.20 * jaccard + 0.12 * containment)
+
+
+def _source_spelling_similarity(left: Any, right: Any) -> float:
+    """Best token-level spelling match for noisy names and acronyms."""
+    left_tokens = re.findall(r"[A-Za-z0-9]{2,}", str(left or "").casefold())
+    right_tokens = re.findall(r"[A-Za-z0-9]{2,}", str(right or "").casefold())
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return max(
+        SequenceMatcher(None, left_token, right_token).ratio()
+        for left_token in left_tokens
+        for right_token in right_tokens
+    )
 
 
 def _spatial_score(left: list[float] | None, right: list[float] | None) -> float:
@@ -364,6 +377,7 @@ def prepare_ocr_translation_references(
                 })
 
     references_by_segment: dict[str, list[dict[str, Any]]] = {}
+    source_hints_by_segment: dict[str, list[dict[str, Any]]] = {}
     match_rows = []
     for index, segment in enumerate(segments):
         sid = str(segment.get("id", index))
@@ -416,6 +430,72 @@ def prepare_ocr_translation_references(
                 "timestamps": sorted(set(round(value, 3) for value in group["timestamps"])),
             })
         candidates.sort(key=lambda item: (item["score"], item["frame_support"]), reverse=True)
+        source_hints = []
+        seen_sources = set()
+        for candidate in candidates:
+            normalized_source = _normalize(candidate["source_text"])
+            if normalized_source in seen_sources or candidate["source_similarity"] < 0.42:
+                continue
+            seen_sources.add(normalized_source)
+            source_hints.append({
+                "source_text": candidate["source_text"],
+                "source_similarity": candidate["source_similarity"],
+                "frame_support": candidate["frame_support"],
+            })
+            if len(source_hints) >= 5:
+                break
+        # A name can occupy its own subtitle card just before the rest of the
+        # sentence (e.g. "Elsa!" then "Wake up...").  Such a short line may
+        # score poorly against the whole ASR sentence, but is still useful as
+        # low-authority source spelling evidence.  Never expose its translation.
+        nearby_sources: dict[str, dict[str, Any]] = {}
+        for pair in pairs:
+            timestamp = float(pair["timestamp"])
+            if timestamp < start - 1.6 or timestamp > end + 0.8:
+                continue
+            normalized_source = _normalize(pair["source_text"])
+            if not normalized_source:
+                continue
+            record = nearby_sources.setdefault(normalized_source, {
+                "source_text": pair["source_text"],
+                "source_similarity": 0.0,
+                "spelling_similarity": 0.0,
+                "timestamps": set(),
+            })
+            record["source_similarity"] = max(
+                float(record["source_similarity"]),
+                _source_similarity(asr, pair["source_text"]),
+            )
+            record["spelling_similarity"] = max(
+                float(record["spelling_similarity"]),
+                _source_spelling_similarity(asr, pair["source_text"]),
+            )
+            record["timestamps"].add(round(timestamp, 3))
+        ranked_nearby = sorted(
+            nearby_sources.values(),
+            key=lambda item: (
+                max(item["source_similarity"], item["spelling_similarity"]),
+                len(item["timestamps"]),
+            ),
+            reverse=True,
+        )
+        for hint in ranked_nearby:
+            normalized_source = _normalize(hint["source_text"])
+            if normalized_source in seen_sources or (
+                hint["source_similarity"] < 0.18 and hint["spelling_similarity"] < 0.72
+            ):
+                continue
+            seen_sources.add(normalized_source)
+            source_hints.append({
+                "source_text": hint["source_text"],
+                "source_similarity": round(float(hint["source_similarity"]), 6),
+                "spelling_similarity": round(float(hint["spelling_similarity"]), 6),
+                "frame_support": len(hint["timestamps"]),
+            })
+            if len(source_hints) >= 5:
+                break
+        if source_hints:
+            source_hints_by_segment[sid] = source_hints
         eligible = [candidate for candidate in candidates if candidate["confidence"] in {"high", "medium"}]
         status, reason, accepted = "rejected", "no_trusted_reference", []
         if eligible:
@@ -446,4 +526,5 @@ def prepare_ocr_translation_references(
     _atomic_json(directory / "translation_index.json", index)
     _atomic_json(directory / "translation_matches.json", matches)
     return {"references_by_segment": references_by_segment,
+            "source_hints_by_segment": source_hints_by_segment,
             "manifest": _manifest(index, matches)}

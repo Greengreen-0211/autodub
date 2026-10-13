@@ -276,27 +276,39 @@ class LightTTSSelector:
             row for row in successful
             if candidates[int(row["candidate_index"])].get("_selection_priority") == "ocr_high"
         ]
-        if not preferred:
-            return closest, "closest_measured_duration"
-        ocr = min(preferred, key=lambda row: float(row["duration_error"]))
-        if ocr["duration_fit"] == "rejected":
-            alternatives = [
-                row for row in successful
-                if candidates[int(row["candidate_index"])].get("_selection_priority") != "ocr_high"
-            ]
-            if alternatives:
-                closest = min(
-                    alternatives,
-                    key=lambda row: (float(row["duration_error"]), int(row["candidate_index"])),
-                )
-            return closest, "ocr_high_rejected_by_duration"
-        if ocr["duration_fit"] == "suitable":
-            return ocr, "ocr_high_duration_suitable"
-        # Borderline OCR is allowed a small preference, never a large timing loss.
-        preference_margin = max(0.15, 0.08 * max(0.4, target_duration))
-        if float(ocr["duration_error"]) <= float(closest["duration_error"]) + preference_margin:
-            return ocr, "ocr_high_duration_borderline_preferred"
-        return closest, "ocr_high_duration_borderline_outperformed"
+        excluded_indices = set()
+        if preferred:
+            ocr = min(preferred, key=lambda row: float(row["duration_error"]))
+            if ocr["duration_fit"] == "suitable":
+                return ocr, "ocr_high_duration_suitable"
+            if ocr["duration_fit"] == "rejected":
+                excluded_indices.update(int(row["candidate_index"]) for row in preferred)
+            else:
+                # Borderline OCR is allowed a small preference, never a large timing loss.
+                preference_margin = max(0.15, 0.08 * max(0.4, target_duration))
+                if float(ocr["duration_error"]) <= float(closest["duration_error"]) + preference_margin:
+                    return ocr, "ocr_high_duration_borderline_preferred"
+
+        available = [
+            row for row in successful
+            if int(row["candidate_index"]) not in excluded_indices
+        ] or successful
+        closest_available = min(
+            available,
+            key=lambda row: (float(row["duration_error"]), int(row["candidate_index"])),
+        )
+        standard = [
+            row for row in available
+            if candidates[int(row["candidate_index"])].get("_selection_priority") == "standard"
+            and row["duration_fit"] == "suitable"
+        ]
+        if standard:
+            return min(standard, key=lambda row: float(row["duration_error"])), "standard_duration_suitable"
+        if preferred and excluded_indices:
+            return closest_available, "ocr_high_rejected_by_duration"
+        if preferred:
+            return closest_available, "ocr_high_duration_borderline_outperformed"
+        return closest_available, "closest_measured_duration"
 
     def select(
         self,

@@ -7,9 +7,9 @@ import os
 import re
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.3.1"
+RULE_VERSION = "translation-v2.3.2"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "full-localization-ocr-v2"
+PROMPT_VERSION = "neutral-dubbing-ocr-v3"
 
 # Translation is fail-closed by default: one segment that cannot be validated
 # stops the stage instead of letting an untranslated line reach the mixer.
@@ -87,6 +87,18 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
         validate_target_text(candidate.get("text") if isinstance(candidate, dict) else candidate,
                              target, original.get("text", ""), source, allow_identity=allow_identity)
     candidates = normalize_translation_candidates(raw, "")
+    canonical = lambda value: re.sub(r"[\W_]+", "", str(value).casefold())
+    primary_key = canonical(primary)
+    primary_index = next(
+        (index for index, candidate in enumerate(candidates)
+         if canonical(candidate["text"]) == primary_key),
+        None,
+    )
+    if primary_index is None:
+        candidates = ([{"text": primary}] + candidates)[:5]
+        primary_index = 0
+    if candidates[primary_index].get("_selection_priority") != "ocr_high":
+        candidates[primary_index]["_selection_priority"] = "standard"
     minimum = 1 if is_tiny(str(original.get("text", ""))) else 3
     if not minimum <= len(candidates) <= 5 or len(raw) > 5:
         raise ValueError(f"candidate_count:{len(candidates)} required:{minimum}-5")
@@ -105,7 +117,8 @@ def segment_fingerprint(segment: dict, previous: str, following: str, source: st
                "segment": {k: segment.get(k) for k in
                            ("id", "text", "start", "end", "speaker", "translation_allow_identity")},
                "previous_text": previous, "next_text": following,
-               "ocr_translation_references": segment.get("_ocr_translation_references", [])}
+               "ocr_translation_references": segment.get("_ocr_translation_references", []),
+               "ocr_source_spelling_hints": segment.get("_ocr_source_spelling_hints", [])}
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
@@ -167,12 +180,25 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         else "terminology_hint"
                     ),
                 })
+        source_spelling_hints = []
+        for hint in segment.get("_ocr_source_spelling_hints", [])[:5]:
+            if not isinstance(hint, dict):
+                continue
+            text = str(hint.get("source_text", "")).strip()[:240]
+            if text:
+                source_spelling_hints.append({
+                    "source_ocr_text": text,
+                    "source_similarity": hint.get("source_similarity"),
+                    "spelling_similarity": hint.get("spelling_similarity"),
+                    "usage_policy": "source_spelling_only",
+                })
         inputs[i] = {"id": sid, "speaker": segment.get("speaker", "Unknown"),
                      "text_asr_corrected": segment.get("text", ""),
                      "previous_text": before, "next_text": after,
                      "duration": float(segment["end"])-float(segment["start"]),
                      "minimum_candidates": 1 if is_tiny(str(segment.get("text", ""))) else 3,
-                     "ocr_translation_references": references}
+                     "ocr_translation_references": references,
+                     "ocr_source_spelling_hints": source_spelling_hints}
 
     def save():
         if checkpoint:
