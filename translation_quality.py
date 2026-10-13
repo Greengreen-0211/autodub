@@ -7,9 +7,9 @@ import os
 import re
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.2.1"
+RULE_VERSION = "translation-v2.3.1"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "context-candidates-v2"
+PROMPT_VERSION = "full-localization-ocr-v2"
 
 # Translation is fail-closed by default: one segment that cannot be validated
 # stops the stage instead of letting an untranslated line reach the mixer.
@@ -104,7 +104,8 @@ def segment_fingerprint(segment: dict, previous: str, following: str, source: st
                "source": language_code(source), "target": language_code(target), "model": model,
                "segment": {k: segment.get(k) for k in
                            ("id", "text", "start", "end", "speaker", "translation_allow_identity")},
-               "previous_text": previous, "next_text": following}
+               "previous_text": previous, "next_text": following,
+               "ocr_translation_references": segment.get("_ocr_translation_references", [])}
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
@@ -122,7 +123,12 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         before = str(segments[i-1].get("text", "")) if i else ""
         after = str(segments[i+1].get("text", "")) if i+1 < len(segments) else ""
         fp = segment_fingerprint(segment, before, after, source, target, model)
-        row = dict(segment, original_text=segment.get("text", ""), text="",
+        # Prompt-only keys are intentionally not copied into persisted/public rows.
+        public_segment = {
+            key: value for key, value in segment.items()
+            if not str(key).startswith("_")
+        }
+        row = dict(public_segment, original_text=segment.get("text", ""), text="",
                    translations_candidates=[], translation_status="failed",
                    translation_source_language=language_code(source),
                    translation_target_language=language_code(target),
@@ -144,11 +150,29 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         except ValueError:
             pending.append(i)
         rows.append(row)
+        references = []
+        for reference in segment.get("_ocr_translation_references", [])[:2]:
+            if not isinstance(reference, dict):
+                continue
+            target_text = str(reference.get("target_text", "")).strip()[:240]
+            source_text = str(reference.get("source_text", "")).strip()[:240]
+            if target_text and source_text:
+                references.append({
+                    "source_subtitle": source_text,
+                    "target_subtitle_reference": target_text,
+                    "confidence": str(reference.get("confidence", "medium")),
+                    "usage_policy": (
+                        "preferred_if_complete"
+                        if str(reference.get("confidence", "")).lower() == "high"
+                        else "terminology_hint"
+                    ),
+                })
         inputs[i] = {"id": sid, "speaker": segment.get("speaker", "Unknown"),
                      "text_asr_corrected": segment.get("text", ""),
                      "previous_text": before, "next_text": after,
                      "duration": float(segment["end"])-float(segment["start"]),
-                     "minimum_candidates": 1 if is_tiny(str(segment.get("text", ""))) else 3}
+                     "minimum_candidates": 1 if is_tiny(str(segment.get("text", ""))) else 3,
+                     "ocr_translation_references": references}
 
     def save():
         if checkpoint:
@@ -181,7 +205,38 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
             try:
                 if ids[i] not in response:
                     raise ValueError(error)
-                valid = validate_translation(response[ids[i]], segments[i], source, target)
+                response_row = response[ids[i]]
+                valid = validate_translation(response_row, segments[i], source, target)
+                preferred = next(
+                    (reference for reference in inputs[i]["ocr_translation_references"]
+                     if reference.get("usage_policy") == "preferred_if_complete"),
+                    None,
+                )
+                # The model must explicitly confirm full semantic coverage before
+                # an OCR subtitle is allowed to become the standard translation.
+                if preferred and response_row.get("ocr_reference_complete") is True:
+                    try:
+                        direct = validate_target_text(
+                            preferred["target_subtitle_reference"],
+                            target,
+                            segments[i].get("text", ""),
+                            source,
+                            allow_identity=bool(segments[i].get("translation_allow_identity")),
+                        )
+                    except ValueError as exc:
+                        valid["translation_warnings"].append(
+                            f"ocr_preferred_reference_rejected:{exc}"
+                        )
+                    else:
+                        candidates = [{"text": direct}]
+                        seen = {re.sub(r"[\W_]+", "", direct.casefold())}
+                        for candidate in valid["translations_candidates"]:
+                            key = re.sub(r"[\W_]+", "", candidate["text"].casefold())
+                            if key not in seen:
+                                candidates.append(candidate)
+                                seen.add(key)
+                        valid["text"] = direct
+                        valid["translations_candidates"] = candidates[:5]
                 rows[i].update(valid)
                 for warning in valid["translation_warnings"]:
                     print(f"⚠️ translation segment={ids[i]} {warning}")
