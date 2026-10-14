@@ -1668,10 +1668,6 @@ class AdvancedTranslator:
                     "to another line; ignore them whenever they conflict with the ASR text or context. Never "
                     "replace, complete, or rewrite the ASR source from OCR. Duration is only a soft preference; "
                     "never remove meaning merely to make the translation shorter. "
-                    "For translation_risk=low_context_short_fragment, translate the lexical meaning strictly. "
-                    "Use context only to disambiguate; never reinterpret an ordinary word as breathing, a sound "
-                    "effect or an unrelated interjection. If context remains unclear, choose the most literal "
-                    "neutral translation and do not guess. "
                     "For an OCR reference marked usage_policy=preferred_if_complete, compare it against the full "
                     "ASR meaning. Judge semantic coverage in natural target-language usage, not word-for-word "
                     "surface alignment: implicit subjects, idiomatic compression and normal target-language "
@@ -1725,7 +1721,7 @@ def _translation_candidates_fingerprint(
     config: DubbingConfig,
 ) -> str:
     payload = {
-        "version": "translation-v2.4.0:target-script-v2:neutral-dubbing-ocr-v4",
+        "version": "translation-v2.5.0:target-script-v2:neutral-dubbing-ocr-v5",
         "source_language": src_lang,
         "target_language": target_lang,
         "model": config.model_name,

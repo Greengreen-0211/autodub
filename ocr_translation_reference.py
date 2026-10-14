@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 
-REFERENCE_VERSION = "ocr-translation-reference-v4"
+REFERENCE_VERSION = "ocr-translation-reference-v5"
 _REF_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
@@ -182,6 +182,99 @@ def _source_ordered_coverage(asr: Any, subtitle: Any) -> float:
     common = previous[-1]
     precision, recall = common / len(right), common / len(left)
     return 0.0 if precision + recall == 0 else 2.0 * precision * recall / (precision + recall)
+
+
+def _alignment_tokens(value: Any) -> list[tuple[str, bool]]:
+    """Return source tokens together with a conservative proper-name hint."""
+    text = str(value or "")
+    latin = re.findall(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?", text)
+    if latin:
+        return [
+            (token.casefold(), token[:1].isupper() and token[1:].islower())
+            for token in latin
+        ]
+    return [(token, False) for token in re.findall(r"[\u3400-\u9fff]", text)]
+
+
+def _tokens_equivalent(left: tuple[str, bool], right: tuple[str, bool]) -> bool:
+    """Match exact tokens and likely ASR spelling errors in proper names."""
+    left_text, left_name = left
+    right_text, right_name = right
+    if left_text == right_text:
+        return True
+    if not (left_name or right_name):
+        return False
+    if not (left_text.isalpha() and right_text.isalpha()):
+        return False
+    if min(len(left_text), len(right_text)) < 4:
+        return False
+    similarity = SequenceMatcher(None, left_text, right_text).ratio()
+    # Four-letter names with one substituted character score 0.75 (for
+    # example an ASR vowel error). Longer tokens retain the stricter limit.
+    threshold = 0.75 if min(len(left_text), len(right_text)) == 4 else 0.80
+    return similarity >= threshold
+
+
+def _source_boundary_metrics(asr: Any, subtitle: Any) -> dict[str, float]:
+    """Measure subtitle omissions and spillover beyond the current ASR turn."""
+    left, right = _alignment_tokens(asr), _alignment_tokens(subtitle)
+    if not left or not right:
+        return {"missing_rate": 1.0, "extra_rate": 1.0, "boundary_cost": 2.5}
+    previous = [0] * (len(right) + 1)
+    for left_token in left:
+        current = [0]
+        for index, right_token in enumerate(right, start=1):
+            if _tokens_equivalent(left_token, right_token):
+                current.append(previous[index - 1] + 1)
+            else:
+                current.append(max(previous[index], current[-1]))
+        previous = current
+    common = previous[-1]
+    missing_rate = (len(left) - common) / len(left)
+    # Normalize additions against the ASR turn. This deliberately penalizes
+    # a subtitle card that has already crossed into the following sentence.
+    extra_rate = (len(right) - common) / len(left)
+    return {
+        "missing_rate": missing_rate,
+        "extra_rate": extra_rate,
+        "boundary_cost": missing_rate + 1.5 * extra_rate,
+    }
+
+
+def _candidates_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Recognize partial/full forms of the same bilingual subtitle evidence."""
+    left_source, right_source = _normalize(left["source_text"]), _normalize(right["source_text"])
+    left_target, right_target = _normalize(left["target_text"]), _normalize(right["target_text"])
+    source_nested = bool(left_source and right_source) and (
+        left_source in right_source or right_source in left_source
+    )
+    target_nested = bool(left_target and right_target) and (
+        left_target in right_target or right_target in left_target
+    )
+    return source_nested and target_nested
+
+
+def _candidate_selection_key(candidate: dict[str, Any]) -> tuple[float, ...]:
+    """Prefer the subtitle whose source boundary best matches this ASR turn."""
+    return (
+        -float(candidate["boundary_cost"]),
+        -abs(float(candidate["source_length_delta"])),
+        float(candidate["source_similarity"]),
+        float(candidate["source_coverage"]),
+        float(candidate["time_alignment"]),
+        float(candidate["score"]),
+        float(candidate["frame_support"]),
+    )
+
+
+def _is_perfect_boundary_candidate(candidate: dict[str, Any]) -> bool:
+    return (
+        float(candidate["source_similarity"]) >= 0.98
+        and float(candidate["source_coverage"]) >= 0.98
+        and float(candidate["missing_rate"]) <= 0.02
+        and float(candidate["extra_rate"]) <= 0.05
+        and int(candidate["frame_support"]) >= 2
+    )
 
 
 def _source_spelling_similarity(left: Any, right: Any) -> float:
@@ -444,6 +537,7 @@ def prepare_ocr_translation_references(
             else:
                 grouped[key] = group
         candidates = []
+        asr_token_count = max(1, len(_alignment_tokens(asr)))
         for group in grouped.values():
             support = len(set(group["timestamps"]))
             score = min(1.0, max(group["scores"]) + min(0.06, 0.03 * (support - 1)))
@@ -457,13 +551,22 @@ def prepare_ocr_translation_references(
                 source_coverage >= 0.56 and support >= 2
                 else "low"
             )
+            boundary = _source_boundary_metrics(asr, group["source_text"])
+            subtitle_token_count = len(_alignment_tokens(group["source_text"]))
+            timestamps = sorted(set(round(value, 3) for value in group["timestamps"]))
+            midpoint = sum(timestamps) / len(timestamps) if timestamps else (start + end) / 2.0
             candidates.append({
                 "source_text": group["source_text"], "target_text": group["target_text"],
                 "confidence": confidence, "score": round(score, 6),
                 "source_similarity": round(source_similarity, 6), "frame_support": support,
                 "source_coverage": round(source_coverage, 6),
+                "missing_rate": round(boundary["missing_rate"], 6),
+                "extra_rate": round(boundary["extra_rate"], 6),
+                "boundary_cost": round(boundary["boundary_cost"], 6),
+                "source_length_delta": subtitle_token_count - asr_token_count,
+                "time_alignment": round(_time_score(midpoint, start, end), 6),
                 "composed": bool(group.get("composed", False)),
-                "timestamps": sorted(set(round(value, 3) for value in group["timestamps"])),
+                "timestamps": timestamps,
             })
         candidates.sort(key=lambda item: (item["score"], item["frame_support"]), reverse=True)
         source_hints = []
@@ -535,14 +638,37 @@ def prepare_ocr_translation_references(
         eligible = [candidate for candidate in candidates if candidate["confidence"] in {"high", "medium"}]
         status, reason, accepted = "rejected", "no_trusted_reference", []
         if eligible:
-            best = eligible[0]
-            competing = next((item for item in eligible[1:]
-                              if _normalize(item["target_text"]) != _normalize(best["target_text"])), None)
-            margin = best["score"] - competing["score"] if competing else 1.0
-            if competing and margin < 0.06:
-                reason = "ambiguous_target_reference"
+            perfect = [candidate for candidate in eligible if _is_perfect_boundary_candidate(candidate)]
+            # A source-exact candidate dominates spillover/partial alternatives,
+            # unless another source-exact candidate gives a genuinely different
+            # target subtitle for the same source text.
+            pool = perfect or eligible
+            best = max(pool, key=_candidate_selection_key)
+            competing = [
+                item for item in pool
+                if item is not best
+                and _normalize(item["target_text"]) != _normalize(best["target_text"])
+                and not _candidates_compatible(best, item)
+            ]
+            close_competitor = next(
+                (item for item in competing if abs(best["score"] - item["score"]) < 0.06),
+                None,
+            )
+            if close_competitor:
+                # Preserve the best evidence as a terminology/semantic hint,
+                # but prevent direct subtitle adoption when targets truly clash.
+                reason = "ambiguous_target_reference_hint"
+                hint = {key: best[key] for key in
+                        ("target_text", "source_text", "score", "frame_support")}
+                hint["confidence"] = "medium"
+                accepted = [hint]
+                references_by_segment[sid] = accepted
             else:
-                status, reason = "accepted", "trusted_source_aligned_pair"
+                status = "accepted"
+                reason = (
+                    "exact_boundary_source_aligned_pair" if perfect
+                    else "trusted_boundary_source_aligned_pair"
+                )
                 accepted = [{key: best[key] for key in
                              ("target_text", "source_text", "confidence", "score", "frame_support")}]
                 references_by_segment[sid] = accepted
