@@ -7,9 +7,9 @@ import os
 import re
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.3.2"
+RULE_VERSION = "translation-v2.4.0"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v3"
+PROMPT_VERSION = "neutral-dubbing-ocr-v4"
 
 # Translation is fail-closed by default: one segment that cannot be validated
 # stops the stage instead of letting an untranslated line reach the mixer.
@@ -197,6 +197,11 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                      "previous_text": before, "next_text": after,
                      "duration": float(segment["end"])-float(segment["start"]),
                      "minimum_candidates": 1 if is_tiny(str(segment.get("text", ""))) else 3,
+                     "translation_risk": (
+                         "low_context_short_fragment"
+                         if is_tiny(str(segment.get("text", ""))) and not references
+                         else "normal"
+                     ),
                      "ocr_translation_references": references,
                      "ocr_source_spelling_hints": source_spelling_hints}
 
@@ -240,7 +245,11 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                 )
                 # The model must explicitly confirm full semantic coverage before
                 # an OCR subtitle is allowed to become the standard translation.
-                if preferred and response_row.get("ocr_reference_complete") is True:
+                if (
+                    preferred
+                    and response_row.get("ocr_reference_complete") is True
+                    and response_row.get("ocr_reference_natural") is True
+                ):
                     try:
                         direct = validate_target_text(
                             preferred["target_subtitle_reference"],
@@ -265,6 +274,10 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                                 seen.add(key)
                         valid["text"] = direct
                         valid["translations_candidates"] = candidates[:5]
+                elif preferred and response_row.get("ocr_reference_complete") is True:
+                    valid["translation_warnings"].append(
+                        "ocr_complete_but_not_natural_reference_only"
+                    )
                 rows[i].update(valid)
                 for warning in valid["translation_warnings"]:
                     print(f"⚠️ translation segment={ids[i]} {warning}")

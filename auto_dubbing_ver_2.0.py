@@ -1668,12 +1668,20 @@ class AdvancedTranslator:
                     "to another line; ignore them whenever they conflict with the ASR text or context. Never "
                     "replace, complete, or rewrite the ASR source from OCR. Duration is only a soft preference; "
                     "never remove meaning merely to make the translation shorter. "
+                    "For translation_risk=low_context_short_fragment, translate the lexical meaning strictly. "
+                    "Use context only to disambiguate; never reinterpret an ordinary word as breathing, a sound "
+                    "effect or an unrelated interjection. If context remains unclear, choose the most literal "
+                    "neutral translation and do not guess. "
                     "For an OCR reference marked usage_policy=preferred_if_complete, compare it against the full "
                     "ASR meaning. Judge semantic coverage in natural target-language usage, not word-for-word "
                     "surface alignment: implicit subjects, idiomatic compression and normal target-language "
-                    "word order are allowed when no meaning is lost. If it covers every meaningful element, "
-                    "normally use that target_subtitle_reference verbatim as text and as the first candidate, "
-                    "and set ocr_reference_complete=true. Exception: if the reference uses a non-established "
+                    "word order are allowed when no meaning is lost. Separately judge whether the target subtitle "
+                    "is natural, grammatical spoken target-language dialogue rather than a literal or awkward "
+                    "rendering. Set ocr_reference_natural=true only when it can be spoken verbatim without repair. "
+                    "Only when both ocr_reference_complete and ocr_reference_natural are true, normally use that "
+                    "target_subtitle_reference verbatim as text and as the first candidate. When it is complete "
+                    "but unnatural, keep it only as semantic evidence and write a natural standard translation. "
+                    "Exception: if the reference uses a non-established "
                     "rendering of a proper name for which an official localized form is known, set "
                     "ocr_reference_complete=false and return a standard translation with the official name "
                     "instead of copying the reference verbatim. If the reference "
@@ -1688,7 +1696,7 @@ class AdvancedTranslator:
                     "accompany their localized form when useful, but must not replace localization. Output "
                     "strict JSON: "
                     '{"translations":[{"id":"supplied-id","text":"translation",'
-                    '"ocr_reference_complete":false,'
+                    '"ocr_reference_complete":false,"ocr_reference_natural":false,'
                     '"translations_candidates":[{"text":"candidate"}]}]}'
                 )
                 response = client.chat.completions.create(
@@ -1717,7 +1725,7 @@ def _translation_candidates_fingerprint(
     config: DubbingConfig,
 ) -> str:
     payload = {
-        "version": "translation-v2.3.2:target-script-v2:neutral-dubbing-ocr-v3",
+        "version": "translation-v2.4.0:target-script-v2:neutral-dubbing-ocr-v4",
         "source_language": src_lang,
         "target_language": target_lang,
         "model": config.model_name,

@@ -213,8 +213,8 @@ class OCRV211Client:
         duration = max(0.0, end - start)
         if duration <= 0:
             return [round(start, 3)]
-        interval = max(0.75, float(os.getenv("AUTODUB_OCR_SAMPLE_INTERVAL", "1.5")))
-        maximum = max(3, int(os.getenv("AUTODUB_OCR_MAX_FRAMES_PER_SEGMENT", "12")))
+        interval = max(0.60, float(os.getenv("AUTODUB_OCR_SAMPLE_INTERVAL", "1.0")))
+        maximum = max(3, int(os.getenv("AUTODUB_OCR_MAX_FRAMES_PER_SEGMENT", "20")))
         count = min(maximum, max(3, int(math.ceil(duration / interval))))
         return [
             round(start + (index + 0.5) * duration / count, 3)
@@ -248,7 +248,7 @@ class OCRV211Client:
                     "media": media_key,
                     "time": timestamp,
                     "service": self.config.ocr_url,
-                    "sampling": "adaptive-subtitle-v2",
+                    "sampling": "adaptive-subtitle-v3",
                     "frame_index": self.config.ocr_frame_index,
                 })
                 cached = cache.get(key)
@@ -460,4 +460,3 @@ def run_preflight() -> None:
     from autodub_ocr_runtime.selftest import run as run_selftest
 
     run_selftest()
-

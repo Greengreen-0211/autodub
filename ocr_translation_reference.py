@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 
-REFERENCE_VERSION = "ocr-translation-reference-v3"
+REFERENCE_VERSION = "ocr-translation-reference-v4"
 _REF_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
@@ -160,6 +160,30 @@ def _source_similarity(left: Any, right: Any) -> float:
     return min(1.0, 0.68 * sequence + 0.20 * jaccard + 0.12 * containment)
 
 
+def _source_ordered_coverage(asr: Any, subtitle: Any) -> float:
+    """Measure ordered token coverage for multi-card subtitle alignment."""
+    def words(value: Any) -> list[str]:
+        text = str(value or "").casefold()
+        latin = re.findall(r"[a-z0-9]+(?:['’][a-z0-9]+)?", text)
+        return latin or re.findall(r"[\u3400-\u9fff]", text)
+
+    left, right = words(asr), words(subtitle)
+    if not left or not right:
+        return 0.0
+    previous = [0] * (len(right) + 1)
+    for left_token in left:
+        current = [0]
+        for index, right_token in enumerate(right, start=1):
+            if left_token == right_token:
+                current.append(previous[index - 1] + 1)
+            else:
+                current.append(max(previous[index], current[-1]))
+        previous = current
+    common = previous[-1]
+    precision, recall = common / len(right), common / len(left)
+    return 0.0 if precision + recall == 0 else 2.0 * precision * recall / (precision + recall)
+
+
 def _source_spelling_similarity(left: Any, right: Any) -> float:
     """Best token-level spelling match for noisy names and acronyms."""
     left_tokens = re.findall(r"[A-Za-z0-9]{2,}", str(left or "").casefold())
@@ -237,7 +261,7 @@ def _composed_groups(
 
     groups = []
     for left in range(len(events)):
-        for right in range(left + 1, min(len(events), left + 6)):
+        for right in range(left + 1, min(len(events), left + 9)):
             selected = events[left:right + 1]
             first = selected[0]["timestamps"][0]
             last = selected[-1]["timestamps"][-1]
@@ -246,17 +270,21 @@ def _composed_groups(
             source_text = _join_subtitle_lines([item["pair"]["source_text"] for item in selected])
             target_text = _join_subtitle_lines([item["pair"]["target_text"] for item in selected])
             similarity = _source_similarity(asr, source_text)
-            if similarity < 0.55:
+            coverage = _source_ordered_coverage(asr, source_text)
+            alignment = 0.65 * similarity + 0.35 * coverage
+            if alignment < 0.50 or coverage < 0.42:
                 continue
             timestamps = sorted({value for item in selected for value in item["timestamps"]})
             spatial = sum(float(item["pair"]["spatial_score"]) for item in selected) / len(selected)
             midpoint = (first + last) / 2.0
-            score = 0.72 * similarity + 0.18 * _time_score(midpoint, start, end) + 0.10 * spatial
+            score = (0.62 * similarity + 0.18 * coverage
+                     + 0.12 * _time_score(midpoint, start, end) + 0.08 * spatial)
             groups.append({
                 "source_text": source_text,
                 "target_text": target_text,
                 "scores": [score],
                 "source_similarities": [similarity],
+                "source_coverages": [coverage],
                 "timestamps": timestamps,
                 "composed": True,
             })
@@ -390,16 +418,19 @@ def prepare_ocr_translation_references(
             source_similarity = _source_similarity(asr, pair["source_text"])
             if source_similarity < 0.42:
                 continue
+            source_coverage = _source_ordered_coverage(asr, pair["source_text"])
             time_score = _time_score(pair["timestamp"], start, end)
             score = (0.72 * source_similarity + 0.18 * time_score
                      + 0.10 * float(pair["spatial_score"]))
             key = (_normalize(pair["source_text"]), _normalize(pair["target_text"]))
             group = grouped.setdefault(key, {
                 "source_text": pair["source_text"], "target_text": pair["target_text"],
-                "scores": [], "source_similarities": [], "timestamps": [],
+                "scores": [], "source_similarities": [], "source_coverages": [],
+                "timestamps": [],
             })
             group["scores"].append(score)
             group["source_similarities"].append(source_similarity)
+            group["source_coverages"].append(source_coverage)
             group["timestamps"].append(pair["timestamp"])
         for group in _composed_groups(pairs, start, end, asr):
             key = (_normalize(group["source_text"]), _normalize(group["target_text"]))
@@ -407,6 +438,7 @@ def prepare_ocr_translation_references(
             if existing:
                 existing["scores"].extend(group["scores"])
                 existing["source_similarities"].extend(group["source_similarities"])
+                existing["source_coverages"].extend(group.get("source_coverages", []))
                 existing["timestamps"].extend(group["timestamps"])
                 existing["composed"] = existing.get("composed", False) or group["composed"]
             else:
@@ -416,16 +448,20 @@ def prepare_ocr_translation_references(
             support = len(set(group["timestamps"]))
             score = min(1.0, max(group["scores"]) + min(0.06, 0.03 * (support - 1)))
             source_similarity = max(group["source_similarities"])
+            source_coverage = max(group.get("source_coverages", [0.0]))
             confidence = (
-                "high" if score >= 0.78 and source_similarity >= 0.72 and
+                "high" if score >= 0.76 and source_similarity >= 0.68 and
+                source_coverage >= 0.68 and
                 (support >= 2 or source_similarity >= 0.88)
-                else "medium" if score >= 0.70 and source_similarity >= 0.62 and support >= 2
+                else "medium" if score >= 0.67 and source_similarity >= 0.58 and
+                source_coverage >= 0.56 and support >= 2
                 else "low"
             )
             candidates.append({
                 "source_text": group["source_text"], "target_text": group["target_text"],
                 "confidence": confidence, "score": round(score, 6),
                 "source_similarity": round(source_similarity, 6), "frame_support": support,
+                "source_coverage": round(source_coverage, 6),
                 "composed": bool(group.get("composed", False)),
                 "timestamps": sorted(set(round(value, 3) for value in group["timestamps"])),
             })

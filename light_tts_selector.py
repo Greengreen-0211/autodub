@@ -240,15 +240,28 @@ class LightTTSSelector:
 
     @staticmethod
     def _duration_fit(actual: float, target: float) -> Dict[str, Any]:
-        """Classify duration with a hybrid absolute/relative tolerance."""
-        absolute = abs(float(actual) - float(target))
-        relative = absolute / max(0.4, float(target))
-        if absolute <= 0.35 or relative <= 0.20:
-            status = "suitable"
-        elif absolute > 0.60 and relative > 0.35:
-            status = "rejected"
+        """Classify duration asymmetrically: overrun is riskier than silence."""
+        actual, target = float(actual), float(target)
+        delta = actual - target
+        absolute = abs(delta)
+        relative = absolute / max(0.4, target)
+        if delta <= 0:
+            # A shorter line can keep a natural tail pause.  Do not lengthen
+            # wording merely to occupy every millisecond of its source window.
+            if absolute <= max(0.70, 0.30 * target):
+                status = "suitable"
+            elif absolute <= max(1.10, 0.45 * target):
+                status = "borderline"
+            else:
+                status = "rejected"
         else:
-            status = "borderline"
+            # Overrun can collide with the next turn, so use a tight limit.
+            if absolute <= 0.25 or relative <= 0.10:
+                status = "suitable"
+            elif absolute <= 0.50 and relative <= 0.20:
+                status = "borderline"
+            else:
+                status = "rejected"
         return {
             "duration_fit": status,
             "duration_error": absolute,
@@ -276,6 +289,10 @@ class LightTTSSelector:
             row for row in successful
             if candidates[int(row["candidate_index"])].get("_selection_priority") == "ocr_high"
         ]
+        standard = [
+            row for row in successful
+            if candidates[int(row["candidate_index"])].get("_selection_priority") == "standard"
+        ]
         excluded_indices = set()
         if preferred:
             ocr = min(preferred, key=lambda row: float(row["duration_error"]))
@@ -283,11 +300,26 @@ class LightTTSSelector:
                 return ocr, "ocr_high_duration_suitable"
             if ocr["duration_fit"] == "rejected":
                 excluded_indices.update(int(row["candidate_index"]) for row in preferred)
-            else:
-                # Borderline OCR is allowed a small preference, never a large timing loss.
-                preference_margin = max(0.15, 0.08 * max(0.4, target_duration))
-                if float(ocr["duration_error"]) <= float(closest["duration_error"]) + preference_margin:
-                    return ocr, "ocr_high_duration_borderline_preferred"
+
+        # Once timing is usable, preserve the standard natural translation
+        # instead of selecting a more verbose variant merely because it fills
+        # a little more of the source window.
+        standard_suitable = [row for row in standard if row["duration_fit"] == "suitable"]
+        if standard_suitable:
+            return min(
+                standard_suitable, key=lambda row: float(row["duration_error"])
+            ), "standard_duration_suitable"
+
+        if preferred:
+            ocr = min(preferred, key=lambda row: float(row["duration_error"]))
+            if ocr["duration_fit"] == "borderline":
+                return ocr, "ocr_high_duration_borderline_preferred"
+
+        standard_borderline = [row for row in standard if row["duration_fit"] == "borderline"]
+        if standard_borderline:
+            return min(
+                standard_borderline, key=lambda row: float(row["duration_error"])
+            ), "standard_duration_borderline"
 
         available = [
             row for row in successful
@@ -297,13 +329,6 @@ class LightTTSSelector:
             available,
             key=lambda row: (float(row["duration_error"]), int(row["candidate_index"])),
         )
-        standard = [
-            row for row in available
-            if candidates[int(row["candidate_index"])].get("_selection_priority") == "standard"
-            and row["duration_fit"] == "suitable"
-        ]
-        if standard:
-            return min(standard, key=lambda row: float(row["duration_error"])), "standard_duration_suitable"
         if preferred and excluded_indices:
             return closest_available, "ocr_high_rejected_by_duration"
         if preferred:
