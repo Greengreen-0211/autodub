@@ -1799,6 +1799,13 @@ class AdvancedTranslator:
                     "word order are allowed when no meaning is lost. Separately judge whether the target subtitle "
                     "is natural, grammatical spoken target-language dialogue rather than a literal or awkward "
                     "rendering. Set ocr_reference_natural=true only when it can be spoken verbatim without repair. "
+                    "reference_policy=direct means the backend verified an exact, stable source boundary; do not "
+                    "declare it incomplete merely because the localized subtitle expresses an action implicitly. "
+                    "reference_policy=composed means several time-ordered subtitle cards were combined. Preserve "
+                    "their order and translate only a genuinely uncovered proposition. If repeated source calls "
+                    "were condensed by the screen subtitle, rebuild the repetition using the subtitle's own natural "
+                    "target wording and the source repetition count. Do not mechanically append a translated word "
+                    "when the target subtitle already conveys that proposition idiomatically. "
                     "Choose ocr_reference_action=direct only when the reference is complete, natural, and already "
                     "consistent with entity_glossary. Choose minimal_repair when it is complete and useful but "
                     "needs only official-name replacement, punctuation, spacing, an obvious grammar repair, or a "
@@ -1849,7 +1856,7 @@ def _translation_candidates_fingerprint(
     config: DubbingConfig,
 ) -> str:
     payload = {
-        "version": "translation-v2.6.0:target-script-v2:neutral-dubbing-ocr-v6:glossary-v1",
+        "version": "translation-v2.7.0:target-script-v2:neutral-dubbing-ocr-v7:glossary-v1",
         "source_language": src_lang,
         "target_language": target_lang,
         "model": config.model_name,
@@ -2298,7 +2305,7 @@ def run_step_3(config: DubbingConfig) -> None:
         reference_manifest = reference_result["manifest"]
     except Exception as exc:
         reference_manifest = {
-            "version": "ocr-translation-reference-v6",
+            "version": "ocr-translation-reference-v7",
             "status": "error",
             "reason": f"{type(exc).__name__}:{exc}",
             "accepted_segments": 0,

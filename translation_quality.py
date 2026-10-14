@@ -7,9 +7,9 @@ import os
 import re
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.6.0"
+RULE_VERSION = "translation-v2.7.0"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v6"
+PROMPT_VERSION = "neutral-dubbing-ocr-v7"
 
 # Translation is fail-closed by default: one segment that cannot be validated
 # stops the stage instead of letting an untranslated line reach the mixer.
@@ -159,6 +159,26 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
             "translation_warnings": warnings}
 
 
+def _restore_backend_candidate_priorities(validated: dict, cached: dict) -> None:
+    """Restore only provenance previously assigned by this backend.
+
+    Model-supplied candidate metadata is discarded by ``validate_translation``.
+    A resumable checkpoint, however, already contains backend-validated OCR
+    candidates and must retain their selection priority on a cache hit.
+    """
+    allowed = {"ocr_direct", "ocr_repaired", "ocr_hybrid", "standard"}
+    priorities = {
+        _canonical(candidate.get("text")): candidate.get("_selection_priority")
+        for candidate in cached.get("translations_candidates", [])
+        if isinstance(candidate, dict)
+        and candidate.get("_selection_priority") in allowed
+    }
+    for candidate in validated.get("translations_candidates", []):
+        priority = priorities.get(_canonical(candidate.get("text")))
+        if priority in allowed:
+            candidate["_selection_priority"] = priority
+
+
 def segment_fingerprint(segment: dict, previous: str, following: str, source: str,
                         target: str, model: str,
                         entity_glossary: list[dict] | None = None) -> str:
@@ -212,14 +232,16 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                 row.update(text=text, translations_candidates=[{"text": text}],
                            translation_status="success", translation_error="", translation_same_language=True)
             else:
-                row.update(validate_translation(known, segment, source, target))
+                validated = validate_translation(known, segment, source, target)
+                _restore_backend_candidate_priorities(validated, known)
+                row.update(validated)
             row["translation_attempts"] = known.get("translation_attempts", 0)
             row["translation_cache_hit"] = True
         except ValueError:
             pending.append(i)
         rows.append(row)
         references = []
-        for reference in segment.get("_ocr_translation_references", [])[:2]:
+        for reference in segment.get("_ocr_translation_references", [])[:3]:
             if not isinstance(reference, dict):
                 continue
             target_text = str(reference.get("target_text", "")).strip()[:240]
@@ -230,9 +252,17 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     "target_subtitle_reference": target_text,
                     "confidence": str(reference.get("confidence", "medium")),
                     "reference_tier": str(reference.get("reference_tier", "trusted")),
+                    "reference_policy": str(reference.get("reference_policy", "hint")),
+                    "source_coverage": reference.get("source_coverage"),
+                    "missing_rate": reference.get("missing_rate"),
+                    "extra_rate": reference.get("extra_rate"),
+                    "composed": bool(reference.get("composed", False)),
                     "usage_policy": (
                         "preferred_if_complete"
-                        if str(reference.get("confidence", "")).lower() == "high"
+                        if (
+                            str(reference.get("confidence", "")).lower() == "high"
+                            and str(reference.get("reference_policy", "hint")) != "hint"
+                        )
                         else "terminology_hint"
                     ),
                 })
@@ -302,19 +332,40 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                 ocr_action = str(response_row.get("ocr_reference_action", "semantic_hint"))
                 ocr_candidate = None
                 ocr_priority = ""
-                if preferred and response_row.get("ocr_reference_complete") is True:
+                reference_policy = str(
+                    preferred.get("reference_policy", "hint") if preferred else "hint"
+                )
+                # A source-exact, stable bilingual subtitle is stronger evidence
+                # than the model's lexical notion of completeness. Localized
+                # subtitles may compress an implied verb without losing the
+                # proposition. Naturalness remains a required independent gate
+                # so stable OCR corruption is never promoted automatically.
+                if (
+                    preferred
+                    and reference_policy == "direct"
+                    and response_row.get("ocr_reference_natural") is True
+                ):
+                    ocr_candidate = preferred["target_subtitle_reference"]
+                    ocr_priority = "ocr_direct"
+                    ocr_action = "backend_direct"
+                elif (
+                    preferred
+                    and ocr_action == "minimal_repair"
+                    and response_row.get("ocr_repaired_complete") is True
+                ):
+                    ocr_candidate = response_row.get("ocr_repaired_text")
+                    ocr_priority = (
+                        "ocr_hybrid"
+                        if reference_policy == "composed"
+                        else "ocr_repaired"
+                    )
+                elif preferred and response_row.get("ocr_reference_complete") is True:
                     if (
                         ocr_action == "direct"
                         and response_row.get("ocr_reference_natural") is True
                     ):
                         ocr_candidate = preferred["target_subtitle_reference"]
                         ocr_priority = "ocr_direct"
-                    elif (
-                        ocr_action == "minimal_repair"
-                        and response_row.get("ocr_repaired_complete") is True
-                    ):
-                        ocr_candidate = response_row.get("ocr_repaired_text")
-                        ocr_priority = "ocr_repaired"
                 if ocr_candidate:
                     try:
                         ocr_candidate = validate_target_text(
@@ -351,7 +402,8 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                 if preferred:
                     print(
                         f"[Translation {ids[i]}] OCR={preferred.get('reference_tier', 'trusted')} "
-                        f"action={ocr_action} "
+                        f"policy={reference_policy} action={ocr_action} "
+                        f"coverage={preferred.get('source_coverage', 'n/a')} "
                         f"entity={'consistent' if required_entities else 'not_applicable'}"
                     )
             except ValueError as exc:

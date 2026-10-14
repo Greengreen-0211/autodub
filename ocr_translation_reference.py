@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 
-REFERENCE_VERSION = "ocr-translation-reference-v6"
+REFERENCE_VERSION = "ocr-translation-reference-v7"
 _REF_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
@@ -324,6 +324,41 @@ def _join_subtitle_lines(values: list[str]) -> str:
     return output.strip()
 
 
+def _collapse_progressive_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse subtitle cards that grow progressively across sampled frames.
+
+    Subtitle renderers often expose ``Wake up`` and then ``Wake up. Wake up``
+    in consecutive frames.  Treating both as separate cards duplicates both
+    source and target text when a segment-level reference is composed.
+    """
+    collapsed: list[dict[str, Any]] = []
+    for event in events:
+        if not collapsed:
+            collapsed.append(event)
+            continue
+        previous = collapsed[-1]
+        previous_source = _normalize(previous["pair"]["source_text"])
+        current_source = _normalize(event["pair"]["source_text"])
+        previous_target = _normalize(previous["pair"]["target_text"])
+        current_target = _normalize(event["pair"]["target_text"])
+        source_nested = bool(previous_source and current_source) and (
+            previous_source in current_source or current_source in previous_source
+        )
+        target_nested = bool(previous_target and current_target) and (
+            previous_target in current_target or current_target in previous_target
+        )
+        if not (source_nested and target_nested):
+            collapsed.append(event)
+            continue
+        timestamps = sorted(set(previous["timestamps"] + event["timestamps"]))
+        # Keep the fuller bilingual card while retaining all temporal support.
+        previous_size = len(previous_source) + len(previous_target)
+        current_size = len(current_source) + len(current_target)
+        winner = event if current_size > previous_size else previous
+        collapsed[-1] = dict(winner, timestamps=timestamps)
+    return collapsed
+
+
 def _composed_groups(
     pairs: list[dict[str, Any]], start: float, end: float, asr: str,
 ) -> list[dict[str, Any]]:
@@ -352,6 +387,7 @@ def _composed_groups(
             continue
         events.append({"key": key, "pair": best, "timestamps": [timestamp]})
 
+    events = _collapse_progressive_events(events)
     groups = []
     for left in range(len(events)):
         for right in range(left + 1, min(len(events), left + 9)):
@@ -661,10 +697,11 @@ def prepare_ocr_translation_references(
                 hint = {key: best[key] for key in (
                     "target_text", "source_text", "score", "frame_support",
                     "source_similarity", "source_coverage", "missing_rate",
-                    "extra_rate", "boundary_cost",
+                    "extra_rate", "boundary_cost", "composed", "timestamps",
                 )}
                 hint["confidence"] = "medium"
                 hint["reference_tier"] = "ambiguous_hint"
+                hint["reference_policy"] = "hint"
                 accepted = [hint]
                 references_by_segment[sid] = accepted
             else:
@@ -676,9 +713,22 @@ def prepare_ocr_translation_references(
                 reference = {key: best[key] for key in (
                     "target_text", "source_text", "confidence", "score",
                     "frame_support", "source_similarity", "source_coverage",
-                    "missing_rate", "extra_rate", "boundary_cost",
+                    "missing_rate", "extra_rate", "boundary_cost", "composed",
+                    "timestamps",
                 )}
                 reference["reference_tier"] = "exact" if perfect else "trusted"
+                if perfect:
+                    reference["reference_policy"] = "direct"
+                elif (
+                    float(reference["source_coverage"]) >= 0.78
+                    and float(reference["missing_rate"]) <= 0.22
+                    and float(reference["extra_rate"]) <= 0.12
+                ):
+                    reference["reference_policy"] = (
+                        "composed" if reference.get("composed") else "repair_or_compress"
+                    )
+                else:
+                    reference["reference_policy"] = "hint"
                 accepted = [reference]
                 references_by_segment[sid] = accepted
         match_rows.append({

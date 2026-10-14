@@ -226,6 +226,7 @@ class LightTTSSelector:
         text: str,
         language: str,
         target_duration: float,
+        available_duration: float,
     ) -> str:
         data = {
             "segment_id": segment_id,
@@ -233,32 +234,43 @@ class LightTTSSelector:
             "text": text,
             "language": language,
             "target_duration": round(target_duration, 6),
+            "available_duration": round(available_duration, 6),
             "backend": self.backend.signature,
         }
         encoded = json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
-    def _duration_fit(actual: float, target: float) -> Dict[str, Any]:
-        """Classify duration asymmetrically: overrun is riskier than silence."""
-        actual, target = float(actual), float(target)
+    def _duration_fit(
+        actual: float,
+        target: float,
+        available: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Judge speech duration against an ideal span and a hard time slot.
+
+        Short speech can retain a natural tail pause.  Long speech is accepted
+        only while it remains inside the segment's available mixing window.
+        """
+        actual, target = float(actual), max(0.4, float(target))
+        available = max(target, float(available if available is not None else target))
         delta = actual - target
         absolute = abs(delta)
         relative = absolute / max(0.4, target)
         if delta <= 0:
-            # A shorter line can keep a natural tail pause.  Do not lengthen
-            # wording merely to occupy every millisecond of its source window.
-            if absolute <= max(0.70, 0.30 * target):
+            ratio = actual / target
+            if ratio >= 0.72 or absolute <= 0.70:
                 status = "suitable"
-            elif absolute <= max(1.10, 0.45 * target):
+            elif ratio >= 0.50 or absolute <= 1.10:
                 status = "borderline"
             else:
                 status = "rejected"
         else:
-            # Overrun can collide with the next turn, so use a tight limit.
-            if absolute <= 0.25 or relative <= 0.10:
+            slot_overrun = actual - available
+            if slot_overrun > max(0.12, 0.05 * available):
+                status = "rejected"
+            elif absolute <= 0.25 or relative <= 0.10:
                 status = "suitable"
-            elif absolute <= 0.50 and relative <= 0.20:
+            elif actual <= available and relative <= 0.30:
                 status = "borderline"
             else:
                 status = "rejected"
@@ -268,6 +280,33 @@ class LightTTSSelector:
             "duration_relative_error": relative,
         }
 
+    @staticmethod
+    def _speech_window(segment: Mapping[str, Any]) -> Tuple[float, float]:
+        """Return (ideal speech duration, maximum available segment duration)."""
+        start = float(segment["start"])
+        end = float(segment["end"])
+        available = max(0.4, end - start)
+        starts: List[float] = []
+        ends: List[float] = []
+        for item in segment.get("qwen3_time_stamps", []) or []:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                word_start = float(item.get("start"))
+                word_end = float(item.get("end", word_start))
+            except (TypeError, ValueError):
+                continue
+            if word_end < start - 0.25 or word_start > end + 0.25:
+                continue
+            starts.append(max(start, word_start))
+            ends.append(min(end, max(word_start, word_end)))
+        if not starts or not ends:
+            return available, available
+        # Small edge allowance preserves natural consonant release without
+        # treating all diarization padding as speech that TTS must fill.
+        ideal = min(available, max(0.4, max(ends) - min(starts) + 0.12))
+        return ideal, available
+
     def _choose_candidate(
         self,
         successful: List[Dict[str, Any]],
@@ -275,10 +314,13 @@ class LightTTSSelector:
         target_duration: float,
         *,
         measured: bool,
+        available_duration: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], str]:
         """Prefer trusted OCR only when measured speech duration remains usable."""
         for row in successful:
-            row.update(self._duration_fit(row["actual_duration"], target_duration))
+            row.update(self._duration_fit(
+                row["actual_duration"], target_duration, available_duration
+            ))
         closest = min(
             successful,
             key=lambda row: (float(row["duration_error"]), int(row["candidate_index"])),
@@ -292,14 +334,15 @@ class LightTTSSelector:
         ]
         repaired = [
             row for row in successful
-            if candidates[int(row["candidate_index"])].get("_selection_priority") == "ocr_repaired"
+            if candidates[int(row["candidate_index"])].get("_selection_priority")
+            in {"ocr_repaired", "ocr_hybrid"}
         ]
         standard = [
             row for row in successful
             if candidates[int(row["candidate_index"])].get("_selection_priority") == "standard"
         ]
         excluded_indices = set()
-        for trusted, label in ((direct, "ocr_direct"), (repaired, "ocr_repaired")):
+        for trusted, label in ((direct, "ocr_direct"), (repaired, "ocr_assisted")):
             if not trusted:
                 continue
             candidate = min(trusted, key=lambda row: float(row["duration_error"]))
@@ -307,6 +350,17 @@ class LightTTSSelector:
                 return candidate, f"{label}_duration_suitable"
             if candidate["duration_fit"] == "rejected":
                 excluded_indices.update(int(row["candidate_index"]) for row in trusted)
+
+        # Borderline means safely adjustable, not unusable.  Once OCR is
+        # source-aligned, semantically validated, and inside the hard slot,
+        # preserve the human subtitle instead of preferring a marginally
+        # closer machine translation.
+        for trusted, label in ((direct, "ocr_direct"), (repaired, "ocr_assisted")):
+            borderline = [row for row in trusted if row["duration_fit"] == "borderline"]
+            if borderline:
+                return min(
+                    borderline, key=lambda row: float(row["duration_error"])
+                ), f"{label}_duration_adjustable"
 
         # Once timing is usable, preserve the standard natural translation
         # instead of selecting a more verbose variant merely because it fills
@@ -322,16 +376,6 @@ class LightTTSSelector:
             return min(
                 standard_borderline, key=lambda row: float(row["duration_error"])
             ), "standard_duration_borderline"
-
-        # A borderline trusted subtitle is used only when no standard candidate
-        # reaches even borderline duration. This prevents OCR confidence from
-        # overriding an obviously better dubbing fit.
-        for trusted, label in ((direct, "ocr_direct"), (repaired, "ocr_repaired")):
-            borderline = [row for row in trusted if row["duration_fit"] == "borderline"]
-            if borderline:
-                return min(
-                    borderline, key=lambda row: float(row["duration_error"])
-                ), f"{label}_duration_borderline_fallback"
 
         available = [
             row for row in successful
@@ -365,7 +409,7 @@ class LightTTSSelector:
         for sequence, source in enumerate(segments):
             segment = dict(source)
             segment_id = str(segment.get("id", sequence))
-            duration = max(0.0, float(segment["end"]) - float(segment["start"]))
+            duration, available_duration = self._speech_window(segment)
             language = str(segment.get("target_lang_raw", target_language) or target_language)
             candidates = normalize_translation_candidates(
                 segment.get("translations_candidates"), segment.get("text", "")
@@ -377,7 +421,9 @@ class LightTTSSelector:
             for index, candidate in enumerate(candidates):
                 text = candidate["text"]
                 cache_key = f"{segment_id}:{index}"
-                fingerprint = self._fingerprint(segment_id, index, text, language, duration)
+                fingerprint = self._fingerprint(
+                    segment_id, index, text, language, duration, available_duration
+                )
                 output_path = self.audio_dir / (
                     f"segment_{_safe_id(segment_id)}_candidate_{index}{self.backend.extension}"
                 )
@@ -406,6 +452,7 @@ class LightTTSSelector:
                             "candidate_index": index,
                             "text": text,
                             "target_duration": duration,
+                            "available_duration": available_duration,
                             "actual_duration": actual,
                             "duration_error": abs(actual - duration),
                             "audio_file": str(output_path.resolve()),
@@ -439,7 +486,9 @@ class LightTTSSelector:
                     }
                 )
                 if record.get("status") == "success":
-                    candidate_row.update(self._duration_fit(record["actual_duration"], duration))
+                    candidate_row.update(self._duration_fit(
+                        record["actual_duration"], duration, available_duration
+                    ))
                 enriched.append(candidate_row)
                 if record.get("status") == "success":
                     successful.append(record)
@@ -459,6 +508,7 @@ class LightTTSSelector:
                 candidates,
                 duration,
                 measured=not any(row.get("estimated") for row in successful),
+                available_duration=available_duration,
             )
             selected_index = int(selected["candidate_index"])
             for index, candidate in enumerate(enriched):
@@ -468,6 +518,7 @@ class LightTTSSelector:
                 "selected_index": selected_index,
                 "selected_text": selected["text"],
                 "target_duration": duration,
+                "available_duration": available_duration,
                 "actual_duration": selected["actual_duration"],
                 "duration_error": selected["duration_error"],
                 "duration_relative_error": selected.get("duration_relative_error"),
@@ -496,6 +547,7 @@ class LightTTSSelector:
                 f"[Translation {segment_id}] "
                 f"source={candidates[selected_index].get('_selection_priority', 'standard')} "
                 f"duration={float(selected['actual_duration']):.3f}/{duration:.3f}s "
+                f"slot={available_duration:.3f}s "
                 f"fit={selected.get('duration_fit')} selected={selection_reason}"
             )
         failures = sum(r["status"] == "fallback" for r in selection_rows)
