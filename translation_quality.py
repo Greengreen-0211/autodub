@@ -7,9 +7,9 @@ import os
 import re
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.5.0"
+RULE_VERSION = "translation-v2.6.0"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v5"
+PROMPT_VERSION = "neutral-dubbing-ocr-v6"
 
 # Translation is fail-closed by default: one segment that cannot be validated
 # stops the stage instead of letting an untranslated line reach the mixer.
@@ -72,6 +72,53 @@ def is_tiny(text: str) -> bool:
     return (0 < han <= 4) or (not han and len(words) <= 2)
 
 
+def _canonical(value: Any) -> str:
+    return re.sub(r"[\W_]+", "", str(value or "").casefold())
+
+
+def _source_contains_form(text: Any, form: Any) -> bool:
+    text, form = str(text or ""), str(form or "").strip()
+    if not form:
+        return False
+    if re.search(r"[A-Za-z0-9]", form):
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(form) + r"(?![A-Za-z0-9])"
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+    return _canonical(form) in _canonical(text)
+
+
+def applicable_glossary_entries(segment: dict, glossary: list[dict] | None) -> list[dict]:
+    """Return validated video-level entities that occur in this source turn."""
+    source_parts = [str(segment.get("text", ""))]
+    source_parts.extend(
+        str(reference.get("source_text", ""))
+        for reference in segment.get("_ocr_translation_references", [])
+        if isinstance(reference, dict)
+    )
+    source_text = " ".join(source_parts)
+    output = []
+    for entry in glossary or []:
+        if not isinstance(entry, dict):
+            continue
+        target_form = str(entry.get("target_form", "")).strip()
+        source_forms = [str(value).strip() for value in entry.get("source_forms", []) if str(value).strip()]
+        if target_form and source_forms and any(
+            _source_contains_form(source_text, form) for form in source_forms
+        ):
+            output.append({"source_forms": source_forms, "target_form": target_form})
+    return output
+
+
+def validate_entity_glossary(text: Any, required: list[dict]) -> None:
+    """Fail closed when a translation drops a required localized entity."""
+    normalized = _canonical(text)
+    missing = [
+        entry["target_form"] for entry in required
+        if _canonical(entry["target_form"]) not in normalized
+    ]
+    if missing:
+        raise ValueError("entity_glossary_mismatch:" + ",".join(missing))
+
+
 def validate_translation(row: dict, original: dict, source: str, target: str) -> dict:
     from light_tts_selector import normalize_translation_candidates
     if not isinstance(row, dict):
@@ -97,8 +144,10 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
     if primary_index is None:
         candidates = ([{"text": primary}] + candidates)[:5]
         primary_index = 0
-    if candidates[primary_index].get("_selection_priority") != "ocr_high":
-        candidates[primary_index]["_selection_priority"] = "standard"
+    # Candidate metadata returned by the model is untrusted. Provenance is
+    # assigned only by this module after validation.
+    for candidate in candidates:
+        candidate["_selection_priority"] = "standard"
     minimum = 1 if is_tiny(str(original.get("text", ""))) else 3
     if not minimum <= len(candidates) <= 5 or len(raw) > 5:
         raise ValueError(f"candidate_count:{len(candidates)} required:{minimum}-5")
@@ -111,12 +160,14 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
 
 
 def segment_fingerprint(segment: dict, previous: str, following: str, source: str,
-                        target: str, model: str) -> str:
+                        target: str, model: str,
+                        entity_glossary: list[dict] | None = None) -> str:
     payload = {"rules": RULE_VERSION, "language_check": LANGUAGE_VERSION, "prompt": PROMPT_VERSION,
                "source": language_code(source), "target": language_code(target), "model": model,
                "segment": {k: segment.get(k) for k in
                            ("id", "text", "start", "end", "speaker", "translation_allow_identity")},
                "previous_text": previous, "next_text": following,
+               "entity_glossary": entity_glossary or [],
                "ocr_translation_references": segment.get("_ocr_translation_references", []),
                "ocr_source_spelling_hints": segment.get("_ocr_source_spelling_hints", [])}
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -125,7 +176,8 @@ def segment_fingerprint(segment: dict, previous: str, following: str, source: st
 def translate_segments(segments: list[dict], source: str, target: str, model: str,
                        request: Callable | None, *, batch_size: int = 10, retries: int = 2,
                        cached: list[dict] | None = None, force_ids: set[str] | None = None,
-                       checkpoint: Callable | None = None) -> list[dict]:
+                       checkpoint: Callable | None = None,
+                       entity_glossary: list[dict] | None = None) -> list[dict]:
     ids = [str(s.get("id", i)) for i, s in enumerate(segments)]
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate segment IDs")
@@ -135,7 +187,10 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         sid = ids[i]
         before = str(segments[i-1].get("text", "")) if i else ""
         after = str(segments[i+1].get("text", "")) if i+1 < len(segments) else ""
-        fp = segment_fingerprint(segment, before, after, source, target, model)
+        required_entities = applicable_glossary_entries(segment, entity_glossary)
+        fp = segment_fingerprint(
+            segment, before, after, source, target, model, required_entities
+        )
         # Prompt-only keys are intentionally not copied into persisted/public rows.
         public_segment = {
             key: value for key, value in segment.items()
@@ -174,6 +229,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     "source_subtitle": source_text,
                     "target_subtitle_reference": target_text,
                     "confidence": str(reference.get("confidence", "medium")),
+                    "reference_tier": str(reference.get("reference_tier", "trusted")),
                     "usage_policy": (
                         "preferred_if_complete"
                         if str(reference.get("confidence", "")).lower() == "high"
@@ -197,6 +253,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                      "previous_text": before, "next_text": after,
                      "duration": float(segment["end"])-float(segment["start"]),
                      "minimum_candidates": 1 if is_tiny(str(segment.get("text", ""))) else 3,
+                     "entity_glossary": required_entities,
                      "ocr_translation_references": references,
                      "ocr_source_spelling_hints": source_spelling_hints}
 
@@ -233,49 +290,70 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     raise ValueError(error)
                 response_row = response[ids[i]]
                 valid = validate_translation(response_row, segments[i], source, target)
+                required_entities = inputs[i]["entity_glossary"]
+                validate_entity_glossary(valid["text"], required_entities)
+                for candidate in valid["translations_candidates"]:
+                    validate_entity_glossary(candidate["text"], required_entities)
                 preferred = next(
                     (reference for reference in inputs[i]["ocr_translation_references"]
                      if reference.get("usage_policy") == "preferred_if_complete"),
                     None,
                 )
-                # The model must explicitly confirm full semantic coverage before
-                # an OCR subtitle is allowed to become the standard translation.
-                if (
-                    preferred
-                    and response_row.get("ocr_reference_complete") is True
-                    and response_row.get("ocr_reference_natural") is True
-                ):
+                ocr_action = str(response_row.get("ocr_reference_action", "semantic_hint"))
+                ocr_candidate = None
+                ocr_priority = ""
+                if preferred and response_row.get("ocr_reference_complete") is True:
+                    if (
+                        ocr_action == "direct"
+                        and response_row.get("ocr_reference_natural") is True
+                    ):
+                        ocr_candidate = preferred["target_subtitle_reference"]
+                        ocr_priority = "ocr_direct"
+                    elif (
+                        ocr_action == "minimal_repair"
+                        and response_row.get("ocr_repaired_complete") is True
+                    ):
+                        ocr_candidate = response_row.get("ocr_repaired_text")
+                        ocr_priority = "ocr_repaired"
+                if ocr_candidate:
                     try:
-                        direct = validate_target_text(
-                            preferred["target_subtitle_reference"],
+                        ocr_candidate = validate_target_text(
+                            ocr_candidate,
                             target,
                             segments[i].get("text", ""),
                             source,
                             allow_identity=bool(segments[i].get("translation_allow_identity")),
                         )
+                        validate_entity_glossary(ocr_candidate, required_entities)
                     except ValueError as exc:
                         valid["translation_warnings"].append(
-                            f"ocr_preferred_reference_rejected:{exc}"
+                            f"ocr_candidate_rejected:{exc}"
                         )
                     else:
-                        # Internal-only marker: LightTTS may prefer this trusted
-                        # subtitle only after its measured duration is acceptable.
-                        candidates = [{"text": direct, "_selection_priority": "ocr_high"}]
-                        seen = {re.sub(r"[\W_]+", "", direct.casefold())}
+                        candidates = [{"text": ocr_candidate,
+                                       "_selection_priority": ocr_priority}]
+                        seen = {_canonical(ocr_candidate)}
                         for candidate in valid["translations_candidates"]:
-                            key = re.sub(r"[\W_]+", "", candidate["text"].casefold())
+                            key = _canonical(candidate["text"])
                             if key not in seen:
                                 candidates.append(candidate)
                                 seen.add(key)
-                        valid["text"] = direct
+                        valid["text"] = ocr_candidate
                         valid["translations_candidates"] = candidates[:5]
                 elif preferred and response_row.get("ocr_reference_complete") is True:
                     valid["translation_warnings"].append(
-                        "ocr_complete_but_not_natural_reference_only"
+                        "ocr_complete_reference_used_as_semantic_hint"
                     )
                 rows[i].update(valid)
                 for warning in valid["translation_warnings"]:
-                    print(f"⚠️ translation segment={ids[i]} {warning}")
+                    if warning != "candidate_lengths_similar":
+                        print(f"⚠️ translation segment={ids[i]} {warning}")
+                if preferred:
+                    print(
+                        f"[Translation {ids[i]}] OCR={preferred.get('reference_tier', 'trusted')} "
+                        f"action={ocr_action} "
+                        f"entity={'consistent' if required_entities else 'not_applicable'}"
+                    )
             except ValueError as exc:
                 rows[i]["translation_error"] = str(exc)
                 print(f"⚠️ translation segment={ids[i]} attempt={rows[i]['translation_attempts']} failed: {exc}")

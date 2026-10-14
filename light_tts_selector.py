@@ -285,21 +285,28 @@ class LightTTSSelector:
         )
         if not measured:
             return closest, "closest_estimated_duration"
-        preferred = [
+        direct = [
             row for row in successful
-            if candidates[int(row["candidate_index"])].get("_selection_priority") == "ocr_high"
+            if candidates[int(row["candidate_index"])].get("_selection_priority")
+            in {"ocr_direct", "ocr_high"}
+        ]
+        repaired = [
+            row for row in successful
+            if candidates[int(row["candidate_index"])].get("_selection_priority") == "ocr_repaired"
         ]
         standard = [
             row for row in successful
             if candidates[int(row["candidate_index"])].get("_selection_priority") == "standard"
         ]
         excluded_indices = set()
-        if preferred:
-            ocr = min(preferred, key=lambda row: float(row["duration_error"]))
-            if ocr["duration_fit"] == "suitable":
-                return ocr, "ocr_high_duration_suitable"
-            if ocr["duration_fit"] == "rejected":
-                excluded_indices.update(int(row["candidate_index"]) for row in preferred)
+        for trusted, label in ((direct, "ocr_direct"), (repaired, "ocr_repaired")):
+            if not trusted:
+                continue
+            candidate = min(trusted, key=lambda row: float(row["duration_error"]))
+            if candidate["duration_fit"] == "suitable":
+                return candidate, f"{label}_duration_suitable"
+            if candidate["duration_fit"] == "rejected":
+                excluded_indices.update(int(row["candidate_index"]) for row in trusted)
 
         # Once timing is usable, preserve the standard natural translation
         # instead of selecting a more verbose variant merely because it fills
@@ -310,16 +317,21 @@ class LightTTSSelector:
                 standard_suitable, key=lambda row: float(row["duration_error"])
             ), "standard_duration_suitable"
 
-        if preferred:
-            ocr = min(preferred, key=lambda row: float(row["duration_error"]))
-            if ocr["duration_fit"] == "borderline":
-                return ocr, "ocr_high_duration_borderline_preferred"
-
         standard_borderline = [row for row in standard if row["duration_fit"] == "borderline"]
         if standard_borderline:
             return min(
                 standard_borderline, key=lambda row: float(row["duration_error"])
             ), "standard_duration_borderline"
+
+        # A borderline trusted subtitle is used only when no standard candidate
+        # reaches even borderline duration. This prevents OCR confidence from
+        # overriding an obviously better dubbing fit.
+        for trusted, label in ((direct, "ocr_direct"), (repaired, "ocr_repaired")):
+            borderline = [row for row in trusted if row["duration_fit"] == "borderline"]
+            if borderline:
+                return min(
+                    borderline, key=lambda row: float(row["duration_error"])
+                ), f"{label}_duration_borderline_fallback"
 
         available = [
             row for row in successful
@@ -329,10 +341,10 @@ class LightTTSSelector:
             available,
             key=lambda row: (float(row["duration_error"]), int(row["candidate_index"])),
         )
-        if preferred and excluded_indices:
-            return closest_available, "ocr_high_rejected_by_duration"
-        if preferred:
-            return closest_available, "ocr_high_duration_borderline_outperformed"
+        if (direct or repaired) and excluded_indices:
+            return closest_available, "trusted_ocr_rejected_by_duration"
+        if direct or repaired:
+            return closest_available, "trusted_ocr_duration_outperformed"
         return closest_available, "closest_measured_duration"
 
     def select(
@@ -481,11 +493,10 @@ class LightTTSSelector:
             output.append(segment)
             selection_rows.append(selection)
             print(
-                f"[Light TTS {sequence + 1}] segment_id={segment_id} "
-                f"candidate={selected_index} target={duration:.3f}s "
-                f"actual={float(selected['actual_duration']):.3f}s "
-                f"error={float(selected['duration_error']):.3f}s "
-                f"fit={selected.get('duration_fit')} reason={selection_reason}"
+                f"[Translation {segment_id}] "
+                f"source={candidates[selected_index].get('_selection_priority', 'standard')} "
+                f"duration={float(selected['actual_duration']):.3f}/{duration:.3f}s "
+                f"fit={selected.get('duration_fit')} selected={selection_reason}"
             )
         failures = sum(r["status"] == "fallback" for r in selection_rows)
         fraction = float(os.getenv("AUTODUB_LIGHT_TTS_MAX_FALLBACK_FRACTION", "0.5"))

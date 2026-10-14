@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 
-REFERENCE_VERSION = "ocr-translation-reference-v5"
+REFERENCE_VERSION = "ocr-translation-reference-v6"
 _REF_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
@@ -658,9 +658,13 @@ def prepare_ocr_translation_references(
                 # Preserve the best evidence as a terminology/semantic hint,
                 # but prevent direct subtitle adoption when targets truly clash.
                 reason = "ambiguous_target_reference_hint"
-                hint = {key: best[key] for key in
-                        ("target_text", "source_text", "score", "frame_support")}
+                hint = {key: best[key] for key in (
+                    "target_text", "source_text", "score", "frame_support",
+                    "source_similarity", "source_coverage", "missing_rate",
+                    "extra_rate", "boundary_cost",
+                )}
                 hint["confidence"] = "medium"
+                hint["reference_tier"] = "ambiguous_hint"
                 accepted = [hint]
                 references_by_segment[sid] = accepted
             else:
@@ -669,8 +673,13 @@ def prepare_ocr_translation_references(
                     "exact_boundary_source_aligned_pair" if perfect
                     else "trusted_boundary_source_aligned_pair"
                 )
-                accepted = [{key: best[key] for key in
-                             ("target_text", "source_text", "confidence", "score", "frame_support")}]
+                reference = {key: best[key] for key in (
+                    "target_text", "source_text", "confidence", "score",
+                    "frame_support", "source_similarity", "source_coverage",
+                    "missing_rate", "extra_rate", "boundary_cost",
+                )}
+                reference["reference_tier"] = "exact" if perfect else "trusted"
+                accepted = [reference]
                 references_by_segment[sid] = accepted
         match_rows.append({
             "segment_id": sid, "start": start, "end": end, "asr_text": asr,
