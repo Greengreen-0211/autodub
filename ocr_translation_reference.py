@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 
-REFERENCE_VERSION = "ocr-translation-reference-v7"
+REFERENCE_VERSION = "ocr-translation-reference-v8"
 _REF_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
@@ -324,6 +324,55 @@ def _join_subtitle_lines(values: list[str]) -> str:
     return output.strip()
 
 
+def _source_clauses(text: str) -> list[str]:
+    """Split source dialogue into semantic units without losing short calls."""
+    return [
+        value.strip()
+        for value in re.split(r"(?<=[.!?。！？])\s+|[\r\n]+", str(text or ""))
+        if value.strip()
+    ] or ([str(text).strip()] if str(text).strip() else [])
+
+
+def _subtitle_card_alignment(asr: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Expose a monotonic card-to-clause map for downstream hybrid translation.
+
+    The map is evidence for the translator, not a new public API field.  It
+    prevents a multi-card subtitle from being flattened into one opaque string.
+    """
+    clauses = _source_clauses(asr)
+    cards: list[dict[str, Any]] = []
+    covered: set[int] = set()
+    minimum_clause = 0
+    for event in events:
+        source_text = str(event["pair"]["source_text"])
+        choices = [
+            (index, _source_similarity(clause, source_text))
+            for index, clause in enumerate(clauses)
+            if index >= minimum_clause
+        ]
+        clause_index, similarity = max(choices, key=lambda item: item[1]) if choices else (-1, 0.0)
+        if similarity >= 0.34:
+            covered.add(clause_index)
+            minimum_clause = clause_index
+        else:
+            clause_index = -1
+        cards.append({
+            "source_text": source_text,
+            "target_text": str(event["pair"]["target_text"]),
+            "timestamps": sorted(set(event["timestamps"])),
+            "clause_index": clause_index,
+            "clause_similarity": round(float(similarity), 6),
+        })
+    return {
+        "subtitle_cards": cards,
+        "source_clauses": clauses,
+        "covered_clause_indices": sorted(covered),
+        "uncovered_source_clauses": [
+            clause for index, clause in enumerate(clauses) if index not in covered
+        ],
+    }
+
+
 def _collapse_progressive_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse subtitle cards that grow progressively across sampled frames.
 
@@ -416,6 +465,7 @@ def _composed_groups(
                 "source_coverages": [coverage],
                 "timestamps": timestamps,
                 "composed": True,
+                **_subtitle_card_alignment(asr, selected),
             })
     return groups
 
@@ -570,6 +620,12 @@ def prepare_ocr_translation_references(
                 existing["source_coverages"].extend(group.get("source_coverages", []))
                 existing["timestamps"].extend(group["timestamps"])
                 existing["composed"] = existing.get("composed", False) or group["composed"]
+                for field in (
+                    "subtitle_cards", "source_clauses", "covered_clause_indices",
+                    "uncovered_source_clauses",
+                ):
+                    if group.get(field):
+                        existing[field] = group[field]
             else:
                 grouped[key] = group
         candidates = []
@@ -603,6 +659,10 @@ def prepare_ocr_translation_references(
                 "time_alignment": round(_time_score(midpoint, start, end), 6),
                 "composed": bool(group.get("composed", False)),
                 "timestamps": timestamps,
+                "subtitle_cards": group.get("subtitle_cards", []),
+                "source_clauses": group.get("source_clauses", _source_clauses(asr)),
+                "covered_clause_indices": group.get("covered_clause_indices", []),
+                "uncovered_source_clauses": group.get("uncovered_source_clauses", []),
             })
         candidates.sort(key=lambda item: (item["score"], item["frame_support"]), reverse=True)
         source_hints = []
@@ -698,6 +758,8 @@ def prepare_ocr_translation_references(
                     "target_text", "source_text", "score", "frame_support",
                     "source_similarity", "source_coverage", "missing_rate",
                     "extra_rate", "boundary_cost", "composed", "timestamps",
+                    "subtitle_cards", "source_clauses", "covered_clause_indices",
+                    "uncovered_source_clauses",
                 )}
                 hint["confidence"] = "medium"
                 hint["reference_tier"] = "ambiguous_hint"
@@ -714,7 +776,8 @@ def prepare_ocr_translation_references(
                     "target_text", "source_text", "confidence", "score",
                     "frame_support", "source_similarity", "source_coverage",
                     "missing_rate", "extra_rate", "boundary_cost", "composed",
-                    "timestamps",
+                    "timestamps", "subtitle_cards", "source_clauses",
+                    "covered_clause_indices", "uncovered_source_clauses",
                 )}
                 reference["reference_tier"] = "exact" if perfect else "trusted"
                 if perfect:

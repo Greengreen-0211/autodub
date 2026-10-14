@@ -7,9 +7,9 @@ import os
 import re
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.7.0"
+RULE_VERSION = "translation-v2.9.0"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v7"
+PROMPT_VERSION = "neutral-dubbing-ocr-v9"
 
 # Translation is fail-closed by default: one segment that cannot be validated
 # stops the stage instead of letting an untranslated line reach the mixer.
@@ -119,6 +119,35 @@ def validate_entity_glossary(text: Any, required: list[dict]) -> None:
         raise ValueError("entity_glossary_mismatch:" + ",".join(missing))
 
 
+def validate_ocr_text_quality(text: Any) -> None:
+    """Reject deterministic OCR corruption before semantic model auditing."""
+    value = str(text or "")
+    if any(character == "\ufffd" or 0xE000 <= ord(character) <= 0xF8FF for character in value):
+        raise ValueError("ocr_corrupt_unicode")
+    if re.search(r"<\/?(?:ref|quad)>|\(\s*\d+\s*,\s*\d+\s*\)", value, re.I):
+        raise ValueError("ocr_markup_leaked")
+    if any(ord(character) < 32 and character not in "\t\r\n" for character in value):
+        raise ValueError("ocr_control_character")
+
+
+def _ocr_audit_acceptance(response_row: dict, variant: str) -> tuple[bool, str]:
+    audit = response_row.get("_ocr_candidate_audit")
+    if not isinstance(audit, dict):
+        return False, "audit_missing"
+    verdict = audit.get(variant)
+    if not isinstance(verdict, dict):
+        return False, f"{variant}_audit_missing"
+    required = ("accepted", "semantic_complete", "faithful", "natural", "no_added_meaning")
+    failed = [field for field in required if verdict.get(field) is not True]
+    if variant == "hybrid" and verdict.get("only_uncovered_translated") is not True:
+        failed.append("only_uncovered_translated")
+    if failed:
+        issues = verdict.get("issues") if isinstance(verdict.get("issues"), list) else []
+        detail = ",".join(str(item) for item in issues[:3] if str(item).strip())
+        return False, f"{variant}_audit_failed:{','.join(failed)}" + (f":{detail}" if detail else "")
+    return True, "audit_passed"
+
+
 def validate_translation(row: dict, original: dict, source: str, target: str) -> dict:
     from light_tts_selector import normalize_translation_candidates
     if not isinstance(row, dict):
@@ -166,7 +195,7 @@ def _restore_backend_candidate_priorities(validated: dict, cached: dict) -> None
     A resumable checkpoint, however, already contains backend-validated OCR
     candidates and must retain their selection priority on a cache hit.
     """
-    allowed = {"ocr_direct", "ocr_repaired", "ocr_hybrid", "standard"}
+    allowed = {"ocr_direct", "ocr_repaired", "ocr_hybrid", "ocr_reference", "standard"}
     priorities = {
         _canonical(candidate.get("text")): candidate.get("_selection_priority")
         for candidate in cached.get("translations_candidates", [])
@@ -257,6 +286,10 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     "missing_rate": reference.get("missing_rate"),
                     "extra_rate": reference.get("extra_rate"),
                     "composed": bool(reference.get("composed", False)),
+                    "subtitle_cards": reference.get("subtitle_cards", [])[:8],
+                    "source_clauses": reference.get("source_clauses", [])[:12],
+                    "covered_clause_indices": reference.get("covered_clause_indices", [])[:12],
+                    "uncovered_source_clauses": reference.get("uncovered_source_clauses", [])[:12],
                     "usage_policy": (
                         "preferred_if_complete"
                         if (
@@ -329,72 +362,123 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                      if reference.get("usage_policy") == "preferred_if_complete"),
                     None,
                 )
-                ocr_action = str(response_row.get("ocr_reference_action", "semantic_hint"))
-                ocr_candidate = None
-                ocr_priority = ""
+                model_ocr_action = str(
+                    response_row.get("ocr_reference_action", "semantic_hint")
+                )
+                ocr_action = model_ocr_action
+                admitted_ocr: list[tuple[str, str, str]] = []
+                rejected_ocr: list[str] = []
                 reference_policy = str(
                     preferred.get("reference_policy", "hint") if preferred else "hint"
                 )
-                # A source-exact, stable bilingual subtitle is stronger evidence
-                # than the model's lexical notion of completeness. Localized
-                # subtitles may compress an implied verb without losing the
-                # proposition. Naturalness remains a required independent gate
-                # so stable OCR corruption is never promoted automatically.
-                if (
-                    preferred
-                    and reference_policy == "direct"
-                    and response_row.get("ocr_reference_natural") is True
-                ):
-                    ocr_candidate = preferred["target_subtitle_reference"]
-                    ocr_priority = "ocr_direct"
-                    ocr_action = "backend_direct"
-                elif (
-                    preferred
-                    and ocr_action == "minimal_repair"
-                    and response_row.get("ocr_repaired_complete") is True
-                ):
-                    ocr_candidate = response_row.get("ocr_repaired_text")
-                    ocr_priority = (
-                        "ocr_hybrid"
-                        if reference_policy == "composed"
-                        else "ocr_repaired"
+                # Source-exact subtitles always remain visible as evidence, but
+                # receive trusted priority only after an independent audit.
+                if preferred and reference_policy == "direct":
+                    raw_trusted, raw_audit_reason = _ocr_audit_acceptance(
+                        response_row, "raw"
                     )
-                elif preferred and response_row.get("ocr_reference_complete") is True:
-                    if (
-                        ocr_action == "direct"
-                        and response_row.get("ocr_reference_natural") is True
-                    ):
-                        ocr_candidate = preferred["target_subtitle_reference"]
-                        ocr_priority = "ocr_direct"
-                if ocr_candidate:
+                    admitted_ocr.append((
+                        preferred["target_subtitle_reference"],
+                        "ocr_direct" if raw_trusted else "ocr_reference",
+                        "exact_source_boundary" if raw_trusted else raw_audit_reason,
+                    ))
+                    ocr_action = "backend_direct" if raw_trusted else "backend_reference_only"
+
+                repaired = str(response_row.get("ocr_repaired_text", "") or "").strip()
+                hybrid = str(response_row.get("ocr_hybrid_text", "") or "").strip()
+                if preferred and reference_policy == "composed" and hybrid:
+                    hybrid_trusted, hybrid_audit_reason = _ocr_audit_acceptance(
+                        response_row, "hybrid"
+                    )
+                    if hybrid_trusted:
+                        admitted_ocr.append((hybrid, "ocr_hybrid", "clause_aligned_hybrid"))
+                    else:
+                        rejected_ocr.append(hybrid_audit_reason)
+                elif preferred and model_ocr_action == "minimal_repair" and repaired:
+                    repaired_trusted, repaired_audit_reason = _ocr_audit_acceptance(
+                        response_row, "repaired"
+                    )
+                    if repaired_trusted:
+                        admitted_ocr.append((
+                            repaired,
+                            "ocr_hybrid" if reference_policy == "composed" else "ocr_repaired",
+                            "minimal_repair",
+                        ))
+                    else:
+                        rejected_ocr.append(repaired_audit_reason)
+                elif preferred and reference_policy == "composed" and repaired:
+                    repaired_trusted, repaired_audit_reason = _ocr_audit_acceptance(
+                        response_row, "repaired"
+                    )
+                    if repaired_trusted:
+                        admitted_ocr.append((repaired, "ocr_hybrid", "composed_repair"))
+                    else:
+                        rejected_ocr.append(repaired_audit_reason)
+
+                # A fully covered composed card sequence may also stand on its
+                # own. Partial sequences require the model-generated hybrid.
+                if preferred and reference_policy == "composed":
+                    uncovered = preferred.get("uncovered_source_clauses") or []
+                    coverage = float(preferred.get("source_coverage") or 0.0)
+                    if not uncovered and coverage >= 0.95:
+                        raw_trusted, raw_audit_reason = _ocr_audit_acceptance(
+                            response_row, "raw"
+                        )
+                        admitted_ocr.append((
+                            preferred["target_subtitle_reference"],
+                            "ocr_hybrid" if raw_trusted else "ocr_reference",
+                            "complete_composed_cards" if raw_trusted else raw_audit_reason,
+                        ))
+
+                accepted_candidates: list[dict[str, str]] = []
+                admission_notes: list[str] = []
+                seen_ocr = set()
+                for raw_candidate, priority, admission_reason in admitted_ocr:
                     try:
                         ocr_candidate = validate_target_text(
-                            ocr_candidate,
+                            raw_candidate,
                             target,
                             segments[i].get("text", ""),
                             source,
                             allow_identity=bool(segments[i].get("translation_allow_identity")),
                         )
+                        validate_ocr_text_quality(ocr_candidate)
                         validate_entity_glossary(ocr_candidate, required_entities)
                     except ValueError as exc:
-                        valid["translation_warnings"].append(
-                            f"ocr_candidate_rejected:{exc}"
-                        )
+                        rejected_ocr.append(f"{admission_reason}:{exc}")
                     else:
-                        candidates = [{"text": ocr_candidate,
-                                       "_selection_priority": ocr_priority}]
-                        seen = {_canonical(ocr_candidate)}
-                        for candidate in valid["translations_candidates"]:
-                            key = _canonical(candidate["text"])
-                            if key not in seen:
-                                candidates.append(candidate)
-                                seen.add(key)
-                        valid["text"] = ocr_candidate
-                        valid["translations_candidates"] = candidates[:5]
+                        key = _canonical(ocr_candidate)
+                        if key and key not in seen_ocr:
+                            accepted_candidates.append({
+                                "text": ocr_candidate,
+                                "_selection_priority": priority,
+                            })
+                            admission_notes.append(f"{priority}:{admission_reason}")
+                            seen_ocr.add(key)
+                if accepted_candidates:
+                    candidates = list(accepted_candidates)
+                    seen = set(seen_ocr)
+                    for candidate in valid["translations_candidates"]:
+                        key = _canonical(candidate["text"])
+                        if key not in seen:
+                            candidates.append(candidate)
+                            seen.add(key)
+                    trusted_primary = next(
+                        (
+                            candidate for candidate in accepted_candidates
+                            if candidate.get("_selection_priority") != "ocr_reference"
+                        ),
+                        None,
+                    )
+                    if trusted_primary:
+                        valid["text"] = trusted_primary["text"]
+                    valid["translations_candidates"] = candidates[:5]
                 elif preferred and response_row.get("ocr_reference_complete") is True:
                     valid["translation_warnings"].append(
                         "ocr_complete_reference_used_as_semantic_hint"
                     )
+                for reason in rejected_ocr:
+                    valid["translation_warnings"].append(f"ocr_candidate_rejected:{reason}")
                 rows[i].update(valid)
                 for warning in valid["translation_warnings"]:
                     if warning != "candidate_lengths_similar":
@@ -404,6 +488,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         f"[Translation {ids[i]}] OCR={preferred.get('reference_tier', 'trusted')} "
                         f"policy={reference_policy} action={ocr_action} "
                         f"coverage={preferred.get('source_coverage', 'n/a')} "
+                        f"admitted={len(accepted_candidates)} "
+                        f"admission={','.join(admission_notes) if admission_notes else 'none'} "
+                        f"rejected={','.join(rejected_ocr) if rejected_ocr else 'none'} "
                         f"entity={'consistent' if required_entities else 'not_applicable'}"
                     )
             except ValueError as exc:

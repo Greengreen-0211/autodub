@@ -266,11 +266,12 @@ class LightTTSSelector:
                 status = "rejected"
         else:
             slot_overrun = actual - available
-            if slot_overrun > max(0.12, 0.05 * available):
+            slot_tolerance = max(0.12, 0.05 * available)
+            if slot_overrun > slot_tolerance:
                 status = "rejected"
             elif absolute <= 0.25 or relative <= 0.10:
                 status = "suitable"
-            elif actual <= available and relative <= 0.30:
+            elif actual <= available + slot_tolerance:
                 status = "borderline"
             else:
                 status = "rejected"
@@ -341,7 +342,16 @@ class LightTTSSelector:
             row for row in successful
             if candidates[int(row["candidate_index"])].get("_selection_priority") == "standard"
         ]
-        excluded_indices = set()
+        # Audit-failed/unavailable OCR remains in diagnostics but is never a
+        # selectable dubbing candidate.
+        reference_only = [
+            row for row in successful
+            if candidates[int(row["candidate_index"])].get("_selection_priority")
+            == "ocr_reference"
+        ]
+        excluded_indices = {
+            int(row["candidate_index"]) for row in reference_only
+        }
         for trusted, label in ((direct, "ocr_direct"), (repaired, "ocr_assisted")):
             if not trusted:
                 continue
