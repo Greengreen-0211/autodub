@@ -5,11 +5,12 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.9.0"
+RULE_VERSION = "translation-v2.10.0"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v9"
+PROMPT_VERSION = "neutral-dubbing-ocr-v10"
 
 # Translation is fail-closed by default: one segment that cannot be validated
 # stops the stage instead of letting an untranslated line reach the mixer.
@@ -146,6 +147,109 @@ def _ocr_audit_acceptance(response_row: dict, variant: str) -> tuple[bool, str]:
         detail = ",".join(str(item) for item in issues[:3] if str(item).strip())
         return False, f"{variant}_audit_failed:{','.join(failed)}" + (f":{detail}" if detail else "")
     return True, "audit_passed"
+
+
+def _ocr_audit_verdict(response_row: dict, variant: str) -> dict:
+    audit = response_row.get("_ocr_candidate_audit")
+    if not isinstance(audit, dict):
+        return {}
+    verdict = audit.get(variant)
+    return verdict if isinstance(verdict, dict) else {}
+
+
+def _punctuation_lexical_signature(text: Any) -> str:
+    """Return text content with punctuation/spacing removed, preserving symbols."""
+    output = []
+    value = str(text or "").casefold()
+    for index, character in enumerate(value):
+        category = unicodedata.category(character)
+        previous_is_alnum = index > 0 and value[index - 1].isalnum()
+        next_is_alnum = index + 1 < len(value) and value[index + 1].isalnum()
+        if previous_is_alnum and next_is_alnum:
+            if character in {"'", "’", "ʼ"}:
+                output.append("'")
+                continue
+            if character in {"-", "‐", "‑", "–"}:
+                output.append("-")
+                continue
+            if character in {".", "．", ",", "，"} and (
+                value[index - 1].isdigit() and value[index + 1].isdigit()
+            ):
+                output.append(character.translate(str.maketrans({"．": ".", "，": ","})))
+                continue
+        if character.isspace() or category.startswith("P") or category.startswith("Z"):
+            continue
+        output.append(character)
+    return "".join(output)
+
+
+def _source_sentence_count(text: Any) -> int:
+    parts = [
+        value for value in re.split(r"(?<=[.!?。！？])\s+|[\r\n]+", str(text or ""))
+        if value.strip()
+    ]
+    return max(1, len(parts))
+
+
+def _target_terminal(source_text: Any, target: Any) -> str:
+    source = str(source_text or "").rstrip()
+    lang = language_code(target)
+    if source.endswith(("?", "？")):
+        return "？" if lang in {"zh", "ja"} else "?"
+    if source.endswith(("!", "！")):
+        return "！" if lang in {"zh", "ja"} else "!"
+    return "。" if lang in {"zh", "ja"} else "."
+
+
+def _punctuation_ready_text(
+    raw_text: Any,
+    source_text: Any,
+    target: Any,
+    audit_verdict: Any,
+) -> tuple[str, bool, str]:
+    """Accept only punctuation/spacing edits and verify TTS-ready boundaries."""
+    raw = str(raw_text or "").strip()
+    verdict = audit_verdict if isinstance(audit_verdict, dict) else {}
+    suggested = str(verdict.get("tts_ready_text", "") or "").strip()
+    status = "original_punctuation"
+    value = raw
+    if suggested:
+        if _punctuation_lexical_signature(suggested) != _punctuation_lexical_signature(raw):
+            return raw, False, "punctuation_changed_words"
+        value = suggested
+        status = "audited_punctuation"
+
+    # Normalize spacing around punctuation without changing lexical content.
+    value = re.sub(r"\s+([，。！？；：、,.!?;:])", r"\1", value)
+    value = re.sub(r"[ \t]{2,}", " ", value).strip()
+    if not re.search(r"[。！？.!?][\"'”’）\]】》]*$", value):
+        value += _target_terminal(source_text, target)
+        status = "audited_plus_terminal" if suggested else "deterministic_terminal"
+
+    if _punctuation_lexical_signature(value) != _punctuation_lexical_signature(raw):
+        return raw, False, "punctuation_signature_mismatch"
+
+    # Multi-sentence source rendered as one unbroken target phrase is unsafe
+    # for both prosody and clause-based routing.
+    body = re.sub(r"[。！？.!?][\"'”’）\]】》]*$", "", value).strip()
+    if _source_sentence_count(source_text) >= 2 and not re.search(
+        r"[，。！？；：,.!?;:]", body
+    ):
+        return value, False, "missing_internal_boundary"
+
+    # A short phrase before an English comma is commonly a vocative. Require
+    # an early target pause (e.g. "Anna, ..." -> "安娜，……").
+    source = str(source_text or "").strip()
+    vocative = re.match(r"^([^,]{1,30}),\s*\S", source)
+    if vocative:
+        prefix = value[: max(4, min(10, len(value)))]
+        if not re.search(r"[，,：:]", prefix):
+            return value, False, "missing_vocative_pause"
+
+    pairs = (("（", "）"), ("(", ")"), ("【", "】"), ("[", "]"), ("《", "》"))
+    if any(value.count(left) != value.count(right) for left, right in pairs):
+        return value, False, "unbalanced_punctuation"
+    return value, True, status
 
 
 def validate_translation(row: dict, original: dict, source: str, target: str) -> dict:
@@ -377,12 +481,31 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     raw_trusted, raw_audit_reason = _ocr_audit_acceptance(
                         response_row, "raw"
                     )
+                    raw_text, raw_punctuation_ready, raw_punctuation_reason = (
+                        _punctuation_ready_text(
+                            preferred["target_subtitle_reference"],
+                            segments[i].get("text", ""),
+                            target,
+                            _ocr_audit_verdict(response_row, "raw") if raw_trusted else {},
+                        )
+                    )
+                    trusted_direct = raw_trusted and raw_punctuation_ready
                     admitted_ocr.append((
-                        preferred["target_subtitle_reference"],
-                        "ocr_direct" if raw_trusted else "ocr_reference",
-                        "exact_source_boundary" if raw_trusted else raw_audit_reason,
+                        raw_text,
+                        "ocr_direct" if trusted_direct else "ocr_reference",
+                        (
+                            f"exact_source_boundary:{raw_punctuation_reason}"
+                            if trusted_direct
+                            else (
+                                raw_audit_reason
+                                if not raw_trusted
+                                else f"punctuation_not_ready:{raw_punctuation_reason}"
+                            )
+                        ),
                     ))
-                    ocr_action = "backend_direct" if raw_trusted else "backend_reference_only"
+                    ocr_action = (
+                        "backend_direct" if trusted_direct else "backend_reference_only"
+                    )
 
                 repaired = str(response_row.get("ocr_repaired_text", "") or "").strip()
                 hybrid = str(response_row.get("ocr_hybrid_text", "") or "").strip()
@@ -391,7 +514,24 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         response_row, "hybrid"
                     )
                     if hybrid_trusted:
-                        admitted_ocr.append((hybrid, "ocr_hybrid", "clause_aligned_hybrid"))
+                        hybrid_text, punctuation_ready, punctuation_reason = (
+                            _punctuation_ready_text(
+                                hybrid,
+                                segments[i].get("text", ""),
+                                target,
+                                _ocr_audit_verdict(response_row, "hybrid"),
+                            )
+                        )
+                        if punctuation_ready:
+                            admitted_ocr.append((
+                                hybrid_text,
+                                "ocr_hybrid",
+                                f"clause_aligned_hybrid:{punctuation_reason}",
+                            ))
+                        else:
+                            rejected_ocr.append(
+                                f"hybrid_punctuation_not_ready:{punctuation_reason}"
+                            )
                     else:
                         rejected_ocr.append(hybrid_audit_reason)
                 elif preferred and model_ocr_action == "minimal_repair" and repaired:
@@ -399,11 +539,24 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         response_row, "repaired"
                     )
                     if repaired_trusted:
-                        admitted_ocr.append((
-                            repaired,
-                            "ocr_hybrid" if reference_policy == "composed" else "ocr_repaired",
-                            "minimal_repair",
-                        ))
+                        repaired_text, punctuation_ready, punctuation_reason = (
+                            _punctuation_ready_text(
+                                repaired,
+                                segments[i].get("text", ""),
+                                target,
+                                _ocr_audit_verdict(response_row, "repaired"),
+                            )
+                        )
+                        if punctuation_ready:
+                            admitted_ocr.append((
+                                repaired_text,
+                                "ocr_hybrid" if reference_policy == "composed" else "ocr_repaired",
+                                f"minimal_repair:{punctuation_reason}",
+                            ))
+                        else:
+                            rejected_ocr.append(
+                                f"repaired_punctuation_not_ready:{punctuation_reason}"
+                            )
                     else:
                         rejected_ocr.append(repaired_audit_reason)
                 elif preferred and reference_policy == "composed" and repaired:
@@ -411,7 +564,24 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         response_row, "repaired"
                     )
                     if repaired_trusted:
-                        admitted_ocr.append((repaired, "ocr_hybrid", "composed_repair"))
+                        repaired_text, punctuation_ready, punctuation_reason = (
+                            _punctuation_ready_text(
+                                repaired,
+                                segments[i].get("text", ""),
+                                target,
+                                _ocr_audit_verdict(response_row, "repaired"),
+                            )
+                        )
+                        if punctuation_ready:
+                            admitted_ocr.append((
+                                repaired_text,
+                                "ocr_hybrid",
+                                f"composed_repair:{punctuation_reason}",
+                            ))
+                        else:
+                            rejected_ocr.append(
+                                f"repaired_punctuation_not_ready:{punctuation_reason}"
+                            )
                     else:
                         rejected_ocr.append(repaired_audit_reason)
 
@@ -424,10 +594,27 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         raw_trusted, raw_audit_reason = _ocr_audit_acceptance(
                             response_row, "raw"
                         )
+                        raw_text, punctuation_ready, punctuation_reason = (
+                            _punctuation_ready_text(
+                                preferred["target_subtitle_reference"],
+                                segments[i].get("text", ""),
+                                target,
+                                _ocr_audit_verdict(response_row, "raw") if raw_trusted else {},
+                            )
+                        )
+                        trusted_composed = raw_trusted and punctuation_ready
                         admitted_ocr.append((
-                            preferred["target_subtitle_reference"],
-                            "ocr_hybrid" if raw_trusted else "ocr_reference",
-                            "complete_composed_cards" if raw_trusted else raw_audit_reason,
+                            raw_text,
+                            "ocr_hybrid" if trusted_composed else "ocr_reference",
+                            (
+                                f"complete_composed_cards:{punctuation_reason}"
+                                if trusted_composed
+                                else (
+                                    raw_audit_reason
+                                    if not raw_trusted
+                                    else f"punctuation_not_ready:{punctuation_reason}"
+                                )
+                            ),
                         ))
 
                 accepted_candidates: list[dict[str, str]] = []
