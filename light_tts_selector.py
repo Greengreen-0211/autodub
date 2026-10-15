@@ -256,6 +256,7 @@ class LightTTSSelector:
         delta = actual - target
         absolute = abs(delta)
         relative = absolute / max(0.4, target)
+        required_speed = actual / available if available > 0 else None
         if delta <= 0:
             ratio = actual / target
             if ratio >= 0.72 or absolute <= 0.70:
@@ -265,13 +266,14 @@ class LightTTSSelector:
             else:
                 status = "rejected"
         else:
-            slot_overrun = actual - available
-            slot_tolerance = max(0.12, 0.05 * available)
-            if slot_overrun > slot_tolerance:
-                status = "rejected"
+            if actual > available:
+                # The final synthesis path already applies ffmpeg atempo. A
+                # trusted human subtitle that needs at most 10% acceleration
+                # is safer than discarding it for a machine paraphrase.
+                status = "speed_adjustable" if required_speed <= 1.10 else "rejected"
             elif absolute <= 0.25 or relative <= 0.10:
                 status = "suitable"
-            elif actual <= available + slot_tolerance:
+            elif actual <= available:
                 status = "borderline"
             else:
                 status = "rejected"
@@ -279,6 +281,7 @@ class LightTTSSelector:
             "duration_fit": status,
             "duration_error": absolute,
             "duration_relative_error": relative,
+            "required_speed_factor": required_speed,
         }
 
     @staticmethod
@@ -352,25 +355,30 @@ class LightTTSSelector:
         excluded_indices = {
             int(row["candidate_index"]) for row in reference_only
         }
-        for trusted, label in ((direct, "ocr_direct"), (repaired, "ocr_assisted")):
-            if not trusted:
-                continue
-            candidate = min(trusted, key=lambda row: float(row["duration_error"]))
-            if candidate["duration_fit"] == "suitable":
-                return candidate, f"{label}_duration_suitable"
-            if candidate["duration_fit"] == "rejected":
-                excluded_indices.update(int(row["candidate_index"]) for row in trusted)
-
-        # Borderline means safely adjustable, not unusable.  Once OCR is
-        # source-aligned, semantically validated, and inside the hard slot,
-        # preserve the human subtitle instead of preferring a marginally
-        # closer machine translation.
-        for trusted, label in ((direct, "ocr_direct"), (repaired, "ocr_assisted")):
-            borderline = [row for row in trusted if row["duration_fit"] == "borderline"]
-            if borderline:
+        excluded_indices.update(
+            int(row["candidate_index"])
+            for row in standard
+            if row["duration_fit"] in {"speed_adjustable", "rejected"}
+        )
+        # Deterministic provenance order: exact OCR remains ahead of repaired
+        # OCR, including when it needs no more than 10% downstream atempo.
+        trusted_tiers = (
+            (direct, "ocr_direct", "suitable"),
+            (direct, "ocr_direct", "speed_adjustable"),
+            (repaired, "ocr_assisted", "suitable"),
+            (repaired, "ocr_assisted", "speed_adjustable"),
+            (direct, "ocr_direct", "borderline"),
+            (repaired, "ocr_assisted", "borderline"),
+        )
+        for trusted, label, fit in trusted_tiers:
+            usable = [row for row in trusted if row["duration_fit"] == fit]
+            if usable:
                 return min(
-                    borderline, key=lambda row: float(row["duration_error"])
-                ), f"{label}_duration_adjustable"
+                    usable, key=lambda row: float(row["duration_error"])
+                ), f"{label}_duration_{fit}"
+        for row in direct + repaired:
+            if row["duration_fit"] == "rejected":
+                excluded_indices.add(int(row["candidate_index"]))
 
         # Once timing is usable, preserve the standard natural translation
         # instead of selecting a more verbose variant merely because it fills
@@ -532,6 +540,7 @@ class LightTTSSelector:
                 "actual_duration": selected["actual_duration"],
                 "duration_error": selected["duration_error"],
                 "duration_relative_error": selected.get("duration_relative_error"),
+                "required_speed_factor": selected.get("required_speed_factor"),
                 "duration_fit": selected.get("duration_fit"),
                 "selection_reason": selection_reason,
                 "preview_audio": selected["audio_file"],

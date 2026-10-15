@@ -8,9 +8,21 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.10.0"
+RULE_VERSION = "translation-v2.11.0"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v10"
+PROMPT_VERSION = "neutral-dubbing-ocr-v11"
+
+OCR_HARD_CONFLICTS = {
+    "wrong_entity",
+    "wrong_number",
+    "wrong_negation",
+    "contradiction",
+    "missing_independent_proposition",
+    "invented_proposition",
+    "source_mismatch",
+    "glossary_violation",
+    "corrupt_text",
+}
 
 # Translation is fail-closed by default: one segment that cannot be validated
 # stops the stage instead of letting an untranslated line reach the mixer.
@@ -138,15 +150,32 @@ def _ocr_audit_acceptance(response_row: dict, variant: str) -> tuple[bool, str]:
     verdict = audit.get(variant)
     if not isinstance(verdict, dict):
         return False, f"{variant}_audit_missing"
-    required = ("accepted", "semantic_complete", "faithful", "natural", "no_added_meaning")
+    hard = verdict.get("hard_conflicts")
+    if isinstance(hard, list):
+        hard = [str(item).strip() for item in hard if str(item).strip()]
+        unknown = [item for item in hard if item not in OCR_HARD_CONFLICTS]
+        if unknown:
+            return False, f"{variant}_audit_invalid_hard_conflict:{','.join(unknown[:3])}"
+        if hard:
+            return False, f"{variant}_audit_hard_conflict:{','.join(hard[:3])}"
+        if verdict.get("semantic_equivalent") is not True:
+            return False, f"{variant}_audit_not_semantically_equivalent"
+        if variant == "hybrid" and verdict.get("only_uncovered_translated") is not True:
+            return False, f"{variant}_audit_changed_trusted_cards"
+        soft = verdict.get("soft_issues") if isinstance(verdict.get("soft_issues"), list) else []
+        detail = ",".join(str(item) for item in soft[:3] if str(item).strip())
+        return True, "audit_passed" + (f":soft={detail}" if detail else "")
+
+    # Backward compatibility for an old cached/API response. New requests use
+    # the structured hard/soft schema and are not rejected merely for idiom,
+    # register, or repairable punctuation.
+    required = ("accepted", "semantic_complete", "faithful", "no_added_meaning")
     failed = [field for field in required if verdict.get(field) is not True]
     if variant == "hybrid" and verdict.get("only_uncovered_translated") is not True:
         failed.append("only_uncovered_translated")
     if failed:
-        issues = verdict.get("issues") if isinstance(verdict.get("issues"), list) else []
-        detail = ",".join(str(item) for item in issues[:3] if str(item).strip())
-        return False, f"{variant}_audit_failed:{','.join(failed)}" + (f":{detail}" if detail else "")
-    return True, "audit_passed"
+        return False, f"{variant}_legacy_audit_failed:{','.join(failed)}"
+    return True, "legacy_audit_passed"
 
 
 def _ocr_audit_verdict(response_row: dict, variant: str) -> dict:
@@ -237,11 +266,19 @@ def _punctuation_ready_text(
     ):
         return value, False, "missing_internal_boundary"
 
-    # A short phrase before an English comma is commonly a vocative. Require
-    # an early target pause (e.g. "Anna, ..." -> "安娜，……").
+    # A genuinely short address before the first comma is commonly a vocative.
+    # Never treat a completed sentence followed by a later comma as one.
     source = str(source_text or "").strip()
-    vocative = re.match(r"^([^,]{1,30}),\s*\S", source)
-    if vocative:
+    first_comma = source.find(",")
+    vocative_prefix = source[:first_comma].strip() if first_comma >= 0 else ""
+    vocative_words = re.findall(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?", vocative_prefix)
+    is_vocative = bool(
+        first_comma > 0
+        and not re.search(r"[.!?。！？;；:]", vocative_prefix)
+        and 1 <= len(vocative_words) <= 3
+        and len(vocative_prefix) <= 24
+    )
+    if is_vocative:
         prefix = value[: max(4, min(10, len(value)))]
         if not re.search(r"[，,：:]", prefix):
             return value, False, "missing_vocative_pause"
@@ -281,7 +318,17 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
     # assigned only by this module after validation.
     for candidate in candidates:
         candidate["_selection_priority"] = "standard"
-    minimum = 1 if is_tiny(str(original.get("text", ""))) else 3
+    trusted_ocr = any(
+        isinstance(reference, dict)
+        and str(reference.get("confidence", "")).lower() == "high"
+        and str(reference.get("reference_policy", "hint")) in {
+            "direct", "composed", "repair_or_compress"
+        }
+        for reference in original.get("_ocr_translation_references", [])
+    )
+    # Trusted human subtitles already contribute a candidate after independent
+    # auditing. Do not retry merely to invent three machine alternatives.
+    minimum = 1 if is_tiny(str(original.get("text", ""))) or trusted_ocr else 2
     if not minimum <= len(candidates) <= 5 or len(raw) > 5:
         raise ValueError(f"candidate_count:{len(candidates)} required:{minimum}-5")
     warnings = []
@@ -415,11 +462,17 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     "spelling_similarity": hint.get("spelling_similarity"),
                     "usage_policy": "source_spelling_only",
                 })
+        trusted_ocr = any(
+            reference.get("usage_policy") == "preferred_if_complete"
+            for reference in references
+        )
         inputs[i] = {"id": sid, "speaker": segment.get("speaker", "Unknown"),
                      "text_asr_corrected": segment.get("text", ""),
                      "previous_text": before, "next_text": after,
                      "duration": float(segment["end"])-float(segment["start"]),
-                     "minimum_candidates": 1 if is_tiny(str(segment.get("text", ""))) else 3,
+                     "minimum_candidates": (
+                         1 if is_tiny(str(segment.get("text", ""))) or trusted_ocr else 2
+                     ),
                      "entity_glossary": required_entities,
                      "ocr_translation_references": references,
                      "ocr_source_spelling_hints": source_spelling_hints}
@@ -506,6 +559,39 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     ocr_action = (
                         "backend_direct" if trusted_direct else "backend_reference_only"
                     )
+                elif preferred and reference_policy == "repair_or_compress":
+                    # Boundary evidence is strong but not source-exact. Let the
+                    # independent semantic audit decide whether the human line
+                    # is already complete; do not depend on the translator's
+                    # self-reported action alone.
+                    raw_trusted, raw_audit_reason = _ocr_audit_acceptance(
+                        response_row, "raw"
+                    )
+                    raw_text, raw_punctuation_ready, raw_punctuation_reason = (
+                        _punctuation_ready_text(
+                            preferred["target_subtitle_reference"],
+                            segments[i].get("text", ""),
+                            target,
+                            _ocr_audit_verdict(response_row, "raw") if raw_trusted else {},
+                        )
+                    )
+                    trusted_raw = raw_trusted and raw_punctuation_ready
+                    admitted_ocr.append((
+                        raw_text,
+                        "ocr_repaired" if trusted_raw else "ocr_reference",
+                        (
+                            f"trusted_semantic_boundary:{raw_punctuation_reason}"
+                            if trusted_raw
+                            else (
+                                raw_audit_reason
+                                if not raw_trusted
+                                else f"punctuation_not_ready:{raw_punctuation_reason}"
+                            )
+                        ),
+                    ))
+                    ocr_action = (
+                        "backend_trusted_raw" if trusted_raw else "backend_reference_only"
+                    )
 
                 repaired = str(response_row.get("ocr_repaired_text", "") or "").strip()
                 hybrid = str(response_row.get("ocr_hybrid_text", "") or "").strip()
@@ -530,10 +616,10 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                             ))
                         else:
                             rejected_ocr.append(
-                                f"hybrid_punctuation_not_ready:{punctuation_reason}"
+                                f"hybrid={hybrid!r}:punctuation_not_ready:{punctuation_reason}"
                             )
                     else:
-                        rejected_ocr.append(hybrid_audit_reason)
+                        rejected_ocr.append(f"hybrid={hybrid!r}:{hybrid_audit_reason}")
                 elif preferred and model_ocr_action == "minimal_repair" and repaired:
                     repaired_trusted, repaired_audit_reason = _ocr_audit_acceptance(
                         response_row, "repaired"
@@ -555,10 +641,10 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                             ))
                         else:
                             rejected_ocr.append(
-                                f"repaired_punctuation_not_ready:{punctuation_reason}"
+                                f"repaired={repaired!r}:punctuation_not_ready:{punctuation_reason}"
                             )
                     else:
-                        rejected_ocr.append(repaired_audit_reason)
+                        rejected_ocr.append(f"repaired={repaired!r}:{repaired_audit_reason}")
                 elif preferred and reference_policy == "composed" and repaired:
                     repaired_trusted, repaired_audit_reason = _ocr_audit_acceptance(
                         response_row, "repaired"
@@ -580,10 +666,10 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                             ))
                         else:
                             rejected_ocr.append(
-                                f"repaired_punctuation_not_ready:{punctuation_reason}"
+                                f"repaired={repaired!r}:punctuation_not_ready:{punctuation_reason}"
                             )
                     else:
-                        rejected_ocr.append(repaired_audit_reason)
+                        rejected_ocr.append(f"repaired={repaired!r}:{repaired_audit_reason}")
 
                 # A fully covered composed card sequence may also stand on its
                 # own. Partial sequences require the model-generated hybrid.
@@ -632,7 +718,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         validate_ocr_text_quality(ocr_candidate)
                         validate_entity_glossary(ocr_candidate, required_entities)
                     except ValueError as exc:
-                        rejected_ocr.append(f"{admission_reason}:{exc}")
+                        rejected_ocr.append(
+                            f"candidate={str(raw_candidate)[:120]!r}:{admission_reason}:{exc}"
+                        )
                     else:
                         key = _canonical(ocr_candidate)
                         if key and key not in seen_ocr:
@@ -640,7 +728,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                                 "text": ocr_candidate,
                                 "_selection_priority": priority,
                             })
-                            admission_notes.append(f"{priority}:{admission_reason}")
+                            admission_notes.append(
+                                f"{priority}={ocr_candidate[:120]!r}:{admission_reason}"
+                            )
                             seen_ocr.add(key)
                 if accepted_candidates:
                     candidates = list(accepted_candidates)
