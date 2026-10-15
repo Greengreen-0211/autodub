@@ -118,7 +118,7 @@ def main() -> None:
             duration = float(item.get("duration_seconds") or audio_duration(str(item["audio_path"])))
             normalized = normalize_emotion(raw, score=score, duration=duration)
             fallback_reason = ""
-            if duration < float(os.getenv("AUTODUB_EMOTION_MIN_DURATION", "0.8")):
+            if duration < float(os.getenv("AUTODUB_EMOTION_MIN_DURATION", "0.4")):
                 fallback_reason = "shorter_than_min_duration"
             elif score < float(os.getenv("AUTODUB_EMOTION_MIN_SCORE", "0.5")):
                 fallback_reason = "below_min_confidence"
