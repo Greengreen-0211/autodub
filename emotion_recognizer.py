@@ -27,7 +27,7 @@ DEFAULT_ENV = "emotion2vec"
 def apply_emotion_reliability(segments, *, model=DEFAULT_MODEL_DIR):
     """Retain raw predictions; smooth only unreliable same-speaker neighbors."""
     rows = [dict(s) for s in segments]
-    minimum_duration = float(os.getenv("AUTODUB_EMOTION_MIN_DURATION", "0.8"))
+    minimum_duration = float(os.getenv("AUTODUB_EMOTION_MIN_DURATION", "0.4"))
     for row in rows:
         raw = row.get("raw_emotion", row.get("emotion_raw", row.get("emotion", "unknown")))
         try:

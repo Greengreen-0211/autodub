@@ -129,7 +129,7 @@ def normalize_emotion(
         _env_float("AUTODUB_EMOTION_MIN_SCORE", 0.5) if min_score is None else min_score
     )
     duration_threshold = (
-        _env_float("AUTODUB_EMOTION_MIN_DURATION", 0.8)
+        _env_float("AUTODUB_EMOTION_MIN_DURATION", 0.4)
         if min_duration is None
         else min_duration
     )
