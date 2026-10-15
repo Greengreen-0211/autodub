@@ -8,9 +8,9 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.11.0"
+RULE_VERSION = "translation-v2.12.0"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v11"
+PROMPT_VERSION = "neutral-dubbing-ocr-v12"
 
 OCR_HARD_CONFLICTS = {
     "wrong_entity",
@@ -235,6 +235,7 @@ def _punctuation_ready_text(
     source_text: Any,
     target: Any,
     audit_verdict: Any,
+    required_entities: list[dict] | None = None,
 ) -> tuple[str, bool, str]:
     """Accept only punctuation/spacing edits and verify TTS-ready boundaries."""
     raw = str(raw_text or "").strip()
@@ -279,6 +280,21 @@ def _punctuation_ready_text(
         and len(vocative_prefix) <= 24
     )
     if is_vocative:
+        # If the source address maps to a validated video-level entity and the
+        # OCR target begins with that entity, inserting a comma is deterministic
+        # punctuation restoration rather than translation.
+        for entry in required_entities or []:
+            target_form = str(entry.get("target_form", "")).strip()
+            source_forms = entry.get("source_forms", [])
+            if not target_form or not value.startswith(target_form):
+                continue
+            if not any(_source_contains_form(vocative_prefix, form) for form in source_forms):
+                continue
+            boundary = len(target_form)
+            if boundary < len(value) and value[boundary] not in "，,：:。！？.!?":
+                value = value[:boundary] + ("，" if language_code(target) in {"zh", "ja"} else ", ") + value[boundary:]
+                status = "deterministic_vocative" if not suggested else "audited_plus_vocative"
+            break
         prefix = value[: max(4, min(10, len(value)))]
         if not re.search(r"[，,：:]", prefix):
             return value, False, "missing_vocative_pause"
@@ -287,6 +303,16 @@ def _punctuation_ready_text(
     if any(value.count(left) != value.count(right) for left, right in pairs):
         return value, False, "unbalanced_punctuation"
     return value, True, status
+
+
+def _ocr_repair_distance(reference: Any, repaired: Any) -> float:
+    """Return lexical edit fraction; punctuation-only changes score zero."""
+    from difflib import SequenceMatcher
+    left = _punctuation_lexical_signature(reference)
+    right = _punctuation_lexical_signature(repaired)
+    if not left or not right:
+        return 1.0
+    return 1.0 - SequenceMatcher(None, left, right).ratio()
 
 
 def validate_translation(row: dict, original: dict, source: str, target: str) -> dict:
@@ -540,6 +566,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                             segments[i].get("text", ""),
                             target,
                             _ocr_audit_verdict(response_row, "raw") if raw_trusted else {},
+                            required_entities,
                         )
                     )
                     trusted_direct = raw_trusted and raw_punctuation_ready
@@ -573,6 +600,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                             segments[i].get("text", ""),
                             target,
                             _ocr_audit_verdict(response_row, "raw") if raw_trusted else {},
+                            required_entities,
                         )
                     )
                     trusted_raw = raw_trusted and raw_punctuation_ready
@@ -595,6 +623,13 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
 
                 repaired = str(response_row.get("ocr_repaired_text", "") or "").strip()
                 hybrid = str(response_row.get("ocr_hybrid_text", "") or "").strip()
+                if (
+                    preferred
+                    and reference_policy == "composed"
+                    and (preferred.get("uncovered_source_clauses") or [])
+                    and not hybrid
+                ):
+                    rejected_ocr.append("hybrid_missing_for_uncovered_source")
                 if preferred and reference_policy == "composed" and hybrid:
                     hybrid_trusted, hybrid_audit_reason = _ocr_audit_acceptance(
                         response_row, "hybrid"
@@ -606,6 +641,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                                 segments[i].get("text", ""),
                                 target,
                                 _ocr_audit_verdict(response_row, "hybrid"),
+                                required_entities,
                             )
                         )
                         if punctuation_ready:
@@ -624,20 +660,28 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     repaired_trusted, repaired_audit_reason = _ocr_audit_acceptance(
                         response_row, "repaired"
                     )
-                    if repaired_trusted:
+                    repair_distance = _ocr_repair_distance(
+                        preferred["target_subtitle_reference"], repaired
+                    )
+                    if repair_distance > 0.18:
+                        rejected_ocr.append(
+                            f"repaired={repaired!r}:repair_too_extensive:{repair_distance:.3f}"
+                        )
+                    elif repaired_trusted:
                         repaired_text, punctuation_ready, punctuation_reason = (
                             _punctuation_ready_text(
                                 repaired,
                                 segments[i].get("text", ""),
                                 target,
                                 _ocr_audit_verdict(response_row, "repaired"),
+                                required_entities,
                             )
                         )
                         if punctuation_ready:
                             admitted_ocr.append((
                                 repaired_text,
                                 "ocr_hybrid" if reference_policy == "composed" else "ocr_repaired",
-                                f"minimal_repair:{punctuation_reason}",
+                                f"minimal_repair:{punctuation_reason}:edit={repair_distance:.3f}",
                             ))
                         else:
                             rejected_ocr.append(
@@ -649,20 +693,28 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     repaired_trusted, repaired_audit_reason = _ocr_audit_acceptance(
                         response_row, "repaired"
                     )
-                    if repaired_trusted:
+                    repair_distance = _ocr_repair_distance(
+                        preferred["target_subtitle_reference"], repaired
+                    )
+                    if repair_distance > 0.18:
+                        rejected_ocr.append(
+                            f"repaired={repaired!r}:repair_too_extensive:{repair_distance:.3f}"
+                        )
+                    elif repaired_trusted:
                         repaired_text, punctuation_ready, punctuation_reason = (
                             _punctuation_ready_text(
                                 repaired,
                                 segments[i].get("text", ""),
                                 target,
                                 _ocr_audit_verdict(response_row, "repaired"),
+                                required_entities,
                             )
                         )
                         if punctuation_ready:
                             admitted_ocr.append((
                                 repaired_text,
                                 "ocr_hybrid",
-                                f"composed_repair:{punctuation_reason}",
+                                f"composed_repair:{punctuation_reason}:edit={repair_distance:.3f}",
                             ))
                         else:
                             rejected_ocr.append(
@@ -686,6 +738,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                                 segments[i].get("text", ""),
                                 target,
                                 _ocr_audit_verdict(response_row, "raw") if raw_trusted else {},
+                                required_entities,
                             )
                         )
                         trusted_composed = raw_trusted and punctuation_ready
@@ -761,11 +814,19 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     if warning != "candidate_lengths_similar":
                         print(f"⚠️ translation segment={ids[i]} {warning}")
                 if preferred:
+                    trusted_count = sum(
+                        candidate.get("_selection_priority") != "ocr_reference"
+                        for candidate in accepted_candidates
+                    )
+                    reference_count = sum(
+                        candidate.get("_selection_priority") == "ocr_reference"
+                        for candidate in accepted_candidates
+                    )
                     print(
                         f"[Translation {ids[i]}] OCR={preferred.get('reference_tier', 'trusted')} "
                         f"policy={reference_policy} action={ocr_action} "
                         f"coverage={preferred.get('source_coverage', 'n/a')} "
-                        f"admitted={len(accepted_candidates)} "
+                        f"trusted_selectable={trusted_count} reference_only={reference_count} "
                         f"admission={','.join(admission_notes) if admission_notes else 'none'} "
                         f"rejected={','.join(rejected_ocr) if rejected_ocr else 'none'} "
                         f"entity={'consistent' if required_entities else 'not_applicable'}"
