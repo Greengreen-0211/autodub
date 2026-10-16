@@ -224,12 +224,20 @@ class OCRV211Client:
             regular = [
                 item
                 for item in segments
-                if not str(item.get("id", "")).startswith("deferred-")
+                if not (
+                    item.get("ocr_recovery_probe")
+                    or str(item.get("id", "")).startswith(
+                        ("deferred-", "recovery-group-")
+                    )
+                )
             ][: self.config.ocr_max_segments]
             probes = [
                 item
                 for item in segments
-                if str(item.get("id", "")).startswith("deferred-")
+                if item.get("ocr_recovery_probe")
+                or str(item.get("id", "")).startswith(
+                    ("deferred-", "recovery-group-")
+                )
             ]
             # The user-facing cap limits ordinary ASR correction cost.  It must
             # not silently disable safety probes for confirmed missing speech.
@@ -249,20 +257,24 @@ class OCRV211Client:
         for index, segment in enumerate(selected, start=1):
             segment_id = str(segment.get("id", index - 1))
             start, end = float(segment["start"]), float(segment["end"])
-            is_recovery_probe = segment_id.startswith("deferred-")
+            is_recovery_probe = bool(segment.get("ocr_recovery_probe")) or segment_id.startswith(
+                ("deferred-", "recovery-group-")
+            )
             if is_recovery_probe:
-                duration = max(0.0, end - start)
+                sample_start = float(segment.get("probe_start", start))
+                sample_end = float(segment.get("probe_end", end))
+                duration = max(0.0, sample_end - sample_start)
                 step = max(0.2, float(self.config.ocr_recovery_frame_step))
                 count = max(3, int(math.ceil(duration / step)) + 1)
                 count = min(max(3, int(self.config.ocr_recovery_max_frames)), count)
                 if count <= 1 or duration <= 0:
-                    times = [round((start + end) / 2.0, 3)]
+                    times = [round((sample_start + sample_end) / 2.0, 3)]
                 else:
                     times = [
-                        round(start + duration * frame_index / (count - 1), 3)
+                        round(sample_start + duration * frame_index / (count - 1), 3)
                         for frame_index in range(count)
                     ]
-                sampling_version = "dense-recovery-v1"
+                sampling_version = "dense-context-recovery-v2"
             else:
                 times = sorted(
                     {round(start + (end - start) * ratio, 3) for ratio in (0.2, 0.5, 0.8)}
@@ -419,6 +431,7 @@ def _recover_deferred_from_ocr(
     deferred_regions: Sequence[Dict[str, Any]],
     frame_records: Dict[str, List[Dict[str, Any]]],
     source_language: str,
+    known_segments: Sequence[Dict[str, Any]] = (),
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Promote stable ordered subtitle events to coarse ASR segments."""
     from asr_recovery import coarse_segment, ocr_source_events
@@ -428,11 +441,21 @@ def _recover_deferred_from_ocr(
     audit: List[Dict[str, Any]] = []
     for region in deferred_regions:
         region_id = str(region.get("id") or "")
+        # Only suppress text already assigned inside the acoustic core.  Merely
+        # adjacent identical calls (e.g. repeated "Come on") must remain
+        # eligible even when their subtitle frames overlap in the context.
+        known_neighbor_texts = [
+            str(item.get("text") or "")
+            for item in known_segments
+            if float(item.get("start", 0.0)) < float(region["end"])
+            and float(item.get("end", 0.0)) > float(region["start"])
+        ]
         events, decision = ocr_source_events(
             frame_records.get(region_id, []),
             source_language,
             region_start=float(region["start"]),
             region_end=float(region["end"]),
+            exclude_texts=known_neighbor_texts,
         )
         record = {
             "id": region_id,
@@ -534,6 +557,14 @@ def run_step_1b_optimized(
     enabled = not disable_ocr and config.ocr_enabled and _mode() != "off"
     ocr_texts: Dict[str, str] = {}
     deferred_regions = [dict(item) for item in state.get("asr_deferred_regions", [])]
+    from asr_recovery import build_recovery_groups
+
+    recovery_groups = build_recovery_groups(
+        deferred_regions,
+        max_gap=float(getattr(config, "ocr_recovery_group_gap", 0.18)),
+        context=float(getattr(config, "ocr_recovery_context", 0.8)),
+        media_duration=float(state.get("duration") or 0.0) or None,
+    )
     deferred_frame_records: Dict[str, List[Dict[str, Any]]] = {}
     if enabled:
         try:
@@ -542,7 +573,7 @@ def run_step_1b_optimized(
                 # OCR is also sampled over confirmed speech regions that ASR
                 # could not safely promote.  These probe records stay internal
                 # and do not alter the frontend segment contract.
-                ocr_inputs = [*raw_segments, *deferred_regions]
+                ocr_inputs = [*raw_segments, *recovery_groups]
                 all_ocr_texts = client.extract_texts(input_file, ocr_inputs)
                 ocr_texts = {
                     str(segment["id"]): all_ocr_texts.get(str(segment["id"]), "")
@@ -552,7 +583,7 @@ def run_step_1b_optimized(
                     str(region.get("id")): list(
                         client.frame_records_by_segment.get(str(region.get("id")), [])
                     )
-                    for region in deferred_regions
+                    for region in recovery_groups
                 }
             finally:
                 client.session.close()
@@ -574,13 +605,14 @@ def run_step_1b_optimized(
 
     recovered_segments: List[Dict[str, Any]] = []
     ocr_recovery_audit: List[Dict[str, Any]] = []
-    remaining_deferred = deferred_regions
-    if enabled and deferred_regions:
+    remaining_deferred = recovery_groups
+    if enabled and recovery_groups:
         recovered_segments, remaining_deferred, ocr_recovery_audit = (
             _recover_deferred_from_ocr(
-                deferred_regions,
+                recovery_groups,
                 deferred_frame_records,
                 str(config.ocr_source_language or state.get("src_lang", "")),
+                segments,
             )
         )
         if recovered_segments:
@@ -592,7 +624,7 @@ def run_step_1b_optimized(
             )
             print(
                 f"✅ OCR 延迟救援采纳 {recovered_parent_count}/"
-                f"{len(deferred_regions)} 个确认语音区间（仅使用粗时间边界）。"
+                f"{len(recovery_groups)} 个恢复组（仅使用粗时间边界）。"
             )
         else:
             print(
@@ -652,6 +684,14 @@ def run_step_1b_optimized(
         or item.get("asr_recovery_status") == "unresolved_blocking"
         or str(item.get("original_text") or "").strip()
     ]
+    blocking_ids = {str(item.get("id") or "") for item in blocking_regions}
+    non_dialogue_audited = [
+        dict(item, asr_recovery_status="non_dialogue_audited")
+        for item in remaining_deferred
+        if str(item.get("id") or "") not in blocking_ids
+        and not item.get("dialogue_evidence")
+        and item.get("asr_recovery_status") != "unresolved_blocking"
+    ]
     state_mgr.save({
         "ocr_texts_by_segment": ocr_texts,
         "segments_ocr_corrected": segments,
@@ -661,9 +701,10 @@ def run_step_1b_optimized(
         "asr_ocr_recovery_report": ocr_recovery_audit,
         "asr_recovery_report": combined_recovery_report,
         "asr_unresolved_dialogue_regions": blocking_regions,
+        "asr_non_dialogue_audited_regions": non_dialogue_audited,
         "ocr_optimized_manifest": {
             "version": OCR_OPTIMIZED_VERSION,
-            "recovery_version": "dense-timeline-v1",
+            "recovery_version": "grouped-dense-context-v2",
             "binding": _implementation_binding(main_path),
             "mode": _mode() if enabled else "off",
             "input_scope": config.ocr_scope,
@@ -676,9 +717,14 @@ def run_step_1b_optimized(
             for item in blocking_regions[:8]
         )
         raise RuntimeError(
-            "ASR/OCR 仍有确认对白未恢复，严格覆盖模式拒绝继续："
+            "多源 ASR/OCR 仍有确认对白未恢复，严格覆盖模式拒绝继续："
             f"{summary}。详细证据已保存到 project_state.json 的 "
             "asr_unresolved_dialogue_regions。"
+        )
+    if non_dialogue_audited:
+        print(
+            f"ℹ️ {len(non_dialogue_audited)} 个区域经多源检查未发现可翻译对白，"
+            "已记入 asr_non_dialogue_audited_regions，未生成伪文本。"
         )
     print("✅ Step 1b 完成。最终 Step 1 文本已保存，可继续运行 --step 2。")
 

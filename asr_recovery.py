@@ -184,6 +184,111 @@ def speech_micro_ranges(
     return result
 
 
+def build_recovery_groups(
+    regions: Sequence[Mapping[str, Any]],
+    *,
+    max_gap: float = 0.18,
+    context: float = 0.8,
+    media_duration: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Group adjacent unresolved atoms for inference without losing provenance.
+
+    The returned ``start``/``end`` values remain the acoustic core.  Expanded
+    ``probe_start``/``probe_end`` values are only for ASR/OCR observation and
+    must never become final sentence boundaries.
+    """
+    ordered = sorted(
+        (dict(item) for item in regions),
+        key=lambda item: (float(item["start"]), float(item["end"])),
+    )
+    groups: List[List[Dict[str, Any]]] = []
+    for item in ordered:
+        if not groups or float(item["start"]) - float(groups[-1][-1]["end"]) > max_gap:
+            groups.append([item])
+        else:
+            groups[-1].append(item)
+
+    result: List[Dict[str, Any]] = []
+    for index, members in enumerate(groups):
+        start = min(float(item["start"]) for item in members)
+        end = max(float(item["end"]) for item in members)
+        probe_start = max(0.0, start - max(0.0, context))
+        probe_end = end + max(0.0, context)
+        if media_duration is not None:
+            probe_end = min(float(media_duration), probe_end)
+        result.append(
+            {
+                "id": f"recovery-group-{index:04d}",
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "probe_start": round(probe_start, 3),
+                "probe_end": round(probe_end, 3),
+                "ocr_recovery_probe": True,
+                "members": members,
+                "member_ids": [str(item.get("id") or "") for item in members],
+                "candidate_kind": "grouped_deferred_region",
+                "dialogue_evidence": any(
+                    bool(item.get("dialogue_evidence")) for item in members
+                ),
+                "acoustic_dialogue_score": max(
+                    (float(item.get("acoustic_dialogue_score") or 0.0) for item in members),
+                    default=0.0,
+                ),
+            }
+        )
+    return result
+
+
+def acoustic_dialogue_score(
+    *,
+    duration: float,
+    vocal_dbfs: float,
+    source_dbfs: Optional[float],
+    acoustic_text_observed: bool,
+    primary_speech_confirmed: bool = False,
+) -> Tuple[float, Dict[str, Any]]:
+    """Return a conservative, auditable dialogue-likelihood score.
+
+    Energy alone never proves dialogue.  It only upgrades an already isolated
+    vocal region to a blocking candidate when the vocal stem is both audible
+    and not dramatically weaker than the source mixture.
+    """
+    score = 0.0
+    reasons: List[str] = []
+    if acoustic_text_observed:
+        score += 0.65
+        reasons.append("asr_text_observed")
+    if primary_speech_confirmed:
+        score += 0.15
+        reasons.append("primary_speech_chunk")
+    if duration >= 0.65:
+        score += 0.10
+        reasons.append("sustained_region")
+    if math.isfinite(vocal_dbfs) and vocal_dbfs >= -42.0:
+        score += 0.20
+        reasons.append("audible_vocal_stem")
+    vocal_delta: Optional[float] = None
+    if source_dbfs is not None and math.isfinite(source_dbfs) and math.isfinite(vocal_dbfs):
+        vocal_delta = vocal_dbfs - source_dbfs
+        if vocal_delta >= -12.0:
+            score += 0.15
+            reasons.append("vocal_not_buried_in_mix")
+    score = min(1.0, score)
+    return round(score, 4), {
+        "duration": round(float(duration), 3),
+        "vocal_dbfs": round(float(vocal_dbfs), 3) if math.isfinite(vocal_dbfs) else None,
+        "source_dbfs": (
+            round(float(source_dbfs), 3)
+            if source_dbfs is not None and math.isfinite(source_dbfs)
+            else None
+        ),
+        "vocal_source_delta_db": (
+            round(float(vocal_delta), 3) if vocal_delta is not None else None
+        ),
+        "reasons": reasons,
+    }
+
+
 _COORDINATE_PREFIX = re.compile(
     r"^\s*(?:\[?\s*\d{1,4}\s*[,;:]\s*\d{1,4}[^\]]*\]?\s*)+"
 )
@@ -296,6 +401,8 @@ def ocr_source_events(
     *,
     region_start: float,
     region_end: float,
+    context_tolerance: float = 0.2,
+    exclude_texts: Sequence[str] = (),
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Build ordered subtitle events from dense OCR observations.
 
@@ -380,6 +487,34 @@ def ocr_source_events(
             "frame_count": len(frame_records),
             "observation_count": len(observations),
             "dialogue_evidence": True,
+        }
+
+    # Frames may be sampled outside the acoustic core so subtitles appearing
+    # slightly early/late remain visible.  Do not steal a subtitle that exists
+    # wholly outside the core plus a small synchronization tolerance.
+    candidates = [
+        item
+        for item in candidates
+        if float(item["last_seen"]) >= float(region_start) - context_tolerance
+        and float(item["first_seen"]) <= float(region_end) + context_tolerance
+    ]
+    if exclude_texts:
+        candidates = [
+            item
+            for item in candidates
+            if not any(
+                text_similarity(str(item["text"]), known) >= 0.90
+                for known in exclude_texts
+                if normalize_text(known)
+            )
+        ]
+
+    if not candidates:
+        return [], {
+            "reason": "source_ocr_only_matched_context_or_known_dialogue",
+            "frame_count": len(frame_records),
+            "observation_count": len(observations),
+            "dialogue_evidence": False,
         }
 
     candidates.sort(key=lambda item: (item["first_seen"], item["last_seen"]))

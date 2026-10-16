@@ -1,12 +1,38 @@
 """Regression tests for evidence-driven dialogue recovery."""
 
+import json
+import os
+import sys
 import unittest
+from unittest.mock import patch
 
-from asr_recovery import choose_consensus_candidate, ocr_source_events
+from asr_recovery import (
+    acoustic_dialogue_score,
+    build_recovery_groups,
+    choose_consensus_candidate,
+    ocr_source_events,
+)
 from ocr_v211_integration import _recover_deferred_from_ocr
+from secondary_asr import SecondaryASR
 
 
 class OCRTimelineTests(unittest.TestCase):
+    def test_adjacent_regions_group_for_inference_but_keep_members(self):
+        groups = build_recovery_groups(
+            [
+                {"id": "a", "start": 0.05, "end": 4.25},
+                {"id": "b", "start": 4.25, "end": 5.16},
+                {"id": "c", "start": 10.3, "end": 11.6},
+            ],
+            context=0.8,
+            media_duration=12.0,
+        )
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0]["member_ids"], ["a", "b"])
+        self.assertEqual((groups[0]["start"], groups[0]["end"]), (0.05, 5.16))
+        self.assertEqual(groups[0]["probe_start"], 0.0)
+        self.assertEqual(groups[1]["probe_end"], 12.0)
+
     def test_dense_ocr_recovers_multiple_ordered_events(self):
         records = [
             {"timestamp": 40.10, "text": "<ref>Come on!</ref><quad>x</quad>"},
@@ -47,6 +73,19 @@ class OCRTimelineTests(unittest.TestCase):
         )
         self.assertEqual(events, [])
         self.assertTrue(decision["dialogue_evidence"])
+
+    def test_context_only_subtitle_is_not_assigned_to_core(self):
+        events, decision = ocr_source_events(
+            [
+                {"timestamp": 8.8, "text": "Previous sentence."},
+                {"timestamp": 9.1, "text": "Previous sentence."},
+            ],
+            "en",
+            region_start=10.0,
+            region_end=11.0,
+        )
+        self.assertEqual(events, [])
+        self.assertFalse(decision["dialogue_evidence"])
 
     def test_deferred_parent_can_become_multiple_coarse_segments(self):
         regions = [
@@ -96,6 +135,41 @@ class OCRTimelineTests(unittest.TestCase):
 
 
 class AcousticConsensusTests(unittest.TestCase):
+    def test_acoustic_score_separates_weak_short_noise_from_probable_dialogue(self):
+        weak, _ = acoustic_dialogue_score(
+            duration=0.4,
+            vocal_dbfs=-48.0,
+            source_dbfs=-20.0,
+            acoustic_text_observed=False,
+            primary_speech_confirmed=True,
+        )
+        probable, evidence = acoustic_dialogue_score(
+            duration=1.2,
+            vocal_dbfs=-24.0,
+            source_dbfs=-20.0,
+            acoustic_text_observed=False,
+            primary_speech_confirmed=True,
+        )
+        self.assertLess(weak, 0.55)
+        self.assertGreaterEqual(probable, 0.55)
+        self.assertIn("vocal_not_buried_in_mix", evidence["reasons"])
+
+    def test_command_secondary_asr_uses_json_protocol_without_shell(self):
+        command = json.dumps(
+            [
+                sys.executable,
+                "-c",
+                "import json; print(json.dumps({'text':'Come on!','language':'en'}))",
+                "{audio}",
+            ]
+        )
+        with patch.dict(os.environ, {"ASR_SECONDARY_COMMAND_JSON": command}):
+            backend = SecondaryASR()
+            self.assertTrue(backend.available)
+            result = backend.transcribe("unused.wav")
+        self.assertEqual(result["text"], "Come on!")
+        self.assertEqual(result["language"], "en")
+
     def test_short_asr_conflict_requires_near_exact_consensus(self):
         candidates = [
             {"text": "Do the magic", "asr_repair_source": "vocals"},
