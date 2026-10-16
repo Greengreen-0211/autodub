@@ -146,7 +146,7 @@ def _source_language(config: Any, text: str) -> str:
 
 
 class OCRV211Client:
-    """Three-frame HunyuanOCR client with per-frame fingerprinted cache."""
+    """Adaptive HunyuanOCR client with per-frame fingerprinted cache."""
 
     def __init__(self, config: Any) -> None:
         self.config = config
@@ -208,6 +208,20 @@ class OCRV211Client:
         if "timestamp_seconds" not in data:
             raise RuntimeError("OCR 服务版本过旧，不支持按 ASR 时间抽帧；请上传并重启新版 ocr_server_v2.py")
         return str(data.get("text") or data.get("ocr_text") or data.get("ocr_result") or "").strip()
+
+    @staticmethod
+    def _sample_times(start: float, end: float) -> List[float]:
+        """Sample long ASR chunks densely enough to observe changing subtitles."""
+        duration = max(0.0, end - start)
+        if duration <= 0:
+            return [round(start, 3)]
+        interval = max(0.60, float(os.getenv("AUTODUB_OCR_SAMPLE_INTERVAL", "1.0")))
+        maximum = max(3, int(os.getenv("AUTODUB_OCR_MAX_FRAMES_PER_SEGMENT", "20")))
+        count = min(maximum, max(3, int(math.ceil(duration / interval))))
+        return [
+            round(start + (index + 0.5) * duration / count, 3)
+            for index in range(count)
+        ]
 
     def extract_texts(self, video_path: str, segments: List[Dict[str, Any]]) -> Dict[str, str]:
         if not self.config.ocr_enabled:
@@ -276,10 +290,12 @@ class OCRV211Client:
                     ]
                 sampling_version = "dense-context-recovery-v2"
             else:
-                times = sorted(
-                    {round(start + (end - start) * ratio, 3) for ratio in (0.2, 0.5, 0.8)}
-                )
-                sampling_version = "three-fractions-v1"
+                # Ordinary ASR segments use the subtitle-aware adaptive sampler
+                # from the OCR translation branch.  Recovery probes keep their
+                # denser context sampling because they must search an uncertain
+                # acoustic interval rather than inspect a known utterance.
+                times = self._sample_times(start, end)
+                sampling_version = "adaptive-subtitle-v3"
             texts: List[str] = []
             for frame_number, timestamp in enumerate(times, start=1):
                 key = _ocr_digest({
@@ -765,4 +781,3 @@ def run_preflight() -> None:
     from autodub_ocr_runtime.selftest import run as run_selftest
 
     run_selftest()
-

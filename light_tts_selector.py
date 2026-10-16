@@ -226,6 +226,7 @@ class LightTTSSelector:
         text: str,
         language: str,
         target_duration: float,
+        available_duration: float,
     ) -> str:
         data = {
             "segment_id": segment_id,
@@ -233,10 +234,180 @@ class LightTTSSelector:
             "text": text,
             "language": language,
             "target_duration": round(target_duration, 6),
+            "available_duration": round(available_duration, 6),
             "backend": self.backend.signature,
         }
         encoded = json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _duration_fit(
+        actual: float,
+        target: float,
+        available: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Judge speech duration against an ideal span and a hard time slot.
+
+        Short speech can retain a natural tail pause.  Long speech is accepted
+        only while it remains inside the segment's available mixing window.
+        """
+        actual, target = float(actual), max(0.4, float(target))
+        available = max(target, float(available if available is not None else target))
+        delta = actual - target
+        absolute = abs(delta)
+        relative = absolute / max(0.4, target)
+        required_speed = actual / available if available > 0 else None
+        if delta <= 0:
+            ratio = actual / target
+            if ratio >= 0.72 or absolute <= 0.70:
+                status = "suitable"
+            elif ratio >= 0.50 or absolute <= 1.10:
+                status = "borderline"
+            else:
+                status = "rejected"
+        else:
+            if actual > available:
+                # The final synthesis path already applies ffmpeg atempo. A
+                # trusted human subtitle that needs at most 10% acceleration
+                # is safer than discarding it for a machine paraphrase.
+                status = "speed_adjustable" if required_speed <= 1.10 else "rejected"
+            elif absolute <= 0.25 or relative <= 0.10:
+                status = "suitable"
+            elif actual <= available:
+                status = "borderline"
+            else:
+                status = "rejected"
+        return {
+            "duration_fit": status,
+            "duration_error": absolute,
+            "duration_relative_error": relative,
+            "required_speed_factor": required_speed,
+        }
+
+    @staticmethod
+    def _speech_window(segment: Mapping[str, Any]) -> Tuple[float, float]:
+        """Return (ideal speech duration, maximum available segment duration)."""
+        start = float(segment["start"])
+        end = float(segment["end"])
+        available = max(0.4, end - start)
+        starts: List[float] = []
+        ends: List[float] = []
+        for item in segment.get("qwen3_time_stamps", []) or []:
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                word_start = float(item.get("start"))
+                word_end = float(item.get("end", word_start))
+            except (TypeError, ValueError):
+                continue
+            if word_end < start - 0.25 or word_start > end + 0.25:
+                continue
+            starts.append(max(start, word_start))
+            ends.append(min(end, max(word_start, word_end)))
+        if not starts or not ends:
+            return available, available
+        # Small edge allowance preserves natural consonant release without
+        # treating all diarization padding as speech that TTS must fill.
+        ideal = min(available, max(0.4, max(ends) - min(starts) + 0.12))
+        return ideal, available
+
+    def _choose_candidate(
+        self,
+        successful: List[Dict[str, Any]],
+        candidates: List[Dict[str, Any]],
+        target_duration: float,
+        *,
+        measured: bool,
+        available_duration: Optional[float] = None,
+    ) -> Tuple[Dict[str, Any], str]:
+        """Prefer trusted OCR only when measured speech duration remains usable."""
+        for row in successful:
+            row.update(self._duration_fit(
+                row["actual_duration"], target_duration, available_duration
+            ))
+        closest = min(
+            successful,
+            key=lambda row: (float(row["duration_error"]), int(row["candidate_index"])),
+        )
+        if not measured:
+            return closest, "closest_estimated_duration"
+        direct = [
+            row for row in successful
+            if candidates[int(row["candidate_index"])].get("_selection_priority")
+            in {"ocr_direct", "ocr_high"}
+        ]
+        repaired = [
+            row for row in successful
+            if candidates[int(row["candidate_index"])].get("_selection_priority")
+            in {"ocr_repaired", "ocr_hybrid"}
+        ]
+        standard = [
+            row for row in successful
+            if candidates[int(row["candidate_index"])].get("_selection_priority") == "standard"
+        ]
+        # Audit-failed/unavailable OCR remains in diagnostics but is never a
+        # selectable dubbing candidate.
+        reference_only = [
+            row for row in successful
+            if candidates[int(row["candidate_index"])].get("_selection_priority")
+            == "ocr_reference"
+        ]
+        excluded_indices = {
+            int(row["candidate_index"]) for row in reference_only
+        }
+        excluded_indices.update(
+            int(row["candidate_index"])
+            for row in standard
+            if row["duration_fit"] in {"speed_adjustable", "rejected"}
+        )
+        # Deterministic provenance order: exact OCR remains ahead of repaired
+        # OCR, including when it needs no more than 10% downstream atempo.
+        trusted_tiers = (
+            (direct, "ocr_direct", "suitable"),
+            (direct, "ocr_direct", "speed_adjustable"),
+            (repaired, "ocr_assisted", "suitable"),
+            (repaired, "ocr_assisted", "speed_adjustable"),
+            (direct, "ocr_direct", "borderline"),
+            (repaired, "ocr_assisted", "borderline"),
+        )
+        for trusted, label, fit in trusted_tiers:
+            usable = [row for row in trusted if row["duration_fit"] == fit]
+            if usable:
+                return min(
+                    usable, key=lambda row: float(row["duration_error"])
+                ), f"{label}_duration_{fit}"
+        for row in direct + repaired:
+            if row["duration_fit"] == "rejected":
+                excluded_indices.add(int(row["candidate_index"]))
+
+        # Once timing is usable, preserve the standard natural translation
+        # instead of selecting a more verbose variant merely because it fills
+        # a little more of the source window.
+        standard_suitable = [row for row in standard if row["duration_fit"] == "suitable"]
+        if standard_suitable:
+            return min(
+                standard_suitable, key=lambda row: float(row["duration_error"])
+            ), "standard_duration_suitable"
+
+        standard_borderline = [row for row in standard if row["duration_fit"] == "borderline"]
+        if standard_borderline:
+            return min(
+                standard_borderline, key=lambda row: float(row["duration_error"])
+            ), "standard_duration_borderline"
+
+        available = [
+            row for row in successful
+            if int(row["candidate_index"]) not in excluded_indices
+        ] or successful
+        closest_available = min(
+            available,
+            key=lambda row: (float(row["duration_error"]), int(row["candidate_index"])),
+        )
+        if (direct or repaired) and excluded_indices:
+            return closest_available, "trusted_ocr_rejected_by_duration"
+        if direct or repaired:
+            return closest_available, "trusted_ocr_duration_outperformed"
+        return closest_available, "closest_measured_duration"
 
     def select(
         self,
@@ -256,7 +427,7 @@ class LightTTSSelector:
         for sequence, source in enumerate(segments):
             segment = dict(source)
             segment_id = str(segment.get("id", sequence))
-            duration = max(0.0, float(segment["end"]) - float(segment["start"]))
+            duration, available_duration = self._speech_window(segment)
             language = str(segment.get("target_lang_raw", target_language) or target_language)
             candidates = normalize_translation_candidates(
                 segment.get("translations_candidates"), segment.get("text", "")
@@ -268,7 +439,9 @@ class LightTTSSelector:
             for index, candidate in enumerate(candidates):
                 text = candidate["text"]
                 cache_key = f"{segment_id}:{index}"
-                fingerprint = self._fingerprint(segment_id, index, text, language, duration)
+                fingerprint = self._fingerprint(
+                    segment_id, index, text, language, duration, available_duration
+                )
                 output_path = self.audio_dir / (
                     f"segment_{_safe_id(segment_id)}_candidate_{index}{self.backend.extension}"
                 )
@@ -297,6 +470,7 @@ class LightTTSSelector:
                             "candidate_index": index,
                             "text": text,
                             "target_duration": duration,
+                            "available_duration": available_duration,
                             "actual_duration": actual,
                             "duration_error": abs(actual - duration),
                             "audio_file": str(output_path.resolve()),
@@ -329,6 +503,10 @@ class LightTTSSelector:
                         "light_tts_error": record.get("error", ""),
                     }
                 )
+                if record.get("status") == "success":
+                    candidate_row.update(self._duration_fit(
+                        record["actual_duration"], duration, available_duration
+                    ))
                 enriched.append(candidate_row)
                 if record.get("status") == "success":
                     successful.append(record)
@@ -343,9 +521,12 @@ class LightTTSSelector:
                                        "actual_duration": estimate, "audio_file": None,
                                        "duration_error": abs(estimate-duration), "estimated": True})
                 print(f"⚠️ segment {segment_id} LightTTS fallback: {errors}")
-            selected = min(
+            selected, selection_reason = self._choose_candidate(
                 successful,
-                key=lambda row: (float(row["duration_error"]), int(row["candidate_index"])),
+                candidates,
+                duration,
+                measured=not any(row.get("estimated") for row in successful),
+                available_duration=available_duration,
             )
             selected_index = int(selected["candidate_index"])
             for index, candidate in enumerate(enriched):
@@ -355,8 +536,13 @@ class LightTTSSelector:
                 "selected_index": selected_index,
                 "selected_text": selected["text"],
                 "target_duration": duration,
+                "available_duration": available_duration,
                 "actual_duration": selected["actual_duration"],
                 "duration_error": selected["duration_error"],
+                "duration_relative_error": selected.get("duration_relative_error"),
+                "required_speed_factor": selected.get("required_speed_factor"),
+                "duration_fit": selected.get("duration_fit"),
+                "selection_reason": selection_reason,
                 "preview_audio": selected["audio_file"],
                 "backend": self.backend.name,
                 "status": "fallback" if selected.get("estimated") else "success",
@@ -366,6 +552,10 @@ class LightTTSSelector:
             state["selections"][segment_id] = selection
             _atomic_json(self.results_path, state)
             segment["text"] = selected["text"]
+            # Candidate provenance is an internal decision aid and must not leak
+            # into the frontend-facing segment schema.
+            for candidate in enriched:
+                candidate.pop("_selection_priority", None)
             segment["translations_candidates"] = enriched
             segment["light_tts_selection"] = selection
             segment["light_tts_status"] = selection["status"]
@@ -373,10 +563,11 @@ class LightTTSSelector:
             output.append(segment)
             selection_rows.append(selection)
             print(
-                f"[Light TTS {sequence + 1}] segment_id={segment_id} "
-                f"candidate={selected_index} target={duration:.3f}s "
-                f"actual={float(selected['actual_duration']):.3f}s "
-                f"error={float(selected['duration_error']):.3f}s"
+                f"[Translation {segment_id}] "
+                f"source={candidates[selected_index].get('_selection_priority', 'standard')} "
+                f"duration={float(selected['actual_duration']):.3f}/{duration:.3f}s "
+                f"slot={available_duration:.3f}s "
+                f"fit={selected.get('duration_fit')} selected={selection_reason}"
             )
         failures = sum(r["status"] == "fallback" for r in selection_rows)
         fraction = float(os.getenv("AUTODUB_LIGHT_TTS_MAX_FALLBACK_FRACTION", "0.5"))
