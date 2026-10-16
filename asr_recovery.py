@@ -279,3 +279,135 @@ def stable_ocr_source_line(
         "frame_count": frame_count,
         "confidence": round(confidence, 4),
     }
+
+
+def _short_text_compatible(left: str, right: str) -> bool:
+    """Match OCR variants without conflating different short utterances."""
+    left_words = re.findall(r"[\w']+", unicodedata.normalize("NFKC", left).casefold())
+    right_words = re.findall(r"[\w']+", unicodedata.normalize("NFKC", right).casefold())
+    if max(len(left_words), len(right_words)) <= 4:
+        return left_words == right_words
+    return text_similarity(left, right) >= 0.88
+
+
+def ocr_source_events(
+    frame_records: Sequence[Mapping[str, Any]],
+    source_language: str,
+    *,
+    region_start: float,
+    region_end: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Build ordered subtitle events from dense OCR observations.
+
+    Identical text separated by a real disappearance is kept as two events so
+    repeated short calls are not collapsed.  Event bounds partition the parent
+    speech region: OCR supplies text/order while the acoustic region remains the
+    conservative outer timing boundary.
+    """
+    observations: List[Dict[str, Any]] = []
+    for frame_index, record in enumerate(frame_records):
+        timestamp = float(record.get("timestamp", 0.0))
+        seen: set[str] = set()
+        for line in _ocr_lines(str(record.get("text") or "")):
+            key = normalize_text(line)
+            if (
+                key in seen
+                or len(key) < 2
+                or len(key) > 140
+                or not _language_matches(line, source_language)
+            ):
+                continue
+            seen.add(key)
+            observations.append(
+                {
+                    "frame_index": frame_index,
+                    "timestamp": timestamp,
+                    "text": line,
+                    "key": key,
+                }
+            )
+
+    if not observations:
+        return [], {
+            "reason": "no_source_language_ocr_evidence",
+            "frame_count": len(frame_records),
+            "dialogue_evidence": False,
+        }
+
+    timestamps = sorted({float(item["timestamp"]) for item in observations})
+    steps = [right - left for left, right in zip(timestamps, timestamps[1:]) if right > left]
+    cadence = sorted(steps)[len(steps) // 2] if steps else 0.35
+    episode_gap = max(0.9, cadence * 2.6)
+
+    clusters: List[List[Dict[str, Any]]] = []
+    for observation in sorted(observations, key=lambda item: (item["timestamp"], item["key"])):
+        best_index: Optional[int] = None
+        best_score = 0.0
+        for index, cluster in enumerate(clusters):
+            if observation["timestamp"] - float(cluster[-1]["timestamp"]) > episode_gap:
+                continue
+            representative = str(cluster[0]["text"])
+            score = text_similarity(representative, str(observation["text"]))
+            if _short_text_compatible(representative, str(observation["text"])) and score > best_score:
+                best_index, best_score = index, score
+        if best_index is None:
+            clusters.append([observation])
+        else:
+            clusters[best_index].append(observation)
+
+    candidates: List[Dict[str, Any]] = []
+    for cluster in clusters:
+        frame_count = len({int(item["frame_index"]) for item in cluster})
+        if frame_count < 2:
+            continue
+        line_counts = Counter(str(item["text"]) for item in cluster)
+        text = max(line_counts, key=lambda line: (line_counts[line], len(normalize_text(line))))
+        first_seen = min(float(item["timestamp"]) for item in cluster)
+        last_seen = max(float(item["timestamp"]) for item in cluster)
+        candidates.append(
+            {
+                "text": text,
+                "first_seen": first_seen,
+                "last_seen": last_seen,
+                "frame_count": frame_count,
+                "confidence": round(min(0.96, 0.74 + 0.06 * (frame_count - 2)), 4),
+            }
+        )
+
+    if not candidates:
+        return [], {
+            "reason": "source_language_ocr_seen_but_not_stable",
+            "frame_count": len(frame_records),
+            "observation_count": len(observations),
+            "dialogue_evidence": True,
+        }
+
+    candidates.sort(key=lambda item: (item["first_seen"], item["last_seen"]))
+    # Partition the confirmed acoustic parent interval at subtitle-change
+    # midpoints.  This avoids arbitrary fixed-width recovery windows while
+    # ensuring that the complete confirmed utterance remains covered.
+    boundaries = [float(region_start)]
+    for left, right in zip(candidates, candidates[1:]):
+        midpoint = (float(left["last_seen"]) + float(right["first_seen"])) / 2.0
+        boundaries.append(max(boundaries[-1], min(float(region_end), midpoint)))
+    boundaries.append(float(region_end))
+    events: List[Dict[str, Any]] = []
+    for index, candidate in enumerate(candidates):
+        start = boundaries[index]
+        end = boundaries[index + 1]
+        if end - start < 0.08:
+            continue
+        events.append(
+            dict(
+                candidate,
+                start=round(start, 3),
+                end=round(end, 3),
+            )
+        )
+    return events, {
+        "reason": "stable_source_language_subtitle_events",
+        "frame_count": len(frame_records),
+        "observation_count": len(observations),
+        "event_count": len(events),
+        "dialogue_evidence": True,
+    }

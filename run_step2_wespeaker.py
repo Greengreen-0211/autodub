@@ -52,6 +52,13 @@ def _env_int(name, default):
         return int(default)
 
 
+def _env_bool(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 SAD_MIN_SILENCE_MS = _env_int("AUTODUB_DIAR_SAD_MIN_SILENCE_MS", 350)
 SAD_KEEP_MS = _env_int("AUTODUB_DIAR_SAD_KEEP_MS", 180)
 SAD_MERGE_GAP_MS = _env_int("AUTODUB_DIAR_SAD_MERGE_GAP_MS", 450)
@@ -1786,6 +1793,14 @@ def main():
     if "segments_step1" not in state:
         print("❌ state 中缺少 segments_step1，请先运行 Step 1a/1b")
         sys.exit(1)
+    unresolved = state.get("asr_unresolved_dialogue_regions") or []
+    if unresolved and _env_bool("ASR_REQUIRE_COMPLETE_DIALOGUE", True):
+        spans = ", ".join(
+            f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
+            for item in unresolved[:8]
+        )
+        print(f"❌ 仍有确认对白未恢复，拒绝执行说话人聚类: {spans}")
+        sys.exit(2)
 
     prepare_inputs(state)
     rttm_path = run_wespeaker_pipeline(state["segments_step1"])
