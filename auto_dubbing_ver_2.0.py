@@ -126,6 +126,18 @@ class DubbingConfig:
         self.asr_retry_context_ms = _env_int("ASR_RETRY_CONTEXT_MS", 400)
         self.asr_max_retry_regions = _env_int("ASR_MAX_RETRY_REGIONS", 12)
         self.asr_restore_fade_ms = _env_int("ASR_RESTORE_FADE_MS", 35)
+        self.asr_alignment_repair_enabled = _env_bool(
+            "ASR_ALIGNMENT_REPAIR_ENABLED", True
+        )
+        self.asr_alignment_repair_max_chunk_ms = _env_int(
+            "ASR_ALIGNMENT_REPAIR_MAX_CHUNK_MS", 4200
+        )
+        self.asr_alignment_repair_min_chunk_ms = _env_int(
+            "ASR_ALIGNMENT_REPAIR_MIN_CHUNK_MS", 650
+        )
+        self.asr_alignment_repair_consensus = _env_float(
+            "ASR_ALIGNMENT_REPAIR_CONSENSUS", 0.82
+        )
         self.ocr_enabled = _env_bool("AUTODUB_OCR_ENABLED", True)
         self.ocr_url = os.getenv("AUTODUB_OCR_URL", "http://127.0.0.1:8000/extract_text")
         self.ocr_frame_index = _env_int("AUTODUB_OCR_FRAME_INDEX", 5)
@@ -231,6 +243,7 @@ class Qwen3ASRProcessor:
         self.uncovered_regions: List[Dict[str, Any]] = []
         self.ambiguous_regions: List[Dict[str, Any]] = []
         self.retry_segments: List[Dict[str, Any]] = []
+        self.alignment_repair_report: List[Dict[str, Any]] = []
 
     def _torch_dtype(self, dtype_name: Optional[str] = None):
         dtype = (dtype_name or self.config.qwen_dtype).lower()
@@ -477,14 +490,29 @@ class Qwen3ASRProcessor:
             segment["timestamp_alignment_status"] = alignment["status"]
             segment["timestamp_coverage_ratio"] = alignment["coverage_ratio"]
             segment["timestamp_warning_codes"] = alignment["warning_codes"]
-            segment["qwen3_sentence_candidates"] = sentence_candidates(normalized_items)
+            segment["timestamp_alignment_diagnostics"] = {
+                key: alignment[key]
+                for key in (
+                    "valid_item_ratio",
+                    "zero_duration_ratio",
+                    "endpoint_pileup_ratio",
+                    "longest_item_duration",
+                    "severe_temporal_failure",
+                )
+                if key in alignment
+            }
+            segment["qwen3_sentence_candidates"] = (
+                sentence_candidates(normalized_items)
+                if alignment["status"] != "unusable"
+                else []
+            )
 
             reliable = [
                 item for item in normalized_items
                 if float(item.get("end", 0.0)) >= float(item.get("start", 0.0))
                 and str(item.get("text", "")).strip()
             ]
-            if reliable:
+            if reliable and alignment["status"] != "unusable":
                 # These are optional upstream hints.  Legacy start/end remain
                 # untouched so the proven Step 2 sentence split is preserved.
                 pre_roll = 0.10
@@ -496,11 +524,11 @@ class Qwen3ASRProcessor:
                     min(float(segment["end"]), float(reliable[-1]["end"]) + post_roll), 3
                 )
                 status = str(alignment.get("status", ""))
-                segment["alignment_confidence"] = 0.95 if status == "valid" else 0.70
+                segment["alignment_confidence"] = 0.95 if status == "valid" else 0.55
             else:
                 segment["speech_start"] = segment["start"]
                 segment["speech_end"] = segment["end"]
-                segment["alignment_confidence"] = 0.35
+                segment["alignment_confidence"] = 0.20
         else:
             segment["speech_start"] = segment["start"]
             segment["speech_end"] = segment["end"]
@@ -536,6 +564,291 @@ class Qwen3ASRProcessor:
             return "".join(pieces)
         text = " ".join(pieces)
         return re.sub(r"\s+([,.;:!?])", r"\1", text).strip()
+
+    @staticmethod
+    def _join_transcripts(texts: Sequence[str]) -> str:
+        pieces = [str(text).strip() for text in texts if str(text).strip()]
+        if not pieces:
+            return ""
+        separator = "" if any(any(_is_cjk(char) for char in part) for part in pieces) else " "
+        return separator.join(pieces).strip()
+
+    @staticmethod
+    def _alignment_requires_repair(segment: Dict[str, Any]) -> bool:
+        diagnostics = segment.get("timestamp_alignment_diagnostics") or {}
+        warnings = set(segment.get("timestamp_warning_codes") or [])
+        return bool(
+            segment.get("timestamp_alignment_status") == "unusable"
+            and segment.get("qwen3_time_stamps")
+            and (
+                diagnostics.get("severe_temporal_failure")
+                or "timestamp_endpoint_pileup" in warnings
+                or "excessive_zero_duration_timestamps" in warnings
+                or "implausibly_long_timestamp_item" in warnings
+            )
+        )
+
+    def _alignment_repair_ranges(
+        self, audio: AudioSegment, start_ms: int, end_ms: int
+    ) -> List[Tuple[int, int]]:
+        """Split only a broken ASR chunk, preferring local silence near safe caps."""
+        max_chunk = max(1600, self.config.asr_alignment_repair_max_chunk_ms)
+        min_chunk = max(350, self.config.asr_alignment_repair_min_chunk_ms)
+        if end_ms - start_ms <= max_chunk:
+            return [(start_ms, end_ms)]
+
+        local = audio[start_ms:end_ms]
+        threshold = -48.0 if local.dBFS == float("-inf") else max(local.dBFS - 13.0, -48.0)
+        silence_ranges = silence.detect_silence(
+            local,
+            min_silence_len=220,
+            silence_thresh=threshold,
+            seek_step=10,
+        )
+        silence_midpoints = [
+            start_ms + (left + right) // 2
+            for left, right in silence_ranges
+            if left >= min_chunk and (len(local) - right) >= min_chunk
+        ]
+
+        ranges: List[Tuple[int, int]] = []
+        cursor = start_ms
+        while end_ms - cursor > max_chunk:
+            target = cursor + max_chunk
+            nearby = [
+                point
+                for point in silence_midpoints
+                if cursor + min_chunk <= point <= min(end_ms - min_chunk, target + 1300)
+                and point >= target - 1300
+            ]
+            cut = min(nearby, key=lambda point: abs(point - target)) if nearby else target
+            if cut - cursor < min_chunk:
+                cut = min(end_ms, cursor + max_chunk)
+            ranges.append((cursor, cut))
+            cursor = cut
+        if end_ms > cursor:
+            if ranges and end_ms - cursor < min_chunk:
+                ranges[-1] = (ranges[-1][0], end_ms)
+            else:
+                ranges.append((cursor, end_ms))
+        return ranges
+
+    def _transcribe_alignment_repair_candidate(
+        self,
+        *,
+        source_name: str,
+        source_path: str,
+        ranges: Sequence[Tuple[int, int]],
+        original_start_ms: int,
+        original_end_ms: int,
+        repair_index: int,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        repair_dir = os.path.join(self.config.temp_dir, "qwen3_alignment_repair")
+        os.makedirs(repair_dir, exist_ok=True)
+        source_audio = AudioSegment.from_wav(source_path)
+        paths: List[str] = []
+        for part_index, (start_ms, end_ms) in enumerate(ranges):
+            path = os.path.join(
+                repair_dir,
+                f"repair_{repair_index:04d}_{source_name}_{part_index:02d}.wav",
+            )
+            source_audio[start_ms:end_ms].export(path, format="wav")
+            paths.append(path)
+
+        outputs = self._transcribe_paths(paths)
+        texts: List[str] = []
+        languages: List[str] = []
+        absolute_items: List[Dict[str, Any]] = []
+        part_diagnostics: List[Dict[str, Any]] = []
+        for part_index, ((start_ms, end_ms), (text, language, timestamps)) in enumerate(
+            zip(ranges, outputs)
+        ):
+            if not text or not timestamps:
+                return None, {
+                    "source": source_name,
+                    "success": False,
+                    "reason": "empty_text_or_timestamps",
+                    "part": part_index,
+                    "text": text,
+                }
+            local_segment = self._build_segment(
+                segment_id=-1,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                text=text,
+                timestamps=timestamps,
+                origin=f"alignment_repair_{source_name}",
+            )
+            part_diagnostics.append(
+                {
+                    "start": round(start_ms / 1000.0, 3),
+                    "end": round(end_ms / 1000.0, 3),
+                    "text": text,
+                    "status": local_segment.get("timestamp_alignment_status"),
+                    "warnings": local_segment.get("timestamp_warning_codes", []),
+                }
+            )
+            if local_segment.get("timestamp_alignment_status") == "unusable":
+                return None, {
+                    "source": source_name,
+                    "success": False,
+                    "reason": "local_alignment_unusable",
+                    "part": part_index,
+                    "parts": part_diagnostics,
+                }
+            texts.append(text)
+            if language:
+                languages.append(language)
+            absolute_items.extend(local_segment.get("qwen3_time_stamps_raw") or [])
+
+        combined_text = self._join_transcripts(texts)
+        relative_items = [
+            {
+                "text": item.get("text", ""),
+                "start": float(item.get("start", 0.0)) - original_start_ms / 1000.0,
+                "end": float(item.get("end", 0.0)) - original_start_ms / 1000.0,
+            }
+            for item in absolute_items
+        ]
+        combined = self._build_segment(
+            segment_id=-1,
+            start_ms=original_start_ms,
+            end_ms=original_end_ms,
+            text=combined_text,
+            timestamps=relative_items,
+            origin=f"alignment_repair_{source_name}",
+        )
+        if combined.get("timestamp_alignment_status") == "unusable":
+            return None, {
+                "source": source_name,
+                "success": False,
+                "reason": "combined_alignment_unusable",
+                "parts": part_diagnostics,
+            }
+        combined["asr_repair_parts"] = part_diagnostics
+        combined["asr_repair_language"] = (
+            max(dict.fromkeys(languages), key=languages.count) if languages else ""
+        )
+        return combined, {
+            "source": source_name,
+            "success": True,
+            "text": combined_text,
+            "parts": part_diagnostics,
+        }
+
+    def _repair_unusable_alignments(
+        self,
+        segments: Sequence[Dict[str, Any]],
+        audio_path: str,
+        source_audio_path: Optional[str],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Repair only severe aligner failures; unresolved chunks fall back to original vocal."""
+        if not self.config.asr_alignment_repair_enabled:
+            return list(segments), [], []
+        vocals_audio = AudioSegment.from_wav(audio_path)
+        repaired_segments: List[Dict[str, Any]] = []
+        unresolved: List[Dict[str, Any]] = []
+        audit: List[Dict[str, Any]] = []
+        for repair_index, original in enumerate(segments):
+            if not self._alignment_requires_repair(original):
+                repaired_segments.append(original)
+                continue
+
+            start_ms = round(float(original["start"]) * 1000.0)
+            end_ms = round(float(original["end"]) * 1000.0)
+            ranges = self._alignment_repair_ranges(vocals_audio, start_ms, end_ms)
+            print(
+                f"⚠️ ASR 对齐异常 {float(original['start']):.3f}-"
+                f"{float(original['end']):.3f}s，拆为 {len(ranges)} 段进行双源复核。"
+            )
+            sources = [("vocals", audio_path)]
+            if (
+                source_audio_path
+                and os.path.isfile(source_audio_path)
+                and os.path.abspath(source_audio_path) != os.path.abspath(audio_path)
+            ):
+                sources.append(("source", source_audio_path))
+
+            candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+            segment_audit: Dict[str, Any] = {
+                "start": round(float(original["start"]), 3),
+                "end": round(float(original["end"]), 3),
+                "original_text": str(original.get("text", "")),
+                "original_warnings": original.get("timestamp_warning_codes", []),
+                "ranges": [[round(a / 1000.0, 3), round(b / 1000.0, 3)] for a, b in ranges],
+                "attempts": [],
+            }
+            for source_name, source_path in sources:
+                candidate, attempt = self._transcribe_alignment_repair_candidate(
+                    source_name=source_name,
+                    source_path=source_path,
+                    ranges=ranges,
+                    original_start_ms=start_ms,
+                    original_end_ms=end_ms,
+                    repair_index=repair_index,
+                )
+                segment_audit["attempts"].append(attempt)
+                if candidate is not None:
+                    candidates.append((candidate, attempt))
+
+            accepted: Optional[Dict[str, Any]] = None
+            consensus = 0.0
+            if len(candidates) >= 2:
+                first, second = candidates[0][0], candidates[1][0]
+                first_text = self._normalized_text(str(first.get("text", "")))
+                second_text = self._normalized_text(str(second.get("text", "")))
+                consensus = difflib.SequenceMatcher(None, first_text, second_text).ratio()
+                if consensus >= self.config.asr_alignment_repair_consensus:
+                    def quality(item: Dict[str, Any]) -> Tuple[int, float, int]:
+                        return (
+                            1 if item.get("timestamp_alignment_status") == "valid" else 0,
+                            float(item.get("timestamp_coverage_ratio", 0.0)),
+                            -len(item.get("timestamp_warning_codes") or []),
+                        )
+                    accepted = max((first, second), key=quality)
+
+            if accepted is not None:
+                accepted["id"] = original.get("id", -1)
+                accepted["asr_origin"] = "primary_alignment_repair_consensus"
+                accepted["asr_original_text"] = str(original.get("text", ""))
+                accepted["asr_repair_consensus_similarity"] = round(consensus, 4)
+                accepted["asr_repair_sources"] = [item[1].get("source") for item in candidates[:2]]
+                repaired_segments.append(accepted)
+                segment_audit.update(
+                    {
+                        "success": True,
+                        "consensus_similarity": round(consensus, 4),
+                        "selected_text": accepted.get("text", ""),
+                    }
+                )
+                print(
+                    f"✅ ASR 对齐局部修复成功，双源一致度 {consensus:.3f}: "
+                    f"{accepted.get('text', '')}"
+                )
+            else:
+                segment_audit.update(
+                    {
+                        "success": False,
+                        "consensus_similarity": round(consensus, 4),
+                        "fallback": "preserve_original_vocal",
+                    }
+                )
+                unresolved.append(
+                    {
+                        "start": round(float(original["start"]), 3),
+                        "end": round(float(original["end"]), 3),
+                        "confidence": 0.98,
+                        "reason": ["forced_alignment_unusable_and_repair_unconfirmed"],
+                        "preserve_original_vocal": True,
+                        "original_text": str(original.get("text", "")),
+                    }
+                )
+                print(
+                    "⚠️ ASR 对齐局部修复未形成双源共识；该区间不进入配音，"
+                    "最终混音保留原声。"
+                )
+            audit.append(segment_audit)
+        return repaired_segments, unresolved, audit
 
     def _retry_region(
         self,
@@ -653,6 +966,13 @@ class Qwen3ASRProcessor:
             )
             segment["asr_retry_language"] = language
             segment["asr_retry_candidate_kind"] = candidate_kind
+            if segment.get("timestamp_alignment_status") == "unusable":
+                attempt["reason"] = "retry_alignment_unusable"
+                attempt["alignment_warnings"] = segment.get(
+                    "timestamp_warning_codes", []
+                )
+                attempts.append(attempt)
+                continue
             if candidate_kind == "confirmed_empty_primary_chunk":
                 attempt.update({"success": True, "text": text})
                 attempts.append(attempt)
@@ -722,6 +1042,14 @@ class Qwen3ASRProcessor:
                 timestamp_segment_count += 1
             segments.append(segment)
             print(f"[Qwen3-ASR {idx:03d}] {segment['start']:.2f}-{segment['end']:.2f}: {text}")
+
+        segments, alignment_unresolved, self.alignment_repair_report = (
+            self._repair_unusable_alignments(
+                segments,
+                audio_path,
+                source_audio_path,
+            )
+        )
 
         if self.config.asr_coverage_enabled:
             from speech_activity import (
@@ -852,6 +1180,8 @@ class Qwen3ASRProcessor:
                 min_duration=self.config.asr_coverage_min_region_ms / 1000.0,
             )
             self.uncovered_regions = [
+                *alignment_unresolved,
+                *[
                 {
                     "start": round(start, 3),
                     "end": round(end, 3),
@@ -867,12 +1197,14 @@ class Qwen3ASRProcessor:
                     "preserve_original_vocal": True,
                 }
                 for start, end in unresolved_confirmed
+                ],
             ]
             self.ambiguous_regions = [
                 *[
                     {
                         "start": round(start, 3),
                         "end": round(end, 3),
+                        "kind": "external_sad_candidate",
                         "confidence": 0.45,
                         "reason": ["independent_sad_outside_asr_chunks"],
                         "preserve_original_vocal": False,
@@ -883,6 +1215,7 @@ class Qwen3ASRProcessor:
                     {
                         "start": round(start, 3),
                         "end": round(end, 3),
+                        "kind": "internal_word_timestamp_gap",
                         "confidence": 0.25,
                         "reason": ["word_timestamp_gap_inside_recognized_segment"],
                         "preserve_original_vocal": False,
@@ -895,10 +1228,14 @@ class Qwen3ASRProcessor:
             confirmed_missing_duration = sum(
                 end - start for start, end in unresolved_confirmed
             )
+            alignment_fallback_duration = sum(
+                float(item["end"]) - float(item["start"])
+                for item in alignment_unresolved
+            )
             raw_word_ranges = [
                 (float(item["start"]), float(item["end"]))
                 for segment in segments
-                if segment.get("asr_origin") == "primary"
+                if str(segment.get("asr_origin", "")).startswith("primary")
                 for item in (segment.get("qwen3_time_stamps") or [])
                 if float(item.get("end", 0.0)) > float(item.get("start", 0.0))
             ]
@@ -908,8 +1245,11 @@ class Qwen3ASRProcessor:
             successful_primary_duration = sum(
                 end - start for start, end in successful_primary_ranges
             )
+            effective_missing_duration = (
+                confirmed_missing_duration + alignment_fallback_duration
+            )
             chunk_coverage_ratio = (
-                1.0 - confirmed_missing_duration / attempted_duration
+                max(0.0, 1.0 - effective_missing_duration / attempted_duration)
                 if attempted_duration > 0
                 else 1.0
             )
@@ -928,7 +1268,14 @@ class Qwen3ASRProcessor:
                 "coverage_ratio": round(chunk_coverage_ratio, 4),
                 "word_alignment_ratio": round(word_alignment_ratio, 4),
                 "confirmed_missing_duration": round(confirmed_missing_duration, 3),
-                "uncovered_duration": round(confirmed_missing_duration, 3),
+                "alignment_fallback_duration": round(alignment_fallback_duration, 3),
+                "alignment_anomaly_count": len(self.alignment_repair_report),
+                "alignment_repair_success_count": sum(
+                    bool(item.get("success")) for item in self.alignment_repair_report
+                ),
+                "uncovered_duration": round(
+                    effective_missing_duration, 3
+                ),
                 "external_ambiguous_duration": round(
                     sum(end - start for start, end in unresolved_external), 3
                 ),
@@ -945,7 +1292,9 @@ class Qwen3ASRProcessor:
                 f"待原声保底 {len(self.uncovered_regions)} 段; "
                 f"仅审计弱候选 {len(self.ambiguous_regions)} 段。"
             )
-        elif not segments:
+        else:
+            self.uncovered_regions = list(alignment_unresolved)
+        if not self.config.asr_coverage_enabled and not segments:
             # Explicit opt-out keeps the historical behaviour for deployments
             # that have not enabled the coverage loop.
             duration = librosa.get_duration(path=audio_path)
@@ -2313,8 +2662,9 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
         "asr_retry_segments": asr.retry_segments,
         "asr_uncovered_regions": asr.uncovered_regions,
         "asr_ambiguous_regions": asr.ambiguous_regions,
+        "asr_alignment_repair_report": asr.alignment_repair_report,
         "duration": librosa.get_duration(path=source_wav),
-        "pipeline_version": "2.0-asr-coverage-v2",
+        "pipeline_version": "2.0-asr-coverage-v3",
         "qwen3_timestamps_enabled": config.qwen_return_timestamps,
     })
     print("✅ Step 1a 完成。可直接运行 --step 1b 接入 OCR，失败时无需重跑 ASR。")

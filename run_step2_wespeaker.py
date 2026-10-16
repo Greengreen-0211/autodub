@@ -283,12 +283,17 @@ def _timestamp_items(segments):
             chunk_end = float(segment.get("end", chunk_start))
         except (TypeError, ValueError):
             continue
-        normalized, _ = normalize_timestamp_items(
+        normalized, alignment = normalize_timestamp_items(
             raw_items,
             transcript=transcript,
             chunk_start=chunk_start,
             chunk_end=chunk_end,
         )
+        # Broken forced-alignment output (for example, most words collapsed
+        # onto the chunk endpoint) is audit evidence only.  It must never
+        # create temporal speaker-change constraints.
+        if alignment.get("status") == "unusable":
+            continue
         for item in normalized:
             items.append({
                 "start": float(item["start"]),

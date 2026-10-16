@@ -122,6 +122,52 @@ def normalize_timestamp_items(
         previous_start = start
 
     transcript_lexical = _lexical_count(transcript)
+    chunk_duration = max(0.0, chunk_end - chunk_start)
+    timestamp_durations = [
+        max(0.0, float(item["end"]) - float(item["start"]))
+        for item in normalized
+    ]
+    zero_duration_count = sum(duration <= 0.02 for duration in timestamp_durations)
+    zero_duration_ratio = (
+        zero_duration_count / len(normalized) if normalized else 0.0
+    )
+    longest_item_duration = max(timestamp_durations, default=0.0)
+    endpoint_tolerance = min(0.08, max(0.02, chunk_duration * 0.01))
+    endpoint_pileup_count = sum(
+        abs(float(item["start"]) - chunk_end) <= endpoint_tolerance
+        and abs(float(item["end"]) - chunk_end) <= endpoint_tolerance
+        for item in normalized
+    )
+    endpoint_pileup_ratio = (
+        endpoint_pileup_count / len(normalized) if normalized else 0.0
+    )
+
+    # Forced aligners sometimes return superficially well-mapped text while
+    # collapsing most words onto the chunk endpoint (or stretching one word
+    # across several seconds).  Such timestamps must never drive sentence or
+    # speaker boundaries.
+    severe_temporal_failure = bool(
+        len(normalized) >= 4
+        and (
+            (zero_duration_count >= 3 and zero_duration_ratio >= 0.45)
+            or (endpoint_pileup_count >= 3 and endpoint_pileup_ratio >= 0.40)
+            or longest_item_duration >= max(2.5, chunk_duration * 0.55)
+        )
+    )
+    temporal_degradation = bool(
+        len(normalized) >= 3
+        and (
+            zero_duration_ratio >= 0.25
+            or endpoint_pileup_ratio >= 0.25
+            or longest_item_duration >= max(2.0, chunk_duration * 0.40)
+        )
+    )
+    if zero_duration_ratio >= 0.25:
+        warnings.append("excessive_zero_duration_timestamps")
+    if endpoint_pileup_ratio >= 0.25:
+        warnings.append("timestamp_endpoint_pileup")
+    if longest_item_duration >= max(2.0, chunk_duration * 0.40):
+        warnings.append("implausibly_long_timestamp_item")
     for index, item in enumerate(normalized):
         char_end = item.get("char_end")
         if char_end is None:
@@ -147,7 +193,9 @@ def normalize_timestamp_items(
     )
     total_raw = len(normalized) + invalid_count
     valid_ratio = len(normalized) / total_raw if total_raw else 0.0
-    if normalized and coverage >= 0.80 and valid_ratio >= 0.90:
+    if severe_temporal_failure:
+        status = "unusable"
+    elif normalized and coverage >= 0.80 and valid_ratio >= 0.90 and not temporal_degradation:
         status = "valid"
     elif normalized and coverage >= 0.50:
         status = "degraded"
@@ -159,6 +207,10 @@ def normalize_timestamp_items(
         "status": status,
         "coverage_ratio": round(coverage, 4),
         "valid_item_ratio": round(valid_ratio, 4),
+        "zero_duration_ratio": round(zero_duration_ratio, 4),
+        "endpoint_pileup_ratio": round(endpoint_pileup_ratio, 4),
+        "longest_item_duration": round(longest_item_duration, 4),
+        "severe_temporal_failure": severe_temporal_failure,
         "warning_codes": sorted(set(warnings)),
     }
     return normalized, metadata
