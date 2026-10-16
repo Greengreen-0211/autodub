@@ -138,6 +138,15 @@ class DubbingConfig:
         self.asr_alignment_repair_consensus = _env_float(
             "ASR_ALIGNMENT_REPAIR_CONSENSUS", 0.82
         )
+        self.asr_recovery_micro_min_ms = _env_int(
+            "ASR_RECOVERY_MICRO_MIN_MS", 650
+        )
+        self.asr_recovery_micro_max_ms = _env_int(
+            "ASR_RECOVERY_MICRO_MAX_MS", 4200
+        )
+        self.asr_recovery_text_consensus = _env_float(
+            "ASR_RECOVERY_TEXT_CONSENSUS", 0.78
+        )
         self.ocr_enabled = _env_bool("AUTODUB_OCR_ENABLED", True)
         self.ocr_url = os.getenv("AUTODUB_OCR_URL", "http://127.0.0.1:8000/extract_text")
         self.ocr_frame_index = _env_int("AUTODUB_OCR_FRAME_INDEX", 5)
@@ -244,6 +253,8 @@ class Qwen3ASRProcessor:
         self.ambiguous_regions: List[Dict[str, Any]] = []
         self.retry_segments: List[Dict[str, Any]] = []
         self.alignment_repair_report: List[Dict[str, Any]] = []
+        self.deferred_regions: List[Dict[str, Any]] = []
+        self.recovery_report: List[Dict[str, Any]] = []
 
     def _torch_dtype(self, dtype_name: Optional[str] = None):
         dtype = (dtype_name or self.config.qwen_dtype).lower()
@@ -525,14 +536,25 @@ class Qwen3ASRProcessor:
                 )
                 status = str(alignment.get("status", ""))
                 segment["alignment_confidence"] = 0.95 if status == "valid" else 0.55
+                segment["timestamp_precision"] = "word"
+                segment["speaker_boundary_eligible"] = True
+                segment["asr_alignment_confidence"] = segment["alignment_confidence"]
             else:
                 segment["speech_start"] = segment["start"]
                 segment["speech_end"] = segment["end"]
                 segment["alignment_confidence"] = 0.20
+                segment["timestamp_precision"] = "unusable"
+                segment["speaker_boundary_eligible"] = False
+                segment["asr_alignment_confidence"] = 0.0
         else:
             segment["speech_start"] = segment["start"]
             segment["speech_end"] = segment["end"]
             segment["alignment_confidence"] = 0.35
+            segment["timestamp_precision"] = "coarse"
+            segment["speaker_boundary_eligible"] = False
+            segment["asr_alignment_confidence"] = 0.0
+        segment.setdefault("asr_recovery_status", "primary")
+        segment.setdefault("asr_text_confidence", 1.0 if text else 0.0)
         return segment
 
     @staticmethod
@@ -589,11 +611,23 @@ class Qwen3ASRProcessor:
         )
 
     def _alignment_repair_ranges(
-        self, audio: AudioSegment, start_ms: int, end_ms: int
+        self,
+        audio: AudioSegment,
+        start_ms: int,
+        end_ms: int,
+        *,
+        max_chunk_ms: Optional[int] = None,
+        min_chunk_ms: Optional[int] = None,
     ) -> List[Tuple[int, int]]:
         """Split only a broken ASR chunk, preferring local silence near safe caps."""
-        max_chunk = max(1600, self.config.asr_alignment_repair_max_chunk_ms)
-        min_chunk = max(350, self.config.asr_alignment_repair_min_chunk_ms)
+        max_chunk = max(
+            1600,
+            int(max_chunk_ms or self.config.asr_alignment_repair_max_chunk_ms),
+        )
+        min_chunk = max(
+            350,
+            int(min_chunk_ms or self.config.asr_alignment_repair_min_chunk_ms),
+        )
         if end_ms - start_ms <= max_chunk:
             return [(start_ms, end_ms)]
 
@@ -660,14 +694,15 @@ class Qwen3ASRProcessor:
         languages: List[str] = []
         absolute_items: List[Dict[str, Any]] = []
         part_diagnostics: List[Dict[str, Any]] = []
+        all_parts_have_usable_alignment = True
         for part_index, ((start_ms, end_ms), (text, language, timestamps)) in enumerate(
             zip(ranges, outputs)
         ):
-            if not text or not timestamps:
+            if not text:
                 return None, {
                     "source": source_name,
                     "success": False,
-                    "reason": "empty_text_or_timestamps",
+                    "reason": "empty_text",
                     "part": part_index,
                     "text": text,
                 }
@@ -688,18 +723,18 @@ class Qwen3ASRProcessor:
                     "warnings": local_segment.get("timestamp_warning_codes", []),
                 }
             )
-            if local_segment.get("timestamp_alignment_status") == "unusable":
-                return None, {
-                    "source": source_name,
-                    "success": False,
-                    "reason": "local_alignment_unusable",
-                    "part": part_index,
-                    "parts": part_diagnostics,
-                }
             texts.append(text)
             if language:
                 languages.append(language)
-            absolute_items.extend(local_segment.get("qwen3_time_stamps_raw") or [])
+            if (
+                timestamps
+                and local_segment.get("timestamp_alignment_status") != "unusable"
+            ):
+                absolute_items.extend(local_segment.get("qwen3_time_stamps_raw") or [])
+            else:
+                # Keep the acoustic text as consensus evidence.  Broken timing
+                # is a separate confidence dimension and must not erase it.
+                all_parts_have_usable_alignment = False
 
         combined_text = self._join_transcripts(texts)
         relative_items = [
@@ -710,6 +745,8 @@ class Qwen3ASRProcessor:
             }
             for item in absolute_items
         ]
+        if not all_parts_have_usable_alignment:
+            relative_items = []
         combined = self._build_segment(
             segment_id=-1,
             start_ms=original_start_ms,
@@ -718,13 +755,11 @@ class Qwen3ASRProcessor:
             timestamps=relative_items,
             origin=f"alignment_repair_{source_name}",
         )
-        if combined.get("timestamp_alignment_status") == "unusable":
-            return None, {
-                "source": source_name,
-                "success": False,
-                "reason": "combined_alignment_unusable",
-                "parts": part_diagnostics,
-            }
+        combined["asr_repair_source"] = source_name
+        combined["asr_text_confidence"] = 0.5
+        combined["asr_alignment_confidence"] = float(
+            combined.get("alignment_confidence", 0.0)
+        )
         combined["asr_repair_parts"] = part_diagnostics
         combined["asr_repair_language"] = (
             max(dict.fromkeys(languages), key=languages.count) if languages else ""
@@ -733,6 +768,8 @@ class Qwen3ASRProcessor:
             "source": source_name,
             "success": True,
             "text": combined_text,
+            "alignment_status": combined.get("timestamp_alignment_status", "coarse"),
+            "text_usable": True,
             "parts": part_diagnostics,
         }
 
@@ -791,34 +828,34 @@ class Qwen3ASRProcessor:
                 if candidate is not None:
                     candidates.append((candidate, attempt))
 
-            accepted: Optional[Dict[str, Any]] = None
-            consensus = 0.0
-            if len(candidates) >= 2:
-                first, second = candidates[0][0], candidates[1][0]
-                first_text = self._normalized_text(str(first.get("text", "")))
-                second_text = self._normalized_text(str(second.get("text", "")))
-                consensus = difflib.SequenceMatcher(None, first_text, second_text).ratio()
-                if consensus >= self.config.asr_alignment_repair_consensus:
-                    def quality(item: Dict[str, Any]) -> Tuple[int, float, int]:
-                        return (
-                            1 if item.get("timestamp_alignment_status") == "valid" else 0,
-                            float(item.get("timestamp_coverage_ratio", 0.0)),
-                            -len(item.get("timestamp_warning_codes") or []),
-                        )
-                    accepted = max((first, second), key=quality)
+            from asr_recovery import choose_consensus_candidate
+
+            accepted, consensus_decision = choose_consensus_candidate(
+                [item[0] for item in candidates],
+                threshold=self.config.asr_alignment_repair_consensus,
+                start=float(original["start"]),
+                end=float(original["end"]),
+                precise_origin="primary_alignment_repair_consensus",
+                coarse_origin="primary_alignment_repair_coarse_consensus",
+            )
+            consensus = float(consensus_decision.get("consensus_similarity", 0.0))
 
             if accepted is not None:
                 accepted["id"] = original.get("id", -1)
-                accepted["asr_origin"] = "primary_alignment_repair_consensus"
                 accepted["asr_original_text"] = str(original.get("text", ""))
                 accepted["asr_repair_consensus_similarity"] = round(consensus, 4)
-                accepted["asr_repair_sources"] = [item[1].get("source") for item in candidates[:2]]
+                accepted["asr_repair_sources"] = accepted.get(
+                    "asr_recovery_sources",
+                    [item[1].get("source") for item in candidates[:2]],
+                )
                 repaired_segments.append(accepted)
                 segment_audit.update(
                     {
                         "success": True,
                         "consensus_similarity": round(consensus, 4),
                         "selected_text": accepted.get("text", ""),
+                        "timestamp_precision": accepted.get("timestamp_precision", "word"),
+                        "decision": consensus_decision,
                     }
                 )
                 print(
@@ -831,6 +868,7 @@ class Qwen3ASRProcessor:
                         "success": False,
                         "consensus_similarity": round(consensus, 4),
                         "fallback": "preserve_original_vocal",
+                        "decision": consensus_decision,
                     }
                 )
                 unresolved.append(
@@ -841,6 +879,8 @@ class Qwen3ASRProcessor:
                         "reason": ["forced_alignment_unusable_and_repair_unconfirmed"],
                         "preserve_original_vocal": True,
                         "original_text": str(original.get("text", "")),
+                        "asr_recovery_status": "deferred",
+                        "candidate_kind": "alignment_text_unconfirmed",
                     }
                 )
                 print(
@@ -929,9 +969,10 @@ class Qwen3ASRProcessor:
                 if selected_text:
                     text = selected_text
                 else:
-                    attempt["reason"] = "timestamps_do_not_overlap_uncovered_region"
-                    attempts.append(attempt)
-                    continue
+                    # The text hypothesis can still participate in independent
+                    # consensus, but no timestamp from this pass is trusted.
+                    selected_timestamps = []
+                    attempt["timing_warning"] = "timestamps_do_not_overlap_core"
             else:
                 # Without word timestamps, accepting a retry inside an existing
                 # broad ASR chunk could duplicate its text.  Only accept a fully
@@ -966,39 +1007,62 @@ class Qwen3ASRProcessor:
             )
             segment["asr_retry_language"] = language
             segment["asr_retry_candidate_kind"] = candidate_kind
-            if segment.get("timestamp_alignment_status") == "unusable":
-                attempt["reason"] = "retry_alignment_unusable"
-                attempt["alignment_warnings"] = segment.get(
-                    "timestamp_warning_codes", []
-                )
-                attempts.append(attempt)
-                continue
-            if candidate_kind == "confirmed_empty_primary_chunk":
-                attempt.update({"success": True, "text": text})
-                attempts.append(attempt)
-                return segment, attempts
-
-            # SAD-only regions are weaker evidence and may be music leakage.
-            # Require independent agreement between the separated vocal and
-            # original source before introducing a new sentence.
+            segment["asr_repair_source"] = source_name
+            segment["asr_text_confidence"] = 0.5
+            segment["asr_alignment_confidence"] = float(
+                segment.get("alignment_confidence", 0.0)
+            )
+            # Text and timing are independent evidence.  Even unusable forced
+            # alignment may vote on text; it simply cannot supply word-level
+            # boundaries if the other source agrees.
             attempt["reason"] = "awaiting_cross_source_confirmation"
             attempt["text"] = text
+            attempt["alignment_status"] = segment.get(
+                "timestamp_alignment_status", "coarse"
+            )
+            attempt["alignment_warnings"] = segment.get(
+                "timestamp_warning_codes", []
+            )
             attempts.append(attempt)
             validated_candidates.append((segment, normalized, attempt))
 
-        if candidate_kind == "external_sad_candidate" and len(validated_candidates) >= 2:
-            first_segment, first_text, first_attempt = validated_candidates[0]
-            second_segment, second_text, second_attempt = validated_candidates[1]
-            similarity = difflib.SequenceMatcher(None, first_text, second_text).ratio()
-            if similarity >= 0.78:
-                chosen = first_segment if len(first_text) >= len(second_text) else second_segment
-                chosen["asr_origin"] = "coverage_retry_cross_source_consensus"
+        if len(validated_candidates) >= 2:
+            from asr_recovery import choose_consensus_candidate
+
+            chosen, decision = choose_consensus_candidate(
+                [item[0] for item in validated_candidates],
+                threshold=self.config.asr_recovery_text_consensus,
+                start=core_start,
+                end=core_end,
+                precise_origin="coverage_retry_cross_source_consensus",
+                coarse_origin="coverage_retry_cross_source_coarse_consensus",
+            )
+            similarity = float(decision.get("consensus_similarity", 0.0))
+            if chosen is not None:
                 chosen["asr_retry_consensus_similarity"] = round(similarity, 4)
-                first_attempt.update({"success": True, "reason": "cross_source_consensus"})
-                second_attempt.update({"success": True, "reason": "cross_source_consensus"})
+                chosen["asr_retry_candidate_kind"] = candidate_kind
+                for _, _, candidate_attempt in validated_candidates:
+                    candidate_attempt.update(
+                        {
+                            "success": True,
+                            "reason": decision.get("reason", "cross_source_consensus"),
+                            "consensus_similarity": round(similarity, 4),
+                        }
+                    )
+                self.recovery_report.append(
+                    {
+                        "start": round(core_start, 3),
+                        "end": round(core_end, 3),
+                        "candidate_kind": candidate_kind,
+                        "status": chosen.get("asr_recovery_status", "accepted_precise"),
+                        "text": chosen.get("text", ""),
+                        "decision": decision,
+                    }
+                )
                 return chosen, attempts
-            first_attempt["reason"] = "cross_source_disagreement"
-            second_attempt["reason"] = "cross_source_disagreement"
+            for _, _, candidate_attempt in validated_candidates:
+                candidate_attempt["reason"] = "cross_source_disagreement"
+                candidate_attempt["consensus_similarity"] = round(similarity, 4)
         return None, attempts
 
     def transcribe(
@@ -1096,14 +1160,60 @@ class Qwen3ASRProcessor:
                 candidate_sources.append(("external_sad_candidate", external_candidates))
             for candidate_kind, candidate_ranges in candidate_sources:
                 for missing_start, missing_end in candidate_ranges:
-                    for bounded_start_ms, bounded_end_ms in self._split_long_range(
-                        round(missing_start * 1000.0), round(missing_end * 1000.0)
-                    ):
+                    if candidate_kind == "confirmed_empty_primary_chunk":
+                        from asr_recovery import speech_micro_ranges
+
+                        bounded_ranges = speech_micro_ranges(
+                            speech_regions,
+                            outer_start=missing_start,
+                            outer_end=missing_end,
+                            min_seconds=self.config.asr_recovery_micro_min_ms / 1000.0,
+                            # First retain silence-delimited independent SAD
+                            # regions.  The audio-aware splitter below handles
+                            # only the unusually long continuous regions.
+                            max_seconds=9999.0,
+                        )
+                        vocals_for_recovery = AudioSegment.from_wav(audio_path)
+                        silence_aware_ranges: List[Tuple[float, float]] = []
+                        for active_start, active_end in bounded_ranges:
+                            for part_start_ms, part_end_ms in self._alignment_repair_ranges(
+                                vocals_for_recovery,
+                                round(active_start * 1000.0),
+                                round(active_end * 1000.0),
+                                max_chunk_ms=self.config.asr_recovery_micro_max_ms,
+                                min_chunk_ms=self.config.asr_recovery_micro_min_ms,
+                            ):
+                                silence_aware_ranges.append(
+                                    (part_start_ms / 1000.0, part_end_ms / 1000.0)
+                                )
+                        bounded_ranges = silence_aware_ranges
+                        # An independently detected speech block may be absent
+                        # for very quiet speech.  Keep one bounded retry rather
+                        # than silently abandoning a confirmed primary empty.
+                        if not bounded_ranges:
+                            bounded_ranges = [
+                                (
+                                    bounded_start_ms / 1000.0,
+                                    bounded_end_ms / 1000.0,
+                                )
+                                for bounded_start_ms, bounded_end_ms in self._alignment_repair_ranges(
+                                    AudioSegment.from_wav(audio_path),
+                                    round(missing_start * 1000.0),
+                                    round(missing_end * 1000.0),
+                                    max_chunk_ms=self.config.asr_recovery_micro_max_ms,
+                                    min_chunk_ms=self.config.asr_recovery_micro_min_ms,
+                                )
+                            ]
+                    else:
+                        bounded_ranges = [(missing_start, missing_end)]
+                    for bounded_start, bounded_end in bounded_ranges:
                         retry_candidates.append(
                             {
-                                "start": bounded_start_ms / 1000.0,
-                                "end": bounded_end_ms / 1000.0,
+                                "start": round(float(bounded_start), 3),
+                                "end": round(float(bounded_end), 3),
                                 "candidate_kind": candidate_kind,
+                                "parent_start": round(float(missing_start), 3),
+                                "parent_end": round(float(missing_end), 3),
                             }
                         )
 
@@ -1180,7 +1290,10 @@ class Qwen3ASRProcessor:
                 min_duration=self.config.asr_coverage_min_region_ms / 1000.0,
             )
             self.uncovered_regions = [
-                *alignment_unresolved,
+                *[
+                    dict(item, asr_recovery_status="fallback")
+                    for item in alignment_unresolved
+                ],
                 *[
                 {
                     "start": round(start, 3),
@@ -1195,10 +1308,72 @@ class Qwen3ASRProcessor:
                         and float(attempt["end"]) > start
                     ),
                     "preserve_original_vocal": True,
+                    "asr_recovery_status": "fallback",
                 }
                 for start, end in unresolved_confirmed
                 ],
             ]
+            recovered_ranges = [
+                (float(segment["start"]), float(segment["end"]))
+                for segment in self.retry_segments
+            ]
+            deferred_confirmed = []
+            deferred_external = []
+            for target in retry_candidates:
+                target_range = [(float(target["start"]), float(target["end"]))]
+                if not subtract_ranges(target_range, recovered_ranges, min_duration=0.08):
+                    continue
+                if target["candidate_kind"] == "confirmed_empty_primary_chunk":
+                    deferred_confirmed.append(
+                        {
+                            "start": round(float(target["start"]), 3),
+                            "end": round(float(target["end"]), 3),
+                            "candidate_kind": "confirmed_empty_primary_chunk",
+                            "asr_recovery_status": "deferred",
+                            "preserve_original_vocal": True,
+                            "reason": ["micro_asr_cross_source_unconfirmed"],
+                        }
+                    )
+                elif target["candidate_kind"] == "external_sad_candidate":
+                    has_acoustic_text = any(
+                        attempt.get("candidate_kind") == "external_sad_candidate"
+                        and str(attempt.get("text") or "").strip()
+                        and float(attempt.get("start", -1.0)) < float(target["end"])
+                        and float(attempt.get("end", -1.0)) > float(target["start"])
+                        for attempt in retry_attempts
+                    )
+                    if not has_acoustic_text:
+                        continue
+                    deferred_external.append(
+                        {
+                            "start": round(float(target["start"]), 3),
+                            "end": round(float(target["end"]), 3),
+                            "candidate_kind": "external_sad_candidate",
+                            "asr_recovery_status": "deferred",
+                            "preserve_original_vocal": False,
+                            "reason": ["independent_sad_waiting_for_stable_ocr"],
+                        }
+                    )
+            self.deferred_regions = [
+                *[
+                    dict(item, asr_recovery_status="deferred")
+                    for item in alignment_unresolved
+                ],
+                *deferred_confirmed,
+                *deferred_external,
+            ]
+            for deferred_id, item in enumerate(self.deferred_regions):
+                item["id"] = f"deferred-{deferred_id:04d}"
+                self.recovery_report.append(
+                    {
+                        "id": item["id"],
+                        "start": item.get("start"),
+                        "end": item.get("end"),
+                        "candidate_kind": item.get("candidate_kind"),
+                        "status": "deferred",
+                        "reason": item.get("reason", []),
+                    }
+                )
             self.ambiguous_regions = [
                 *[
                     {
@@ -1284,6 +1459,8 @@ class Qwen3ASRProcessor:
                 ),
                 "retry_attempts": retry_attempts,
                 "retry_success_count": len(self.retry_segments),
+                "deferred_region_count": len(self.deferred_regions),
+                "recovery_report": self.recovery_report,
             }
             print(
                 f"🔎 ASR 音频块覆盖: {chunk_coverage_ratio:.1%}; "
@@ -1293,7 +1470,18 @@ class Qwen3ASRProcessor:
                 f"仅审计弱候选 {len(self.ambiguous_regions)} 段。"
             )
         else:
-            self.uncovered_regions = list(alignment_unresolved)
+            self.uncovered_regions = [
+                dict(item, asr_recovery_status="fallback")
+                for item in alignment_unresolved
+            ]
+            self.deferred_regions = [
+                dict(
+                    item,
+                    id=f"deferred-{index:04d}",
+                    asr_recovery_status="deferred",
+                )
+                for index, item in enumerate(alignment_unresolved)
+            ]
         if not self.config.asr_coverage_enabled and not segments:
             # Explicit opt-out keeps the historical behaviour for deployments
             # that have not enabled the coverage loop.
@@ -2662,9 +2850,11 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
         "asr_retry_segments": asr.retry_segments,
         "asr_uncovered_regions": asr.uncovered_regions,
         "asr_ambiguous_regions": asr.ambiguous_regions,
+        "asr_deferred_regions": asr.deferred_regions,
+        "asr_recovery_report": asr.recovery_report,
         "asr_alignment_repair_report": asr.alignment_repair_report,
         "duration": librosa.get_duration(path=source_wav),
-        "pipeline_version": "2.0-asr-coverage-v3",
+        "pipeline_version": "2.0-asr-coverage-v4",
         "qwen3_timestamps_enabled": config.qwen_return_timestamps,
     })
     print("✅ Step 1a 完成。可直接运行 --step 1b 接入 OCR，失败时无需重跑 ASR。")
@@ -2986,6 +3176,35 @@ def run_step_3(config: DubbingConfig) -> None:
             final_segments = [by_id.get(str(s.get("id")), s) for s in final_segments]
         else:
             final_segments = selected_segments
+        recovery_min_ratio = _env_float("ASR_RECOVERY_TTS_MIN_RATIO", 0.65)
+        recovery_max_ratio = _env_float("ASR_RECOVERY_TTS_MAX_RATIO", 1.35)
+        duration_rejected = []
+        for segment in final_segments:
+            if (
+                segment.get("asr_recovery_status") != "accepted_coarse"
+                or segment.get("timestamp_precision") != "coarse"
+            ):
+                continue
+            selection = segment.get("light_tts_selection") or {}
+            target = float(selection.get("target_duration") or 0.0)
+            actual = float(selection.get("actual_duration") or 0.0)
+            measured = selection.get("duration_source") == "measured_audio"
+            ratio = actual / target if target > 0 and actual > 0 else 0.0
+            segment["asr_recovery_tts_duration_ratio"] = round(ratio, 4)
+            if measured and not recovery_min_ratio <= ratio <= recovery_max_ratio:
+                segment["translation_status"] = "skipped"
+                segment["translation_skip_reason"] = (
+                    "coarse_asr_recovery_tts_duration_mismatch:"
+                    f"ratio={ratio:.3f},allowed={recovery_min_ratio:.2f}-"
+                    f"{recovery_max_ratio:.2f}"
+                )
+                segment["dubbing_enabled"] = False
+                duration_rejected.append(str(segment.get("id")))
+        if duration_rejected:
+            print(
+                "⚠️ 粗边界 ASR 恢复句轻量 TTS 时长明显不匹配，改为保留原声: "
+                + ", ".join(duration_rejected)
+            )
         light_tts_results_path = str(selector.results_path)
     else:
         print("⚠️ 轻量 TTS 候选筛选已通过 AUTODUB_LIGHT_TTS_ENABLED=0 关闭。")

@@ -149,6 +149,7 @@ class OCRV211Client:
 
     def __init__(self, config: Any) -> None:
         self.config = config
+        self.frame_texts_by_segment: Dict[str, List[str]] = {}
         try:
             import requests
         except ImportError as exc:
@@ -217,10 +218,29 @@ class OCRV211Client:
         media_key = _ocr_digest({"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
         cache_path = _runtime_dir(self.config) / "ocr_frames.json"
         cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
-        selected = segments[:self.config.ocr_max_segments] if self.config.ocr_max_segments > 0 else segments
         if self.config.ocr_max_segments > 0:
-            print(f"按配置仅处理前 {len(selected)} 个 ASR 片段。")
+            regular = [
+                item
+                for item in segments
+                if not str(item.get("id", "")).startswith("deferred-")
+            ][: self.config.ocr_max_segments]
+            probes = [
+                item
+                for item in segments
+                if str(item.get("id", "")).startswith("deferred-")
+            ]
+            # The user-facing cap limits ordinary ASR correction cost.  It must
+            # not silently disable safety probes for confirmed missing speech.
+            selected = [*regular, *probes]
+        else:
+            selected = segments
+        if self.config.ocr_max_segments > 0:
+            print(
+                f"按配置处理前 {len(regular)} 个 ASR 片段，并保留 "
+                f"{len(probes)} 个漏段安全探针。"
+            )
         outputs: Dict[str, str] = {}
+        self.frame_texts_by_segment = {}
         health_checked = False
         stopped = False
         for index, segment in enumerate(selected, start=1):
@@ -274,6 +294,8 @@ class OCRV211Client:
                     _ocr_atomic_json(cache_path, cache)
                 if text and text not in texts:
                     texts.append(text)
+                if text:
+                    self.frame_texts_by_segment.setdefault(segment_id, []).append(text)
             outputs[segment_id] = "\n".join(texts)
         success_count = sum(bool(text.strip()) for text in outputs.values())
         print(f"✅ OCR 完成: {success_count}/{len(selected)} 个片段获得文本，三帧记录保存至: {cache_path}")
@@ -365,6 +387,56 @@ def _implementation_binding(main_path: Path) -> str:
     })
 
 
+def _recover_deferred_from_ocr(
+    deferred_regions: Sequence[Dict[str, Any]],
+    frame_texts: Dict[str, List[str]],
+    source_language: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Promote only stable source-language subtitles to coarse ASR segments."""
+    from asr_recovery import coarse_segment, stable_ocr_source_line
+
+    recovered: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    for region in deferred_regions:
+        region_id = str(region.get("id") or "")
+        text, decision = stable_ocr_source_line(
+            frame_texts.get(region_id, []), source_language
+        )
+        record = {
+            "id": region_id,
+            "start": round(float(region["start"]), 3),
+            "end": round(float(region["end"]), 3),
+            "decision": decision,
+        }
+        if not text:
+            remaining.append(dict(region))
+            record["status"] = "deferred"
+            audit.append(record)
+            continue
+        seed = {
+            "id": -1,
+            "text": text,
+            "asr_model": "qwen3+ocr",
+            "asr_repair_source": "stable_ocr_frames",
+            "ocr_recovered": True,
+            "ocr_recovery_frame_count": decision.get("frame_count", 0),
+        }
+        segment = coarse_segment(
+            seed,
+            start=float(region["start"]),
+            end=float(region["end"]),
+            origin="ocr_deferred_source_subtitle",
+            text_confidence=float(decision.get("confidence", 0.72)),
+            reason="stable_source_language_subtitle_over_confirmed_speech_region",
+        )
+        segment["asr_retry_candidate_kind"] = region.get("candidate_kind")
+        recovered.append(segment)
+        record.update({"status": "accepted_coarse", "text": text})
+        audit.append(record)
+    return recovered, remaining, audit
+
+
 def run_step_1b_optimized(
     config: Any,
     input_file: str,
@@ -401,11 +473,27 @@ def run_step_1b_optimized(
     })
     enabled = not disable_ocr and config.ocr_enabled and _mode() != "off"
     ocr_texts: Dict[str, str] = {}
+    deferred_regions = [dict(item) for item in state.get("asr_deferred_regions", [])]
+    deferred_frame_texts: Dict[str, List[str]] = {}
     if enabled:
         try:
             client = OCRV211Client(config)
             try:
-                ocr_texts = client.extract_texts(input_file, raw_segments)
+                # OCR is also sampled over confirmed speech regions that ASR
+                # could not safely promote.  These probe records stay internal
+                # and do not alter the frontend segment contract.
+                ocr_inputs = [*raw_segments, *deferred_regions]
+                all_ocr_texts = client.extract_texts(input_file, ocr_inputs)
+                ocr_texts = {
+                    str(segment["id"]): all_ocr_texts.get(str(segment["id"]), "")
+                    for segment in raw_segments
+                }
+                deferred_frame_texts = {
+                    str(region.get("id")): list(
+                        client.frame_texts_by_segment.get(str(region.get("id")), [])
+                    )
+                    for region in deferred_regions
+                }
             finally:
                 client.session.close()
         except Exception as exc:
@@ -424,11 +512,74 @@ def run_step_1b_optimized(
             for segment in raw_segments
         ]
 
+    recovered_segments: List[Dict[str, Any]] = []
+    ocr_recovery_audit: List[Dict[str, Any]] = []
+    remaining_deferred = deferred_regions
+    if enabled and deferred_regions:
+        recovered_segments, remaining_deferred, ocr_recovery_audit = (
+            _recover_deferred_from_ocr(
+                deferred_regions,
+                deferred_frame_texts,
+                str(config.ocr_source_language or state.get("src_lang", "")),
+            )
+        )
+        if recovered_segments:
+            print(
+                f"✅ OCR 延迟救援采纳 {len(recovered_segments)}/"
+                f"{len(deferred_regions)} 个确认语音区间（仅使用粗时间边界）。"
+            )
+        else:
+            print(
+                f"ℹ️ OCR 延迟救援未形成稳定源语言字幕证据；"
+                f"{len(remaining_deferred)} 个区间继续执行原声保底或弱候选审计。"
+            )
+
+    if recovered_segments:
+        from speech_activity import subtract_ranges
+
+        segments = sorted(
+            [*segments, *recovered_segments],
+            key=lambda item: (float(item["start"]), float(item["end"])),
+        )
+        for left, right in zip(segments, segments[1:]):
+            if float(left["end"]) - float(right["start"]) > 0.02:
+                raise RuntimeError(
+                    "OCR 延迟救援内部错误：恢复片段与既有 ASR 片段重叠 "
+                    f"{left.get('id')}->{right.get('id')}"
+                )
+        for index, segment in enumerate(segments):
+            segment["id"] = index
+        recovered_ranges = [
+            (float(item["start"]), float(item["end"]))
+            for item in recovered_segments
+        ]
+        updated_uncovered: List[Dict[str, Any]] = []
+        for region in state.get("asr_uncovered_regions", []):
+            remaining_ranges = subtract_ranges(
+                [(float(region["start"]), float(region["end"]))],
+                recovered_ranges,
+                min_duration=0.08,
+            )
+            for start, end in remaining_ranges:
+                updated_uncovered.append(
+                    dict(region, start=round(start, 3), end=round(end, 3))
+                )
+    else:
+        updated_uncovered = list(state.get("asr_uncovered_regions", []))
+
     state_mgr.delete_keys(downstream_state_keys)
+    combined_recovery_report = [
+        *list(state.get("asr_recovery_report", [])),
+        *[dict(item, stage="ocr_deferred_recovery") for item in ocr_recovery_audit],
+    ]
     state_mgr.save({
         "ocr_texts_by_segment": ocr_texts,
         "segments_ocr_corrected": segments,
         "segments_step1": segments,
+        "asr_deferred_regions": remaining_deferred,
+        "asr_uncovered_regions": updated_uncovered,
+        "asr_ocr_recovery_report": ocr_recovery_audit,
+        "asr_recovery_report": combined_recovery_report,
         "ocr_optimized_manifest": {
             "version": OCR_OPTIMIZED_VERSION,
             "binding": _implementation_binding(main_path),

@@ -276,6 +276,11 @@ def _timestamp_items(segments):
 
     items = []
     for segment_index, segment in enumerate(segments):
+        if segment.get("speaker_boundary_eligible") is False:
+            # Coarse ASR recovery keeps safe outer speech bounds only.  It may
+            # receive a speaker by RTTM overlap later, but must never create a
+            # word-level speaker-change constraint.
+            continue
         transcript = str(segment.get("text", ""))
         raw_items = list(segment.get("qwen3_time_stamps") or [])
         try:

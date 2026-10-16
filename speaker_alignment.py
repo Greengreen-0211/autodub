@@ -485,12 +485,20 @@ def align_segments_with_rttm(
         segment_end = float(segment["end"])
         transcript = str(segment.get("text", ""))
         saved_items = list(segment.get("qwen3_time_stamps") or [])
-        items, alignment = normalize_timestamp_items(
-            saved_items,
-            transcript=transcript,
-            chunk_start=segment_start,
-            chunk_end=segment_end,
-        )
+        if segment.get("speaker_boundary_eligible") is False:
+            items = []
+            alignment = {
+                "status": "coarse",
+                "coverage_ratio": 0.0,
+                "warning_codes": ["coarse_recovery_bounds"],
+            }
+        else:
+            items, alignment = normalize_timestamp_items(
+                saved_items,
+                transcript=transcript,
+                chunk_start=segment_start,
+                chunk_end=segment_end,
+            )
         segment["qwen3_time_stamps"] = items
         segment["timestamp_alignment_status"] = alignment["status"]
         segment["timestamp_coverage_ratio"] = alignment["coverage_ratio"]
@@ -502,7 +510,7 @@ def align_segments_with_rttm(
         segment_changes = [
             item for item in changes if segment_start < float(item["time"]) < segment_end
         ]
-        if not items or status == "unusable":
+        if not items or status in {"unusable", "coarse"}:
             segment["speaker"] = normalize_speaker(fallback)
             if len(overlaps) > 1:
                 segment["speaker_boundary_ambiguous"] = True
