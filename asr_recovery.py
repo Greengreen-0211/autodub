@@ -230,6 +230,9 @@ def build_recovery_groups(
                 "dialogue_evidence": any(
                     bool(item.get("dialogue_evidence")) for item in members
                 ),
+                "acoustic_candidate": any(
+                    bool(item.get("acoustic_candidate")) for item in members
+                ),
                 "acoustic_dialogue_score": max(
                     (float(item.get("acoustic_dialogue_score") or 0.0) for item in members),
                     default=0.0,
@@ -286,6 +289,37 @@ def acoustic_dialogue_score(
             round(float(vocal_delta), 3) if vocal_delta is not None else None
         ),
         "reasons": reasons,
+    }
+
+
+def classify_recovery_evidence(
+    *,
+    acoustic_text_observed: bool,
+    acoustic_score: float,
+    acoustic_candidate_threshold: float = 0.40,
+) -> Dict[str, Any]:
+    """Keep acoustic activity separate from confirmed dialogue evidence.
+
+    Energy, duration, and vocal-stem dominance may identify a region worth
+    auditing, but they cannot prove that translatable dialogue exists. Only
+    observed text may mark the ASR-stage region as confirmed dialogue. OCR can
+    independently upgrade it later when source-language subtitles are seen.
+    """
+    text_evidence = bool(acoustic_text_observed)
+    acoustic_candidate = (
+        not text_evidence
+        and float(acoustic_score) >= float(acoustic_candidate_threshold)
+    )
+    if text_evidence:
+        status = "confirmed_dialogue_text_observed"
+    elif acoustic_candidate:
+        status = "acoustic_candidate_without_text_evidence"
+    else:
+        status = "weak_activity_without_text_evidence"
+    return {
+        "dialogue_evidence": text_evidence,
+        "acoustic_candidate": acoustic_candidate,
+        "evidence_status": status,
     }
 
 

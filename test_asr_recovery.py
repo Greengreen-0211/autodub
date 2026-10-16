@@ -1,19 +1,18 @@
 """Regression tests for evidence-driven dialogue recovery."""
 
-import json
-import os
-import sys
 import unittest
-from unittest.mock import patch
 
 from asr_recovery import (
     acoustic_dialogue_score,
     build_recovery_groups,
+    classify_recovery_evidence,
     choose_consensus_candidate,
     ocr_source_events,
 )
-from ocr_v211_integration import _recover_deferred_from_ocr
-from secondary_asr import SecondaryASR
+from ocr_v211_integration import (
+    _partition_deferred_regions,
+    _recover_deferred_from_ocr,
+)
 
 
 class OCRTimelineTests(unittest.TestCase):
@@ -135,7 +134,7 @@ class OCRTimelineTests(unittest.TestCase):
 
 
 class AcousticConsensusTests(unittest.TestCase):
-    def test_acoustic_score_separates_weak_short_noise_from_probable_dialogue(self):
+    def test_acoustic_score_separates_weak_short_noise_from_auditable_activity(self):
         weak, _ = acoustic_dialogue_score(
             duration=0.4,
             vocal_dbfs=-48.0,
@@ -154,21 +153,48 @@ class AcousticConsensusTests(unittest.TestCase):
         self.assertGreaterEqual(probable, 0.55)
         self.assertIn("vocal_not_buried_in_mix", evidence["reasons"])
 
-    def test_command_secondary_asr_uses_json_protocol_without_shell(self):
-        command = json.dumps(
-            [
-                sys.executable,
-                "-c",
-                "import json; print(json.dumps({'text':'Come on!','language':'en'}))",
-                "{audio}",
-            ]
+    def test_energy_only_never_confirms_dialogue(self):
+        classification = classify_recovery_evidence(
+            acoustic_text_observed=False,
+            acoustic_score=0.60,
+            acoustic_candidate_threshold=0.40,
         )
-        with patch.dict(os.environ, {"ASR_SECONDARY_COMMAND_JSON": command}):
-            backend = SecondaryASR()
-            self.assertTrue(backend.available)
-            result = backend.transcribe("unused.wav")
-        self.assertEqual(result["text"], "Come on!")
-        self.assertEqual(result["language"], "en")
+        self.assertFalse(classification["dialogue_evidence"])
+        self.assertTrue(classification["acoustic_candidate"])
+        self.assertEqual(
+            classification["evidence_status"],
+            "acoustic_candidate_without_text_evidence",
+        )
+
+    def test_observed_asr_text_confirms_dialogue(self):
+        classification = classify_recovery_evidence(
+            acoustic_text_observed=True,
+            acoustic_score=0.10,
+            acoustic_candidate_threshold=0.40,
+        )
+        self.assertTrue(classification["dialogue_evidence"])
+        self.assertFalse(classification["acoustic_candidate"])
+
+    def test_energy_only_region_is_audited_without_blocking(self):
+        regions = [
+            {
+                "id": "recovery-group-0000",
+                "start": 0.05,
+                "end": 5.22,
+                "dialogue_evidence": False,
+                "acoustic_candidate": True,
+                "acoustic_dialogue_score": 0.60,
+                "asr_recovery_status": "unresolved_uncertain",
+            }
+        ]
+        blocking, acoustic, non_dialogue = _partition_deferred_regions(regions)
+        self.assertEqual(blocking, [])
+        self.assertEqual(non_dialogue, [])
+        self.assertEqual(len(acoustic), 1)
+        self.assertEqual(
+            acoustic[0]["asr_recovery_status"],
+            "acoustic_candidate_unconfirmed",
+        )
 
     def test_short_asr_conflict_requires_near_exact_consensus(self):
         candidates = [

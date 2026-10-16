@@ -150,8 +150,8 @@ class DubbingConfig:
         self.asr_require_complete_dialogue = _env_bool(
             "ASR_REQUIRE_COMPLETE_DIALOGUE", True
         )
-        self.asr_dialogue_block_threshold = _env_float(
-            "ASR_DIALOGUE_BLOCK_THRESHOLD", 0.55
+        self.asr_acoustic_candidate_threshold = _env_float(
+            "ASR_ACOUSTIC_CANDIDATE_THRESHOLD", 0.40
         )
         self.asr_recovery_group_gap = _env_float(
             "ASR_RECOVERY_GROUP_GAP", 0.18
@@ -1051,66 +1051,6 @@ class Qwen3ASRProcessor:
                 attempts.append(attempt)
                 validated_candidates.append((segment, normalized, attempt))
 
-        # A genuinely independent recognizer is optional and runs only on the
-        # unresolved core.  It never replaces primary ASR by itself; its text
-        # must agree with Qwen/source OCR through the normal consensus gate.
-        from secondary_asr import SecondaryASR
-
-        secondary = SecondaryASR()
-        if secondary.available:
-            secondary_path = os.path.join(
-                retry_dir, f"retry_{retry_index:04d}_secondary_core.wav"
-            )
-            secondary_clip = AudioSegment.from_wav(audio_path)[core_start_ms:core_end_ms]
-            if len(secondary_clip) > 0 and secondary_clip.max_dBFS != float("-inf"):
-                secondary_clip = effects.normalize(secondary_clip, headroom=1.0)
-            secondary_clip.export(secondary_path, format="wav")
-            result = secondary.transcribe(secondary_path)
-            text = str(result.get("text") or "").strip()
-            attempt = {
-                "source": "secondary",
-                "view": "core_normalized",
-                "candidate_kind": candidate_kind,
-                "start": round(core_start, 3),
-                "end": round(core_end, 3),
-                "text": text,
-                "success": False,
-                "reason": result.get("error") or "awaiting_cross_model_confirmation",
-            }
-            normalized = self._normalized_text(text)
-            if normalized and not (
-                len(normalized) >= 4
-                and any(normalized in known for known in existing_texts if known)
-            ):
-                timestamps = result.get("timestamps")
-                if not isinstance(timestamps, list):
-                    timestamps = []
-                segment = self._build_segment(
-                    segment_id=-1,
-                    start_ms=core_start_ms,
-                    end_ms=core_end_ms,
-                    text=text,
-                    timestamps=timestamps,
-                    origin="coverage_retry_secondary",
-                    timestamp_offset_ms=core_start_ms,
-                )
-                segment["asr_retry_language"] = result.get("language")
-                segment["asr_retry_candidate_kind"] = candidate_kind
-                segment["asr_repair_source"] = "secondary"
-                segment["asr_repair_view"] = "core_normalized"
-                segment["asr_text_confidence"] = 0.5
-                attempt["alignment_status"] = segment.get(
-                    "timestamp_alignment_status", "coarse"
-                )
-                attempts.append(attempt)
-                validated_candidates.append((segment, normalized, attempt))
-            else:
-                if not text:
-                    attempt["reason"] = result.get("error") or "empty_asr_result"
-                else:
-                    attempt["reason"] = "duplicate_existing_text"
-                attempts.append(attempt)
-
         if len(validated_candidates) >= 2:
             from asr_recovery import choose_consensus_candidate
 
@@ -1475,7 +1415,10 @@ class Qwen3ASRProcessor:
                         if source_metric_audio is not None
                         else None
                     )
-                    from asr_recovery import acoustic_dialogue_score
+                    from asr_recovery import (
+                        acoustic_dialogue_score,
+                        classify_recovery_evidence,
+                    )
 
                     dialogue_score, acoustic_evidence = acoustic_dialogue_score(
                         duration=max(0.0, float(target["end"]) - float(target["start"])),
@@ -1486,9 +1429,18 @@ class Qwen3ASRProcessor:
                         acoustic_text_observed=has_acoustic_text,
                         primary_speech_confirmed=True,
                     )
-                    dialogue_evidence = (
-                        has_acoustic_text
-                        or dialogue_score >= self.config.asr_dialogue_block_threshold
+                    evidence_classification = classify_recovery_evidence(
+                        acoustic_text_observed=has_acoustic_text,
+                        acoustic_score=dialogue_score,
+                        acoustic_candidate_threshold=(
+                            self.config.asr_acoustic_candidate_threshold
+                        ),
+                    )
+                    dialogue_evidence = bool(
+                        evidence_classification["dialogue_evidence"]
+                    )
+                    acoustic_candidate = bool(
+                        evidence_classification["acoustic_candidate"]
                     )
                     deferred_confirmed.append(
                         {
@@ -1498,14 +1450,22 @@ class Qwen3ASRProcessor:
                             "asr_recovery_status": "deferred",
                             "preserve_original_vocal": False,
                             "dialogue_evidence": dialogue_evidence,
+                            "acoustic_candidate": acoustic_candidate,
+                            "evidence_status": evidence_classification[
+                                "evidence_status"
+                            ],
                             "acoustic_text_observed": has_acoustic_text,
                             "acoustic_dialogue_score": dialogue_score,
                             "acoustic_evidence": acoustic_evidence,
                             "reason": [
                                 (
-                                    "probable_dialogue_waiting_for_text_recovery"
+                                    "confirmed_dialogue_waiting_for_text_recovery"
                                     if dialogue_evidence
-                                    else "speech_activity_without_dialogue_evidence"
+                                    else (
+                                        "acoustic_candidate_without_text_evidence"
+                                        if acoustic_candidate
+                                        else "weak_activity_without_text_evidence"
+                                    )
                                 )
                             ],
                         }
@@ -3004,7 +2964,8 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
     state_mgr.delete_keys([
         "ocr_texts_by_segment", "segments_ocr_corrected",
         "ocr_optimized_manifest", "asr_ocr_recovery_report",
-        "asr_unresolved_dialogue_regions", "asr_non_dialogue_audited_regions",
+        "asr_unresolved_dialogue_regions", "asr_acoustic_uncertain_regions",
+        "asr_non_dialogue_audited_regions",
         "asr_tts_duration_blocked_ids",
         "segments_step2", "segments_emotion", "segments_audio_analyzed",
         "segments_step3", "segments_scheme3", "segments_json_path", "audio_clips",
@@ -3032,7 +2993,7 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
         "asr_recovery_report": asr.recovery_report,
         "asr_alignment_repair_report": asr.alignment_repair_report,
         "duration": librosa.get_duration(path=source_wav),
-        "pipeline_version": "2.0-asr-coverage-v6",
+        "pipeline_version": "2.0-asr-coverage-v7",
         "qwen3_timestamps_enabled": config.qwen_return_timestamps,
     })
     print("✅ Step 1a 完成。可直接运行 --step 1b 接入 OCR，失败时无需重跑 ASR。")

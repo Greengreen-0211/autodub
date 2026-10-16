@@ -520,6 +520,44 @@ def _recover_deferred_from_ocr(
     return recovered, remaining, audit
 
 
+def _partition_deferred_regions(
+    remaining_deferred: Sequence[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Partition unresolved regions without equating energy with dialogue."""
+    blocking_regions = [
+        dict(item, asr_recovery_status="unresolved_blocking")
+        for item in remaining_deferred
+        if item.get("dialogue_evidence")
+        or item.get("asr_recovery_status") == "unresolved_blocking"
+        or str(item.get("original_text") or "").strip()
+    ]
+    blocking_ids = {str(item.get("id") or "") for item in blocking_regions}
+    acoustic_uncertain = [
+        dict(item, asr_recovery_status="acoustic_candidate_unconfirmed")
+        for item in remaining_deferred
+        if str(item.get("id") or "") not in blocking_ids
+        and not item.get("dialogue_evidence")
+        and (
+            bool(item.get("acoustic_candidate"))
+            or any(
+                bool(member.get("acoustic_candidate"))
+                for member in item.get("members", [])
+                if isinstance(member, dict)
+            )
+        )
+    ]
+    acoustic_ids = {str(item.get("id") or "") for item in acoustic_uncertain}
+    non_dialogue_audited = [
+        dict(item, asr_recovery_status="non_dialogue_audited")
+        for item in remaining_deferred
+        if str(item.get("id") or "") not in blocking_ids
+        and str(item.get("id") or "") not in acoustic_ids
+        and not item.get("dialogue_evidence")
+        and item.get("asr_recovery_status") != "unresolved_blocking"
+    ]
+    return blocking_regions, acoustic_uncertain, non_dialogue_audited
+
+
 def run_step_1b_optimized(
     config: Any,
     input_file: str,
@@ -677,21 +715,9 @@ def run_step_1b_optimized(
         *list(state.get("asr_recovery_report", [])),
         *[dict(item, stage="ocr_deferred_recovery") for item in ocr_recovery_audit],
     ]
-    blocking_regions = [
-        dict(item, asr_recovery_status="unresolved_blocking")
-        for item in remaining_deferred
-        if item.get("dialogue_evidence")
-        or item.get("asr_recovery_status") == "unresolved_blocking"
-        or str(item.get("original_text") or "").strip()
-    ]
-    blocking_ids = {str(item.get("id") or "") for item in blocking_regions}
-    non_dialogue_audited = [
-        dict(item, asr_recovery_status="non_dialogue_audited")
-        for item in remaining_deferred
-        if str(item.get("id") or "") not in blocking_ids
-        and not item.get("dialogue_evidence")
-        and item.get("asr_recovery_status") != "unresolved_blocking"
-    ]
+    blocking_regions, acoustic_uncertain, non_dialogue_audited = (
+        _partition_deferred_regions(remaining_deferred)
+    )
     state_mgr.save({
         "ocr_texts_by_segment": ocr_texts,
         "segments_ocr_corrected": segments,
@@ -701,10 +727,11 @@ def run_step_1b_optimized(
         "asr_ocr_recovery_report": ocr_recovery_audit,
         "asr_recovery_report": combined_recovery_report,
         "asr_unresolved_dialogue_regions": blocking_regions,
+        "asr_acoustic_uncertain_regions": acoustic_uncertain,
         "asr_non_dialogue_audited_regions": non_dialogue_audited,
         "ocr_optimized_manifest": {
             "version": OCR_OPTIMIZED_VERSION,
-            "recovery_version": "grouped-dense-context-v2",
+            "recovery_version": "grouped-dense-context-v3-evidence-split",
             "binding": _implementation_binding(main_path),
             "mode": _mode() if enabled else "off",
             "input_scope": config.ocr_scope,
@@ -725,6 +752,11 @@ def run_step_1b_optimized(
         print(
             f"ℹ️ {len(non_dialogue_audited)} 个区域经多源检查未发现可翻译对白，"
             "已记入 asr_non_dialogue_audited_regions，未生成伪文本。"
+        )
+    if acoustic_uncertain:
+        print(
+            f"ℹ️ {len(acoustic_uncertain)} 个区域只有声学活动、没有任何文字证据，"
+            "已记入 asr_acoustic_uncertain_regions；不会伪造对白，也不会仅凭音量阻断。"
         )
     print("✅ Step 1b 完成。最终 Step 1 文本已保存，可继续运行 --step 2。")
 
