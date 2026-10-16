@@ -121,18 +121,6 @@ def run_cmd(cmd, env=None, cwd=None, stdout_file=None):
         subprocess.run(cmd, env=full_env, cwd=cwd, check=True)
 
 
-def _merge_time_ranges(ranges, *, max_gap_ms):
-    merged = []
-    for start, end in sorted(ranges):
-        if end <= start:
-            continue
-        if merged and start - merged[-1][1] <= max_gap_ms:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return merged
-
-
 def detect_speech_regions(vocal_path):
     """Detect speech-bearing regions independently from the ASR transcript.
 
@@ -140,62 +128,31 @@ def detect_speech_regions(vocal_path):
     sentence boundaries, so merging a short pause cannot merge speaker labels.
     """
     try:
-        import soundfile as sf
+        from speech_activity import detect_speech_regions as shared_detect
 
-        if np is None:
-            raise RuntimeError("numpy 不可用")
-        samples, sample_rate = sf.read(vocal_path, dtype="float32")
-        if samples.ndim > 1:
-            samples = samples.mean(axis=1)
-        if len(samples) <= 0 or sample_rate <= 0:
-            return []
-
-        frame_samples = max(1, round(sample_rate * 0.030))
-        hop_samples = max(1, round(sample_rate * 0.010))
-        starts = np.arange(0, len(samples), hop_samples, dtype=int)
-        rms = np.asarray([
-            math.sqrt(float(np.mean(np.square(samples[start:start + frame_samples]))) + 1e-12)
-            for start in starts
-        ])
-        frame_dbfs = 20.0 * np.log10(np.maximum(rms, 1e-12))
-        reference_rms = math.sqrt(float(np.mean(np.square(samples))) + 1e-12)
-        reference_dbfs = 20.0 * math.log10(max(reference_rms, 1e-12))
-        silence_thresh = max(SAD_FLOOR_DBFS, reference_dbfs - SAD_DB_OFFSET)
-        active = np.flatnonzero(frame_dbfs >= silence_thresh)
-        duration_ms = len(samples) / sample_rate * 1000.0
-        if len(active):
-            raw = []
-            run_start = int(active[0])
-            previous = run_start
-            max_inactive_frames = max(1, round(SAD_MIN_SILENCE_MS / 10.0))
-            for frame_index in map(int, active[1:]):
-                if frame_index - previous > max_inactive_frames:
-                    raw.append([run_start * 10, previous * 10 + 30])
-                    run_start = frame_index
-                previous = frame_index
-            raw.append([run_start * 10, previous * 10 + 30])
-        else:
-            raw = []
-        padded = [
-            [max(0, start - SAD_KEEP_MS), min(duration_ms, end + SAD_KEEP_MS)]
-            for start, end in raw
-        ]
-        merged = _merge_time_ranges(padded, max_gap_ms=SAD_MERGE_GAP_MS)
-        regions = [
-            (start / 1000.0, end / 1000.0)
-            for start, end in merged
-            if end - start >= SAD_MIN_REGION_MS
-        ]
+        regions, diagnostics = shared_detect(
+            vocal_path,
+            min_silence_ms=SAD_MIN_SILENCE_MS,
+            keep_ms=SAD_KEEP_MS,
+            merge_gap_ms=SAD_MERGE_GAP_MS,
+            min_region_ms=SAD_MIN_REGION_MS,
+            db_offset=SAD_DB_OFFSET,
+            floor_dbfs=SAD_FLOOR_DBFS,
+        )
         if regions:
             covered = sum(end - start for start, end in regions)
             print(
                 f"✅ 独立语音活动检测: {len(regions)} 段, "
-                f"覆盖 {covered:.1f}s/{duration_ms / 1000.0:.1f}s, "
-                f"阈值 {silence_thresh:.1f} dBFS"
+                f"覆盖 {covered:.1f}s/{diagnostics['duration']:.1f}s, "
+                f"阈值 {diagnostics['threshold_dbfs']:.1f} dBFS"
             )
             return regions
-        print("⚠️ 独立语音活动检测未找到有效区域，将使用完整人声音轨。")
-        return [(0.0, duration_ms / 1000.0)]
+        print("⚠️ 独立语音活动检测未找到有效区域。")
+        # Preserve the historical WeSpeaker behaviour for silent or unusual
+        # files.  Step 1 coverage auditing intentionally does not use this
+        # fallback because a full-duration false positive would restore noise.
+        duration = float(diagnostics.get("duration", 0.0))
+        return [(0.0, duration)] if duration > 0.0 else []
     except Exception as exc:
         raise RuntimeError(f"无法对人声音轨执行独立语音活动检测: {exc}") from exc
 

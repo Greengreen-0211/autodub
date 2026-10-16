@@ -511,6 +511,14 @@ def align_segments_with_rttm(
                 key: round(value, 3) for key, value in group_overlaps.items()
             }
             result["qwen3_time_stamps"] = items[left:right]
+            group_items = items[left:right]
+            if group_items:
+                result["speech_start"] = round(
+                    max(start, float(group_items[0].get("start", start)) - 0.10), 3
+                )
+                result["speech_end"] = round(
+                    min(end, float(group_items[-1].get("end", end)) + 0.08), 3
+                )
             result["segment_split_reasons"] = sorted(
                 {
                     *( ["sentence_boundary"] if right in sentence_splits else [] ),
@@ -568,6 +576,12 @@ def merge_adjacent_speaker_turns(
                 parent_ids.append(next_parent)
             left["parent_segment_ids"] = parent_ids
             left["end"] = segment["end"]
+            if segment.get("speech_end") is not None:
+                left["speech_end"] = segment["speech_end"]
+            left["alignment_confidence"] = min(
+                float(left.get("alignment_confidence", 0.35)),
+                float(segment.get("alignment_confidence", 0.35)),
+            )
             left["text"] = _join_transcript(left.get("text", ""), segment.get("text", ""))
             left["qwen3_time_stamps"] = list(left.get("qwen3_time_stamps") or []) + list(
                 segment.get("qwen3_time_stamps") or []
