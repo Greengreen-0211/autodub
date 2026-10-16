@@ -52,6 +52,29 @@ def subtract_ranges(
     return result
 
 
+def intersect_ranges(
+    left: Sequence[TimeRange], right: Sequence[TimeRange]
+) -> List[TimeRange]:
+    """Return intersections between two interval collections."""
+    left_ranges = merge_ranges(left)
+    right_ranges = merge_ranges(right)
+    intersections: List[TimeRange] = []
+    left_index = 0
+    right_index = 0
+    while left_index < len(left_ranges) and right_index < len(right_ranges):
+        left_start, left_end = left_ranges[left_index]
+        right_start, right_end = right_ranges[right_index]
+        start = max(left_start, right_start)
+        end = min(left_end, right_end)
+        if end > start:
+            intersections.append((start, end))
+        if left_end <= right_end:
+            left_index += 1
+        else:
+            right_index += 1
+    return intersections
+
+
 def detect_speech_regions(
     audio_path: str,
     *,

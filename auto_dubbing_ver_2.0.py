@@ -4,6 +4,7 @@ AutoDub Pro v2.0 - Qwen3-ASR + HunyuanOCR 辅助纠错版 + 时间戳对齐
 """
 
 import argparse
+import difflib
 import hashlib
 import json
 import os
@@ -119,6 +120,7 @@ class DubbingConfig:
         self.asr_coverage_enabled = _env_bool("ASR_COVERAGE_ENABLED", True)
         self.asr_retry_enabled = _env_bool("ASR_RETRY_ENABLED", True)
         self.asr_retry_source_fallback = _env_bool("ASR_RETRY_SOURCE_FALLBACK", True)
+        self.asr_retry_external_candidates = _env_bool("ASR_RETRY_EXTERNAL_CANDIDATES", True)
         self.asr_coverage_min_region_ms = _env_int("ASR_COVERAGE_MIN_REGION_MS", 280)
         self.asr_coverage_pad_ms = _env_int("ASR_COVERAGE_PAD_MS", 160)
         self.asr_retry_context_ms = _env_int("ASR_RETRY_CONTEXT_MS", 400)
@@ -227,6 +229,7 @@ class Qwen3ASRProcessor:
         self.model = None
         self.coverage_report: Dict[str, Any] = {}
         self.uncovered_regions: List[Dict[str, Any]] = []
+        self.ambiguous_regions: List[Dict[str, Any]] = []
         self.retry_segments: List[Dict[str, Any]] = []
 
     def _torch_dtype(self, dtype_name: Optional[str] = None):
@@ -542,6 +545,7 @@ class Qwen3ASRProcessor:
         core_end: float,
         existing_segments: Sequence[Dict[str, Any]],
         retry_index: int,
+        candidate_kind: str,
     ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         """Retry one uncovered span.  Context is inference-only, never a new boundary."""
         attempts: List[Dict[str, Any]] = []
@@ -564,6 +568,24 @@ class Qwen3ASRProcessor:
             candidates.append(("source", source_audio_path))
 
         existing_texts = [self._normalized_text(str(item.get("text", ""))) for item in existing_segments]
+        if any(
+            min(core_end, float(segment["end"]))
+            - max(core_start, float(segment["start"]))
+            > 0.05
+            for segment in existing_segments
+        ):
+            return None, [
+                {
+                    "source": "none",
+                    "candidate_kind": candidate_kind,
+                    "start": round(core_start, 3),
+                    "end": round(core_end, 3),
+                    "text": "",
+                    "success": False,
+                    "reason": "overlaps_existing_segment",
+                }
+            ]
+        validated_candidates: List[Tuple[Dict[str, Any], str, Dict[str, Any]]] = []
         for source_name, candidate_path in candidates:
             out_path = os.path.join(retry_dir, f"retry_{retry_index:04d}_{source_name}.wav")
             candidate_audio = AudioSegment.from_wav(candidate_path)
@@ -571,6 +593,7 @@ class Qwen3ASRProcessor:
             text, language, timestamps = self._transcribe_paths([out_path])[0]
             attempt = {
                 "source": source_name,
+                "candidate_kind": candidate_kind,
                 "start": round(core_start, 3),
                 "end": round(core_end, 3),
                 "text": text,
@@ -629,9 +652,33 @@ class Qwen3ASRProcessor:
                 timestamp_offset_ms=expanded_start,
             )
             segment["asr_retry_language"] = language
-            attempt.update({"success": True, "text": text})
+            segment["asr_retry_candidate_kind"] = candidate_kind
+            if candidate_kind == "confirmed_empty_primary_chunk":
+                attempt.update({"success": True, "text": text})
+                attempts.append(attempt)
+                return segment, attempts
+
+            # SAD-only regions are weaker evidence and may be music leakage.
+            # Require independent agreement between the separated vocal and
+            # original source before introducing a new sentence.
+            attempt["reason"] = "awaiting_cross_source_confirmation"
+            attempt["text"] = text
             attempts.append(attempt)
-            return segment, attempts
+            validated_candidates.append((segment, normalized, attempt))
+
+        if candidate_kind == "external_sad_candidate" and len(validated_candidates) >= 2:
+            first_segment, first_text, first_attempt = validated_candidates[0]
+            second_segment, second_text, second_attempt = validated_candidates[1]
+            similarity = difflib.SequenceMatcher(None, first_text, second_text).ratio()
+            if similarity >= 0.78:
+                chosen = first_segment if len(first_text) >= len(second_text) else second_segment
+                chosen["asr_origin"] = "coverage_retry_cross_source_consensus"
+                chosen["asr_retry_consensus_similarity"] = round(similarity, 4)
+                first_attempt.update({"success": True, "reason": "cross_source_consensus"})
+                second_attempt.update({"success": True, "reason": "cross_source_consensus"})
+                return chosen, attempts
+            first_attempt["reason"] = "cross_source_disagreement"
+            second_attempt["reason"] = "cross_source_disagreement"
         return None, attempts
 
     def transcribe(
@@ -643,12 +690,23 @@ class Qwen3ASRProcessor:
 
         results = self._transcribe_paths(chunk_paths)
         segments = []
+        successful_primary_ranges: List[Tuple[float, float]] = []
+        failed_primary_ranges: List[Tuple[float, float]] = []
+        all_primary_ranges = [
+            (start_ms / 1000.0, end_ms / 1000.0) for start_ms, end_ms in chunks
+        ]
         language_durations: Dict[str, float] = {}
 
         timestamp_segment_count = 0
         for idx, ((start_ms, end_ms), (text, language, timestamps)) in enumerate(zip(chunks, results)):
             if not text:
+                failed_primary_ranges.append((start_ms / 1000.0, end_ms / 1000.0))
+                print(
+                    f"⚠️ [Qwen3-ASR {idx:03d}] {start_ms / 1000.0:.2f}-"
+                    f"{end_ms / 1000.0:.2f}: 返回空文本，列为确定性漏段候选。"
+                )
                 continue
+            successful_primary_ranges.append((start_ms / 1000.0, end_ms / 1000.0))
             if language:
                 language_durations[language] = language_durations.get(language, 0.0) + max(
                     0.001, (end_ms - start_ms) / 1000.0
@@ -666,7 +724,12 @@ class Qwen3ASRProcessor:
             print(f"[Qwen3-ASR {idx:03d}] {segment['start']:.2f}-{segment['end']:.2f}: {text}")
 
         if self.config.asr_coverage_enabled:
-            from speech_activity import detect_speech_regions, subtract_ranges
+            from speech_activity import (
+                detect_speech_regions,
+                intersect_ranges,
+                merge_ranges,
+                subtract_ranges,
+            )
 
             speech_regions, sad_diagnostics = detect_speech_regions(
                 audio_path,
@@ -677,32 +740,69 @@ class Qwen3ASRProcessor:
                 db_offset=18.0,
                 floor_dbfs=-50.0,
             )
-            covered_before = self._coverage_ranges(
-                segments, self.config.asr_coverage_pad_ms / 1000.0
-            )
-            missing_before = subtract_ranges(
+            external_candidates = subtract_ranges(
                 speech_regions,
-                covered_before,
+                all_primary_ranges,
                 min_duration=self.config.asr_coverage_min_region_ms / 1000.0,
             )
-            bounded_missing: List[Tuple[float, float]] = []
-            for missing_start, missing_end in missing_before:
-                for bounded_start_ms, bounded_end_ms in self._split_long_range(
-                    round(missing_start * 1000.0), round(missing_end * 1000.0)
-                ):
-                    bounded_missing.append(
-                        (bounded_start_ms / 1000.0, bounded_end_ms / 1000.0)
+            internal_gap_candidates: List[Tuple[float, float]] = []
+            for segment in segments:
+                segment_bounds = [(float(segment["start"]), float(segment["end"]))]
+                active_inside = intersect_ranges(speech_regions, segment_bounds)
+                word_coverage = self._coverage_ranges(
+                    [segment], self.config.asr_coverage_pad_ms / 1000.0
+                )
+                internal_gap_candidates.extend(
+                    subtract_ranges(
+                        active_inside,
+                        word_coverage,
+                        min_duration=self.config.asr_coverage_min_region_ms / 1000.0,
                     )
+                )
+
+            retry_candidates: List[Dict[str, Any]] = []
+            candidate_sources = [
+                ("confirmed_empty_primary_chunk", failed_primary_ranges),
+            ]
+            if self.config.asr_retry_external_candidates:
+                candidate_sources.append(("external_sad_candidate", external_candidates))
+            for candidate_kind, candidate_ranges in candidate_sources:
+                for missing_start, missing_end in candidate_ranges:
+                    for bounded_start_ms, bounded_end_ms in self._split_long_range(
+                        round(missing_start * 1000.0), round(missing_end * 1000.0)
+                    ):
+                        retry_candidates.append(
+                            {
+                                "start": bounded_start_ms / 1000.0,
+                                "end": bounded_end_ms / 1000.0,
+                                "candidate_kind": candidate_kind,
+                            }
+                        )
+
+            # Confirmed empty ASR chunks are always ordered before weaker SAD-only
+            # candidates, so a retry cap can never starve the strongest evidence.
+            retry_candidates.sort(
+                key=lambda item: (
+                    0 if item["candidate_kind"] == "confirmed_empty_primary_chunk" else 1,
+                    float(item["start"]),
+                )
+            )
             retry_attempts: List[Dict[str, Any]] = []
             if self.config.asr_retry_enabled:
                 retry_limit = max(0, self.config.asr_max_retry_regions)
-                retry_targets = bounded_missing[:retry_limit] if retry_limit else bounded_missing
-                if len(bounded_missing) > len(retry_targets):
+                retry_targets = (
+                    retry_candidates[:retry_limit] if retry_limit else retry_candidates
+                )
+                if len(retry_candidates) > len(retry_targets):
                     print(
-                        f"⚠️ 疑似 ASR 漏段共 {len(bounded_missing)} 个，本次最多重试 "
-                        f"{len(retry_targets)} 个，其余直接进入原声保底。"
+                        f"⚠️ 漏段候选共 {len(retry_candidates)} 个，本次最多重试 "
+                        f"{len(retry_targets)} 个；未重试的弱候选只记录审计，"
+                        "确定性空块保留原声。"
                     )
-                for retry_index, (missing_start, missing_end) in enumerate(retry_targets):
+                for retry_index, target in enumerate(retry_targets):
+                    missing_start = float(target["start"])
+                    missing_end = float(target["end"])
+                    candidate_kind = str(target["candidate_kind"])
                     retry_segment, attempts = self._retry_region(
                         audio_path,
                         source_audio_path,
@@ -710,16 +810,25 @@ class Qwen3ASRProcessor:
                         missing_end,
                         segments,
                         retry_index,
+                        candidate_kind,
                     )
                     retry_attempts.extend(attempts)
                     if retry_segment is not None:
                         segments.append(retry_segment)
                         print(
-                            f"✅ ASR 漏段重试成功 {missing_start:.3f}-{missing_end:.3f}s: "
+                            f"✅ ASR 漏段重试成功 [{candidate_kind}] "
+                            f"{missing_start:.3f}-{missing_end:.3f}s: "
                             f"{retry_segment['text']}"
                         )
 
             segments.sort(key=lambda item: (float(item["start"]), float(item["end"])))
+            for left, right in zip(segments, segments[1:]):
+                overlap = float(left["end"]) - float(right["start"])
+                if overlap > 0.02:
+                    raise RuntimeError(
+                        "ASR 覆盖恢复内部错误：重试片段与已有片段重叠 "
+                        f"{left.get('id')}->{right.get('id')} ({overlap:.3f}s)"
+                    )
             for new_id, segment in enumerate(segments):
                 segment["id"] = new_id
             self.retry_segments = [
@@ -727,48 +836,114 @@ class Qwen3ASRProcessor:
                 for segment in segments
                 if str(segment.get("asr_origin", "")).startswith("coverage_retry_")
             ]
-            covered_after = self._coverage_ranges(
-                segments, self.config.asr_coverage_pad_ms / 1000.0
+
+            retry_ranges = [
+                (float(segment["start"]), float(segment["end"]))
+                for segment in self.retry_segments
+            ]
+            unresolved_confirmed = subtract_ranges(
+                failed_primary_ranges,
+                retry_ranges,
+                min_duration=0.08,
             )
-            unresolved = subtract_ranges(
-                speech_regions,
-                covered_after,
+            unresolved_external = subtract_ranges(
+                external_candidates,
+                retry_ranges,
                 min_duration=self.config.asr_coverage_min_region_ms / 1000.0,
             )
-            speech_duration = sum(end - start for start, end in speech_regions)
-            unresolved_duration = sum(end - start for start, end in unresolved)
             self.uncovered_regions = [
                 {
                     "start": round(start, 3),
                     "end": round(end, 3),
-                    "confidence": 0.85,
-                    "reason": ["independent_sad_speech", "no_asr_word_coverage"],
+                    "confidence": 0.95,
+                    "reason": ["primary_asr_chunk_empty"],
                     "retry_attempts": sum(
                         1
                         for attempt in retry_attempts
-                        if float(attempt["start"]) < end and float(attempt["end"]) > start
+                        if attempt.get("candidate_kind") == "confirmed_empty_primary_chunk"
+                        and float(attempt["start"]) < end
+                        and float(attempt["end"]) > start
                     ),
                     "preserve_original_vocal": True,
                 }
-                for start, end in unresolved
+                for start, end in unresolved_confirmed
             ]
+            self.ambiguous_regions = [
+                *[
+                    {
+                        "start": round(start, 3),
+                        "end": round(end, 3),
+                        "confidence": 0.45,
+                        "reason": ["independent_sad_outside_asr_chunks"],
+                        "preserve_original_vocal": False,
+                    }
+                    for start, end in unresolved_external
+                ],
+                *[
+                    {
+                        "start": round(start, 3),
+                        "end": round(end, 3),
+                        "confidence": 0.25,
+                        "reason": ["word_timestamp_gap_inside_recognized_segment"],
+                        "preserve_original_vocal": False,
+                    }
+                    for start, end in merge_ranges(internal_gap_candidates)
+                ],
+            ]
+
+            attempted_duration = sum(end - start for start, end in all_primary_ranges)
+            confirmed_missing_duration = sum(
+                end - start for start, end in unresolved_confirmed
+            )
+            raw_word_ranges = [
+                (float(item["start"]), float(item["end"]))
+                for segment in segments
+                if segment.get("asr_origin") == "primary"
+                for item in (segment.get("qwen3_time_stamps") or [])
+                if float(item.get("end", 0.0)) > float(item.get("start", 0.0))
+            ]
+            word_aligned_duration = sum(
+                end - start for start, end in merge_ranges(raw_word_ranges)
+            )
+            successful_primary_duration = sum(
+                end - start for start, end in successful_primary_ranges
+            )
+            chunk_coverage_ratio = (
+                1.0 - confirmed_missing_duration / attempted_duration
+                if attempted_duration > 0
+                else 1.0
+            )
+            word_alignment_ratio = (
+                min(1.0, word_aligned_duration / successful_primary_duration)
+                if successful_primary_duration > 0
+                else 0.0
+            )
             self.coverage_report = {
-                "detector": "adaptive_energy_v1",
+                "detector": "adaptive_energy_v2",
                 "detector_diagnostics": sad_diagnostics,
-                "speech_region_count": len(speech_regions),
-                "speech_duration": round(speech_duration, 3),
-                "covered_duration": round(max(0.0, speech_duration - unresolved_duration), 3),
-                "uncovered_duration": round(unresolved_duration, 3),
-                "coverage_ratio": round(
-                    1.0 - unresolved_duration / speech_duration, 4
-                ) if speech_duration > 0 else 1.0,
+                "primary_chunk_count": len(all_primary_ranges),
+                "primary_success_count": len(successful_primary_ranges),
+                "primary_empty_count": len(failed_primary_ranges),
+                "chunk_coverage_ratio": round(chunk_coverage_ratio, 4),
+                "coverage_ratio": round(chunk_coverage_ratio, 4),
+                "word_alignment_ratio": round(word_alignment_ratio, 4),
+                "confirmed_missing_duration": round(confirmed_missing_duration, 3),
+                "uncovered_duration": round(confirmed_missing_duration, 3),
+                "external_ambiguous_duration": round(
+                    sum(end - start for start, end in unresolved_external), 3
+                ),
+                "internal_gap_ambiguous_duration": round(
+                    sum(end - start for start, end in merge_ranges(internal_gap_candidates)), 3
+                ),
                 "retry_attempts": retry_attempts,
                 "retry_success_count": len(self.retry_segments),
             }
             print(
-                f"🔎 ASR 语音覆盖: {self.coverage_report['coverage_ratio']:.1%}; "
+                f"🔎 ASR 音频块覆盖: {chunk_coverage_ratio:.1%}; "
+                f"空结果块 {len(failed_primary_ranges)} 个; "
                 f"重试补回 {len(self.retry_segments)} 段; "
-                f"待原声保底 {len(self.uncovered_regions)} 段。"
+                f"待原声保底 {len(self.uncovered_regions)} 段; "
+                f"仅审计弱候选 {len(self.ambiguous_regions)} 段。"
             )
         elif not segments:
             # Explicit opt-out keeps the historical behaviour for deployments
@@ -779,6 +954,9 @@ class Qwen3ASRProcessor:
             )
 
         if self.config.qwen_return_timestamps:
+            timestamp_segment_count = sum(
+                1 for segment in segments if segment.get("qwen3_time_stamps")
+            )
             print(
                 f"Qwen3 时间戳覆盖: {timestamp_segment_count}/{len(segments)} 个 ASR 片段"
             )
@@ -2134,8 +2312,9 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
         "asr_coverage_report": asr.coverage_report,
         "asr_retry_segments": asr.retry_segments,
         "asr_uncovered_regions": asr.uncovered_regions,
+        "asr_ambiguous_regions": asr.ambiguous_regions,
         "duration": librosa.get_duration(path=source_wav),
-        "pipeline_version": "2.0-asr-coverage-v1",
+        "pipeline_version": "2.0-asr-coverage-v2",
         "qwen3_timestamps_enabled": config.qwen_return_timestamps,
     })
     print("✅ Step 1a 完成。可直接运行 --step 1b 接入 OCR，失败时无需重跑 ASR。")
