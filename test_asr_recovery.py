@@ -10,12 +10,62 @@ from asr_recovery import (
     ocr_source_events,
 )
 from ocr_v211_integration import (
+    _load_initial_recovery_state,
     _partition_deferred_regions,
     _recover_deferred_from_ocr,
 )
 
 
 class OCRTimelineTests(unittest.TestCase):
+    def test_step1b_rerun_uses_immutable_initial_inventory(self):
+        state = {
+            "asr_deferred_regions_initial": [
+                {"id": "original", "start": 40.0, "end": 43.0}
+            ],
+            "asr_deferred_regions": [],
+            "asr_deferred_regions_remaining": [],
+            "asr_uncovered_regions_initial": [
+                {"start": 40.0, "end": 43.0}
+            ],
+            "asr_uncovered_regions": [],
+            "asr_uncovered_regions_remaining": [],
+            "asr_recovery_report_initial": [{"status": "step1a"}],
+            "asr_recovery_report": [{"status": "mutated"}],
+            "ocr_optimized_manifest": {"version": "already-ran"},
+        }
+        deferred, uncovered, report = _load_initial_recovery_state(state)
+        self.assertEqual([item["id"] for item in deferred], ["original"])
+        self.assertEqual(uncovered, [{"start": 40.0, "end": 43.0}])
+        self.assertEqual(report, [{"status": "step1a"}])
+
+        # Callers may mutate a run-local copy without changing the checkpoint.
+        deferred.clear()
+        self.assertEqual(state["asr_deferred_regions_initial"][0]["id"], "original")
+
+    def test_unprocessed_legacy_checkpoint_can_seed_initial_inventory(self):
+        deferred, uncovered, report = _load_initial_recovery_state(
+            {
+                "asr_deferred_regions": [{"id": "legacy"}],
+                "asr_uncovered_regions": [{"start": 1.0, "end": 2.0}],
+                "asr_recovery_report": [{"status": "legacy-step1a"}],
+            }
+        )
+        self.assertEqual(deferred, [{"id": "legacy"}])
+        self.assertEqual(uncovered, [{"start": 1.0, "end": 2.0}])
+        self.assertEqual(report, [{"status": "legacy-step1a"}])
+
+    def test_processed_legacy_checkpoint_fails_instead_of_losing_dialogue(self):
+        with self.assertRaisesRegex(RuntimeError, "重新运行 --step 1a"):
+            _load_initial_recovery_state(
+                {
+                    "asr_deferred_regions": [],
+                    "asr_uncovered_regions": [],
+                    "asr_recovery_report": [],
+                    "ocr_optimized_manifest": {"version": "legacy-step1b"},
+                    "segments_ocr_corrected": [{"id": 0, "text": "hello"}],
+                }
+            )
+
     def test_adjacent_regions_group_for_inference_but_keep_members(self):
         groups = build_recovery_groups(
             [

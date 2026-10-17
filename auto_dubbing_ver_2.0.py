@@ -3371,6 +3371,9 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
     state_mgr.delete_keys([
         "ocr_texts_by_segment", "segments_ocr_corrected",
         "ocr_optimized_manifest", "asr_ocr_recovery_report",
+        "asr_deferred_regions_initial", "asr_deferred_regions_remaining",
+        "asr_uncovered_regions_initial", "asr_uncovered_regions_remaining",
+        "asr_recovery_report_initial",
         "asr_unresolved_dialogue_regions", "asr_acoustic_uncertain_regions",
         "asr_non_dialogue_audited_regions",
         "asr_tts_duration_blocked_ids",
@@ -3395,12 +3398,17 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
         "asr_coverage_report": asr.coverage_report,
         "asr_retry_segments": asr.retry_segments,
         "asr_uncovered_regions": asr.uncovered_regions,
+        "asr_uncovered_regions_initial": asr.uncovered_regions,
+        "asr_uncovered_regions_remaining": asr.uncovered_regions,
         "asr_ambiguous_regions": asr.ambiguous_regions,
         "asr_deferred_regions": asr.deferred_regions,
+        "asr_deferred_regions_initial": asr.deferred_regions,
+        "asr_deferred_regions_remaining": asr.deferred_regions,
         "asr_recovery_report": asr.recovery_report,
+        "asr_recovery_report_initial": asr.recovery_report,
         "asr_alignment_repair_report": asr.alignment_repair_report,
         "duration": librosa.get_duration(path=source_wav),
-        "pipeline_version": "2.0-asr-coverage-v7",
+        "pipeline_version": "2.0-asr-coverage-v8-idempotent-step1b",
         "qwen3_timestamps_enabled": config.qwen_return_timestamps,
     })
     print("✅ Step 1a 完成。可直接运行 --step 1b 接入 OCR，失败时无需重跑 ASR。")

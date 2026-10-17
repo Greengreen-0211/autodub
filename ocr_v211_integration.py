@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Type
 from urllib.parse import urlsplit, urlunsplit
@@ -574,6 +575,47 @@ def _partition_deferred_regions(
     return blocking_regions, acoustic_uncertain, non_dialogue_audited
 
 
+def _load_initial_recovery_state(
+    state: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return immutable Step 1a recovery inputs for every Step 1b run.
+
+    Older checkpoints used ``asr_deferred_regions`` and
+    ``asr_uncovered_regions`` for both the original Step 1a inventory and the
+    remaining Step 1b output.  Once Step 1b had run, those fields were lossy and
+    could not safely be used to reproduce previously recovered dialogue.
+    """
+    initial_deferred = state.get("asr_deferred_regions_initial")
+    initial_uncovered = state.get("asr_uncovered_regions_initial")
+    initial_report = state.get("asr_recovery_report_initial")
+    if (
+        initial_deferred is not None
+        and initial_uncovered is not None
+        and initial_report is not None
+    ):
+        return (
+            deepcopy(list(initial_deferred)),
+            deepcopy(list(initial_uncovered)),
+            deepcopy(list(initial_report)),
+        )
+
+    # A legacy checkpoint is safe only before its first Step 1b run.  If an OCR
+    # manifest already exists, the legacy fields may already contain only the
+    # remainder.  Failing explicitly prevents a silent 9 -> 6 segment rollback.
+    if state.get("ocr_optimized_manifest") or "segments_ocr_corrected" in state:
+        raise RuntimeError(
+            "当前项目状态由旧版 Step 1b 写入，原始 ASR 恢复清单已经无法可靠重建。"
+            "请先使用当前代码重新运行 --step 1a，再运行 --step 1b；"
+            "不要继续使用可能缺句的旧检查点。"
+        )
+
+    return (
+        deepcopy(list(state.get("asr_deferred_regions", []))),
+        deepcopy(list(state.get("asr_uncovered_regions", []))),
+        deepcopy(list(state.get("asr_recovery_report", []))),
+    )
+
+
 def run_step_1b_optimized(
     config: Any,
     input_file: str,
@@ -610,7 +652,11 @@ def run_step_1b_optimized(
     })
     enabled = not disable_ocr and config.ocr_enabled and _mode() != "off"
     ocr_texts: Dict[str, str] = {}
-    deferred_regions = [dict(item) for item in state.get("asr_deferred_regions", [])]
+    (
+        deferred_regions,
+        initial_uncovered_regions,
+        initial_recovery_report,
+    ) = _load_initial_recovery_state(state)
     from asr_recovery import build_recovery_groups
 
     recovery_groups = build_recovery_groups(
@@ -713,7 +759,7 @@ def run_step_1b_optimized(
             }
         )
         updated_uncovered: List[Dict[str, Any]] = []
-        for region in state.get("asr_uncovered_regions", []):
+        for region in initial_uncovered_regions:
             remaining_ranges = subtract_ranges(
                 [(float(region["start"]), float(region["end"]))],
                 recovered_ranges,
@@ -724,11 +770,11 @@ def run_step_1b_optimized(
                     dict(region, start=round(start, 3), end=round(end, 3))
                 )
     else:
-        updated_uncovered = list(state.get("asr_uncovered_regions", []))
+        updated_uncovered = deepcopy(initial_uncovered_regions)
 
     state_mgr.delete_keys(downstream_state_keys)
     combined_recovery_report = [
-        *list(state.get("asr_recovery_report", [])),
+        *deepcopy(initial_recovery_report),
         *[dict(item, stage="ocr_deferred_recovery") for item in ocr_recovery_audit],
     ]
     blocking_regions, acoustic_uncertain, non_dialogue_audited = (
@@ -738,8 +784,15 @@ def run_step_1b_optimized(
         "ocr_texts_by_segment": ocr_texts,
         "segments_ocr_corrected": segments,
         "segments_step1": segments,
+        "asr_deferred_regions_initial": deepcopy(deferred_regions),
+        "asr_deferred_regions_remaining": remaining_deferred,
+        # Compatibility alias for older diagnostics.  Step 1b never reads this
+        # mutable remainder again; it always reads the immutable initial field.
         "asr_deferred_regions": remaining_deferred,
+        "asr_uncovered_regions_initial": deepcopy(initial_uncovered_regions),
+        "asr_uncovered_regions_remaining": updated_uncovered,
         "asr_uncovered_regions": updated_uncovered,
+        "asr_recovery_report_initial": deepcopy(initial_recovery_report),
         "asr_ocr_recovery_report": ocr_recovery_audit,
         "asr_recovery_report": combined_recovery_report,
         "asr_unresolved_dialogue_regions": blocking_regions,
@@ -747,7 +800,7 @@ def run_step_1b_optimized(
         "asr_non_dialogue_audited_regions": non_dialogue_audited,
         "ocr_optimized_manifest": {
             "version": OCR_OPTIMIZED_VERSION,
-            "recovery_version": "grouped-dense-context-v3-evidence-split",
+            "recovery_version": "grouped-dense-context-v4-idempotent",
             "binding": _implementation_binding(main_path),
             "mode": _mode() if enabled else "off",
             "input_scope": config.ocr_scope,
