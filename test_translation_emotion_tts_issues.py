@@ -14,7 +14,12 @@ import unittest
 from unittest.mock import patch
 import wave
 
-from translation_quality import translate_segments, require_translated, validate_target_text
+from translation_quality import (
+    prepare_tts_punctuation,
+    translate_segments,
+    require_translated,
+    validate_target_text,
+)
 from light_tts_selector import LightTTSSelector, EspeakBackend
 from emotion_recognizer import apply_emotion_reliability
 from scheme3_policy import build_scheme3_segments, describe_scheme3_decision
@@ -42,6 +47,85 @@ def translation(sid, tiny=False):
 
 
 class TranslationTests(unittest.TestCase):
+    def test_multi_sentence_comma_chain_restores_strong_boundaries(self):
+        source_text = (
+            "I just can't. The sky's awake, so I'm awake. "
+            "So we have to play."
+        )
+        target_text = "我睡不着，天还没睡我也睡不着，我们来玩游戏吧。"
+        restored, ready, reason = prepare_tts_punctuation(
+            target_text, source_text, "zh"
+        )
+        self.assertTrue(ready)
+        self.assertEqual(
+            restored,
+            "我睡不着。天还没睡我也睡不着。我们来玩游戏吧。",
+        )
+        self.assertEqual(reason, "deterministic_source_boundaries")
+
+    def test_punctuation_restoration_never_changes_words(self):
+        text = "来点魔法，来点魔法"
+        restored, ready, _ = prepare_tts_punctuation(
+            text, "Do the magic! Do the magic!", "zh"
+        )
+        self.assertTrue(ready)
+        self.assertEqual(restored, "来点魔法！来点魔法！")
+
+    def test_truncated_source_keeps_all_known_sentence_boundaries(self):
+        restored, ready, _ = prepare_tts_punctuation(
+            "来点魔法，来点魔法，来点",
+            "Do the magic! Do the magic! Do the",
+            "zh",
+        )
+        self.assertTrue(ready)
+        self.assertEqual(restored, "来点魔法！来点魔法！来点。")
+
+    def test_source_abbreviation_is_not_treated_as_sentence_boundary(self):
+        restored, ready, reason = prepare_tts_punctuation(
+            "史密斯博士来了", "Dr. Smith is here.", "zh"
+        )
+        self.assertTrue(ready)
+        self.assertEqual(restored, "史密斯博士来了。")
+        self.assertEqual(reason, "deterministic_terminal")
+
+    def test_missing_boundary_evidence_fails_closed(self):
+        restored, ready, reason = prepare_tts_punctuation(
+            "我睡不着天还没睡我们来玩", "I can't. The sky is awake. We play.", "zh"
+        )
+        self.assertFalse(ready)
+        self.assertEqual(restored, "我睡不着天还没睡我们来玩")
+        self.assertEqual(reason, "missing_strong_boundary_evidence")
+
+    def test_translation_candidates_are_punctuated_before_light_tts(self):
+        source_segment = source(
+            text=(
+                "I just can't. The sky's awake, so I'm awake. "
+                "So we have to play."
+            )
+        )
+
+        def request(_items):
+            return {"translations": [{
+                "id": "0",
+                "text": "我睡不着，天还没睡我也睡不着，我们来玩游戏吧。",
+                "translations_candidates": [
+                    {"text": "我睡不着，天还没睡我也睡不着，我们来玩游戏吧。"},
+                    {"text": "我实在睡不着，天空还醒着我也醒着，我们必须玩。"},
+                ],
+            }]}
+
+        rows = translate_segments(
+            [source_segment], "en", "zh", "test", request, retries=0
+        )
+        self.assertEqual(
+            rows[0]["text"],
+            "我睡不着。天还没睡我也睡不着。我们来玩游戏吧。",
+        )
+        self.assertTrue(all(
+            candidate["text"].count("。") >= 3
+            for candidate in rows[0]["translations_candidates"]
+        ))
+
     def test_partial_batch_kept_only_failed_retried(self):
         calls=[]; checkpoints=[]
         def request(items):

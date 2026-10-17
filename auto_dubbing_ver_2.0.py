@@ -3231,7 +3231,7 @@ def _translation_candidates_fingerprint(
     config: DubbingConfig,
 ) -> str:
     payload = {
-        "version": "translation-v2.12.0:target-script-v2:neutral-dubbing-ocr-v12:glossary-v1",
+        "version": "translation-v2.12.1:target-script-v2:neutral-dubbing-ocr-v12:glossary-v1",
         "source_language": src_lang,
         "target_language": target_lang,
         "model": config.model_name,

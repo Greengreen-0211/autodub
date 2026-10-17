@@ -45,6 +45,15 @@ MODEL_ENVS = {
 MODEL_ORDER = ("f5tts", "indextts2", "cosyvoice3", "confucius4", "omnivoice")
 
 
+def _is_precise_reference_segment(segment: Dict[str, Any]) -> bool:
+    """Whether a segment has audio/text alignment safe for voice reference."""
+    return not (
+        str(segment.get("timestamp_precision", "")).lower() == "coarse"
+        or str(segment.get("asr_recovery_status", "")).lower()
+        == "accepted_coarse"
+    )
+
+
 def _language_code(language: Any) -> str:
     value = str(language or "").strip().lower().replace("_", "-")
     aliases = {"chinese": "zh", "mandarin": "zh", "english": "en"}
@@ -304,6 +313,13 @@ class TTSRouter:
             for index, segment in enumerate(segments):
                 if str(segment.get("speaker", "SPEAKER_00")) != speaker:
                     continue
+                # Coarse ASR recovery provides only an outer dialogue window.
+                # Its audio may contain additional words, pauses, or another
+                # turn that are absent from the recovered transcript.  Such a
+                # clip is valid for dubbing, but unsafe as paired reference
+                # audio/text for a voice-cloning model.
+                if not _is_precise_reference_segment(segment):
+                    continue
                 start = max(0, int(round(float(segment["start"]) * 1000)))
                 end = min(len(full_audio), int(round(float(segment["end"]) * 1000)))
                 clip = full_audio[start:end]
@@ -311,7 +327,10 @@ class TTSRouter:
                     continue
                 candidates.append((self._reference_score(segment, clip), index, segment, clip))
             if not candidates:
-                raise RuntimeError(f"{speaker} 没有可用参考音频")
+                raise RuntimeError(
+                    f"{speaker} 没有可用的精确边界参考音频；"
+                    "粗边界恢复句不会用于声纹参考"
+                )
             candidates.sort(key=lambda item: (item[0], len(item[3])), reverse=True)
             chosen = []
             total_ms = 0
