@@ -17,6 +17,13 @@ from collections import Counter
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
+_WORD_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", flags=re.UNICODE)
+_TERMINATED_CLAUSE_RE = re.compile(
+    r"([^.!?。！？]+?)([.!?。！？]+)(?=\s|$)",
+    flags=re.UNICODE,
+)
+
+
 def normalize_text(text: str) -> str:
     return "".join(
         char
@@ -77,6 +84,144 @@ def coarse_segment(
         }
     )
     return result
+
+
+def _word_tokens_with_spans(text: str) -> List[Tuple[str, int, int]]:
+    return [
+        (match.group(0).casefold(), match.start(), match.end())
+        for match in _WORD_TOKEN_RE.finditer(str(text or ""))
+    ]
+
+
+def _repair_repeated_clause_boundary(
+    left_text: str,
+    right_text: str,
+) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+    """Move a repeated clause suffix across one broken coarse boundary.
+
+    Recovery/OCR timelines can split ``Do the magic! Do the`` immediately
+    before ``magic Ready?``.  This helper is deliberately evidence-bound: the
+    unfinished left fragment must be an exact prefix of the preceding complete
+    clause, and the right side must begin with the exact missing suffix.  It
+    therefore repairs repeated dialogue without asking a language model to
+    invent, delete, or paraphrase words.
+    """
+    left_text = str(left_text or "").strip()
+    right_text = str(right_text or "").strip()
+    completed = list(_TERMINATED_CLAUSE_RE.finditer(left_text))
+    if not completed or not right_text:
+        return None
+    previous = completed[-1]
+    trailing_text = left_text[previous.end() :].strip()
+    if not trailing_text:
+        return None
+
+    clause_tokens = _word_tokens_with_spans(previous.group(1))
+    trailing_tokens = _word_tokens_with_spans(trailing_text)
+    right_tokens = _word_tokens_with_spans(right_text)
+    if not clause_tokens or not trailing_tokens or not right_tokens:
+        return None
+    clause_words = [item[0] for item in clause_tokens]
+    trailing_words = [item[0] for item in trailing_tokens]
+    if (
+        len(trailing_words) >= len(clause_words)
+        or clause_words[: len(trailing_words)] != trailing_words
+    ):
+        return None
+    missing_words = clause_words[len(trailing_words) :]
+    if [item[0] for item in right_tokens[: len(missing_words)]] != missing_words:
+        return None
+
+    suffix_end = right_tokens[len(missing_words) - 1][2]
+    suffix_text = right_text[:suffix_end].strip()
+    remaining = right_text[suffix_end:]
+    punctuation_match = re.match(r"^([.!?。！？]+)", remaining)
+    if punctuation_match:
+        punctuation = punctuation_match.group(1)
+        suffix_text += punctuation
+        remaining = remaining[punctuation_match.end() :]
+    else:
+        punctuation = previous.group(2)
+        suffix_text += punctuation
+    remaining = remaining.lstrip()
+    # Do not erase a segment.  A fully consumed right side needs a higher-level
+    # timing merge rather than a text-only boundary repair.
+    if not remaining:
+        return None
+
+    repaired_left = f"{left_text.rstrip()} {suffix_text}".strip()
+    before_tokens = [
+        item[0]
+        for item in _word_tokens_with_spans(f"{left_text} {right_text}")
+    ]
+    after_tokens = [
+        item[0]
+        for item in _word_tokens_with_spans(f"{repaired_left} {remaining}")
+    ]
+    if before_tokens != after_tokens:
+        raise RuntimeError("coarse boundary repair changed dialogue token order")
+    return repaired_left, remaining, {
+        "reason": "repeated_clause_prefix_completed_from_right",
+        "moved_tokens": missing_words,
+        "reference_clause": previous.group(0).strip(),
+        "punctuation": punctuation,
+    }
+
+
+def reconcile_coarse_recovery_boundaries(
+    segments: Sequence[Mapping[str, Any]],
+    *,
+    max_gap: float = 0.12,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Repair provably broken text boundaries between adjacent coarse turns.
+
+    Timing is intentionally left untouched.  Speaker clustering and subtitle
+    timing may refine it later, while translation immediately benefits from
+    complete clauses.  All edits are audited and preserve the exact token
+    sequence across the pair.
+    """
+    repaired = [dict(item) for item in segments]
+    audit: List[Dict[str, Any]] = []
+    for index in range(len(repaired) - 1):
+        left, right = repaired[index], repaired[index + 1]
+        if (
+            left.get("timestamp_precision") != "coarse"
+            or right.get("timestamp_precision") != "coarse"
+            or left.get("asr_recovery_status") != "accepted_coarse"
+            or right.get("asr_recovery_status") != "accepted_coarse"
+        ):
+            continue
+        gap = float(right.get("start", 0.0)) - float(left.get("end", 0.0))
+        if gap < -0.02 or gap > float(max_gap):
+            continue
+        result = _repair_repeated_clause_boundary(
+            str(left.get("text") or ""),
+            str(right.get("text") or ""),
+        )
+        if result is None:
+            continue
+        left_text, right_text, evidence = result
+        before_left, before_right = left.get("text", ""), right.get("text", "")
+        left["text"], right["text"] = left_text, right_text
+        # Coarse recovery must never regain authority from stale word stamps.
+        left["qwen3_time_stamps"] = []
+        right["qwen3_time_stamps"] = []
+        left["qwen3_sentence_candidates"] = []
+        right["qwen3_sentence_candidates"] = []
+        for item in (left, right):
+            item["boundary_text_repaired"] = True
+            item["boundary_text_repair_reason"] = evidence["reason"]
+        audit.append({
+            "left_index": index,
+            "right_index": index + 1,
+            "left_before": before_left,
+            "right_before": before_right,
+            "left_after": left_text,
+            "right_after": right_text,
+            "gap": round(gap, 4),
+            **evidence,
+        })
+    return repaired, audit
 
 
 def choose_consensus_candidate(

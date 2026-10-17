@@ -772,6 +772,21 @@ def run_step_1b_optimized(
     else:
         updated_uncovered = deepcopy(initial_uncovered_regions)
 
+    # Coarse segments can originate from OCR events or from independent Qwen
+    # views agreeing on text without safe alignment.  Reconcile both sources;
+    # the helper only edits a boundary when exact repeated-clause evidence
+    # proves which existing token belongs on the left.
+    from asr_recovery import reconcile_coarse_recovery_boundaries
+
+    segments, boundary_repair_audit = reconcile_coarse_recovery_boundaries(
+        segments
+    )
+    if boundary_repair_audit:
+        print(
+            f"✅ 恢复句边界校正: 修复 {len(boundary_repair_audit)} 个"
+            "被重复短语截断的相邻边界。"
+        )
+
     state_mgr.delete_keys(downstream_state_keys)
     combined_recovery_report = [
         *deepcopy(initial_recovery_report),
@@ -794,13 +809,14 @@ def run_step_1b_optimized(
         "asr_uncovered_regions": updated_uncovered,
         "asr_recovery_report_initial": deepcopy(initial_recovery_report),
         "asr_ocr_recovery_report": ocr_recovery_audit,
+        "asr_boundary_repair_report": boundary_repair_audit,
         "asr_recovery_report": combined_recovery_report,
         "asr_unresolved_dialogue_regions": blocking_regions,
         "asr_acoustic_uncertain_regions": acoustic_uncertain,
         "asr_non_dialogue_audited_regions": non_dialogue_audited,
         "ocr_optimized_manifest": {
             "version": OCR_OPTIMIZED_VERSION,
-            "recovery_version": "grouped-dense-context-v4-idempotent",
+            "recovery_version": "grouped-dense-context-v5-boundary-reconcile",
             "binding": _implementation_binding(main_path),
             "mode": _mode() if enabled else "off",
             "input_scope": config.ocr_scope,

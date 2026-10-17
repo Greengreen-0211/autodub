@@ -1,6 +1,9 @@
 """Regression tests for evidence-driven dialogue recovery."""
 
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
 from asr_recovery import (
     acoustic_dialogue_score,
@@ -8,7 +11,14 @@ from asr_recovery import (
     classify_recovery_evidence,
     choose_consensus_candidate,
     ocr_source_events,
+    reconcile_coarse_recovery_boundaries,
 )
+from light_tts_selector import (
+    LightTTSSelector,
+    classify_coarse_recovery_duration,
+)
+from ocr_translation_reference import prepare_ocr_translation_references
+from run_step2_wespeaker import invalidate_downstream_state
 from ocr_v211_integration import (
     _load_initial_recovery_state,
     _partition_deferred_regions,
@@ -17,6 +27,153 @@ from ocr_v211_integration import (
 
 
 class OCRTimelineTests(unittest.TestCase):
+    def test_repeated_clause_boundary_moves_only_missing_suffix(self):
+        segments = [
+            {
+                "id": 7,
+                "start": 43.03,
+                "end": 48.03,
+                "text": "Do the magic! Do the magic! Do the",
+                "timestamp_precision": "coarse",
+                "asr_recovery_status": "accepted_coarse",
+                "qwen3_time_stamps": [{"text": "stale", "start": 47.5, "end": 48.0}],
+            },
+            {
+                "id": 8,
+                "start": 48.03,
+                "end": 59.52,
+                "text": "magic Ready? Uhhm... This is amazing!",
+                "timestamp_precision": "coarse",
+                "asr_recovery_status": "accepted_coarse",
+                "qwen3_time_stamps": [{"text": "stale", "start": 48.0, "end": 48.5}],
+            },
+        ]
+        repaired, audit = reconcile_coarse_recovery_boundaries(segments)
+        self.assertEqual(
+            repaired[0]["text"],
+            "Do the magic! Do the magic! Do the magic!",
+        )
+        self.assertEqual(repaired[1]["text"], "Ready? Uhhm... This is amazing!")
+        self.assertEqual(repaired[0]["qwen3_time_stamps"], [])
+        self.assertEqual(repaired[1]["qwen3_time_stamps"], [])
+        self.assertEqual(audit[0]["moved_tokens"], ["magic"])
+        self.assertEqual(segments[0]["text"], "Do the magic! Do the magic! Do the")
+        rerun, rerun_audit = reconcile_coarse_recovery_boundaries(repaired)
+        self.assertEqual(rerun, repaired)
+        self.assertEqual(rerun_audit, [])
+
+    def test_non_repeated_fragment_is_not_guessed(self):
+        segments = [
+            {
+                "start": 1.0,
+                "end": 2.0,
+                "text": "We should go to",
+                "timestamp_precision": "coarse",
+                "asr_recovery_status": "accepted_coarse",
+                "ocr_recovered": True,
+            },
+            {
+                "start": 2.0,
+                "end": 3.0,
+                "text": "school now.",
+                "timestamp_precision": "coarse",
+                "asr_recovery_status": "accepted_coarse",
+                "ocr_recovered": True,
+            },
+        ]
+        repaired, audit = reconcile_coarse_recovery_boundaries(segments)
+        self.assertEqual([item["text"] for item in repaired], [
+            "We should go to", "school now.",
+        ])
+        self.assertEqual(audit, [])
+
+    def test_repaired_complete_source_can_select_exact_bilingual_ocr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory) / "ocr_optimized"
+            cache_dir.mkdir(parents=True)
+            frame_text = (
+                "<ref>Do the magic! Do the magic!</ref>\n"
+                "<ref>来点魔法！来点魔法！</ref>"
+            )
+            (cache_dir / "ocr_frames.json").write_text(
+                json.dumps({
+                    "a": {"status": "ok", "timestamp": 43.5, "segment_id": "7", "text": frame_text},
+                    "b": {"status": "ok", "timestamp": 44.0, "segment_id": "7", "text": frame_text},
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result = prepare_ocr_translation_references(
+                directory,
+                [{"id": 7, "start": 43.0, "end": 48.0,
+                  "text": "Do the magic! Do the magic!"}],
+                "en",
+                "zh",
+            )
+            reference = result["references_by_segment"]["7"][0]
+            self.assertEqual(reference["target_text"], "来点魔法！来点魔法！")
+            self.assertEqual(reference["reference_tier"], "exact")
+
+    def test_repeated_ocr_subtitle_competes_when_only_count_differs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory) / "ocr_optimized"
+            cache_dir.mkdir(parents=True)
+            frame_text = (
+                "<ref>Do the magic! Do the magic!</ref>\n"
+                "<ref>来点魔法！来点魔法！</ref>"
+            )
+            (cache_dir / "ocr_frames.json").write_text(
+                json.dumps({
+                    "a": {"status": "ok", "timestamp": 43.5, "segment_id": "7", "text": frame_text},
+                    "b": {"status": "ok", "timestamp": 44.0, "segment_id": "7", "text": frame_text},
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result = prepare_ocr_translation_references(
+                directory,
+                [{"id": 7, "start": 43.0, "end": 48.0,
+                  "text": "Do the magic! Do the magic! Do the magic!"}],
+                "en",
+                "zh",
+            )
+            reference = result["references_by_segment"]["7"][0]
+            self.assertEqual(reference["target_text"], "来点魔法！来点魔法！")
+            self.assertTrue(reference["repetition_count_mismatch"])
+            self.assertEqual(reference["reference_policy"], "repair_or_compress")
+
+    def test_coarse_duration_uses_full_slot_for_hard_gate(self):
+        ideal, available = LightTTSSelector._speech_window({
+            "start": 43.03,
+            "end": 48.03,
+            "timestamp_precision": "coarse",
+            "qwen3_time_stamps": [
+                {"start": 47.47, "end": 47.79, "text": "stale"}
+            ],
+        })
+        self.assertEqual((ideal, available), (5.0, 5.0))
+        decision = classify_coarse_recovery_duration(
+            actual=2.75,
+            target=0.44,
+            available=5.0,
+            measured=True,
+        )
+        self.assertEqual(decision["status"], "shorter_than_window")
+        self.assertEqual(decision["slot_ratio"], 0.55)
+        self.assertGreater(decision["target_ratio"], 6.0)
+
+    def test_wespeaker_step2_invalidates_dependent_results(self):
+        state = {
+            "segments_step1": [{"id": 0, "text": "hello"}],
+            "segments_emotion": [{"id": 0, "emotion": "happy"}],
+            "segments_translation_candidates": [{"id": 0, "text": "你好"}],
+            "light_tts_selector_results": [{"id": 0}],
+            "unrelated_diagnostic": {"keep": True},
+        }
+        removed = invalidate_downstream_state(state)
+        self.assertIn("segments_emotion", removed)
+        self.assertIn("segments_translation_candidates", removed)
+        self.assertIn("light_tts_selector_results", removed)
+        self.assertEqual(state["unrelated_diagnostic"], {"keep": True})
+
     def test_step1b_rerun_uses_immutable_initial_inventory(self):
         state = {
             "asr_deferred_regions_initial": [

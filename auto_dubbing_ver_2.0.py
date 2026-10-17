@@ -3382,6 +3382,7 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
         "segments_translation_candidates", "translation_candidates_fingerprint",
         "light_tts_selector_results", "light_tts_selector_results_path",
         "emotion_results", "tts_router_results", "tts_backend",
+        "tts_stage_manifest", "tts_routing_summary", "tts_routing_report_path",
     ])
     wespeaker_work_dir = os.path.join(config.temp_dir, "wespeaker_diar")
     if os.path.isdir(wespeaker_work_dir):
@@ -3429,6 +3430,7 @@ def run_step_1b(config: DubbingConfig, input_file: str, disable_ocr: bool = Fals
             "segments_translation_candidates", "translation_candidates_fingerprint",
             "light_tts_selector_results", "light_tts_selector_results_path",
             "emotion_results", "tts_router_results", "tts_backend",
+            "tts_stage_manifest", "tts_routing_summary", "tts_routing_report_path",
         ],
         main_path=Path(__file__).resolve(),
     )
@@ -3478,6 +3480,7 @@ def run_step_2(config: DubbingConfig) -> None:
                 "segments_translation_candidates", "translation_candidates_fingerprint",
                 "light_tts_selector_results", "light_tts_selector_results_path",
                 "emotion_results", "tts_router_results", "tts_backend",
+                "tts_stage_manifest", "tts_routing_summary", "tts_routing_report_path",
             ])
             checkpoint = {"segments_step2": aligned}
             if clustering_diagnostics:
@@ -3529,6 +3532,7 @@ def run_step_2(config: DubbingConfig) -> None:
         "segments_translation_candidates", "translation_candidates_fingerprint",
         "light_tts_selector_results", "light_tts_selector_results_path",
         "emotion_results", "tts_router_results", "tts_backend",
+        "tts_stage_manifest", "tts_routing_summary", "tts_routing_report_path",
     ])
     state_mgr.save({"segments_step2": aligned})
 
@@ -3555,6 +3559,7 @@ def run_step_emotion(config: DubbingConfig, force: bool = False) -> None:
         "segments_translation_candidates", "translation_candidates_fingerprint",
         "light_tts_selector_results", "light_tts_selector_results_path",
         "audio_clips", "tts_router_results", "tts_backend",
+        "tts_stage_manifest", "tts_routing_summary", "tts_routing_report_path",
     ])
     state_mgr.save({
         "segments_step2": recognized,
@@ -3738,8 +3743,11 @@ def run_step_3(config: DubbingConfig) -> None:
     )
     cached_candidates = state.get("segments_translation_candidates")
     # Invalidate downstream state before attempting repair, including failed runs.
-    state_mgr.delete_keys(["segments_step3", "segments_scheme3", "audio_clips", "tts_router_results",
-                           "tts_backend", "tts_stage_manifest", "light_tts_selector_results"])
+    state_mgr.delete_keys([
+        "segments_step3", "segments_scheme3", "audio_clips", "tts_router_results",
+        "tts_backend", "tts_stage_manifest", "light_tts_selector_results",
+        "tts_routing_summary", "tts_routing_report_path",
+    ])
     def checkpoint(rows):
         state_mgr.save({
             "segments_translation_candidates": rows,
@@ -3762,7 +3770,10 @@ def run_step_3(config: DubbingConfig) -> None:
     light_tts_results = []
     light_tts_results_path = None
     if config.light_tts_enabled:
-        from light_tts_selector import LightTTSSelector
+        from light_tts_selector import (
+            LightTTSSelector,
+            classify_coarse_recovery_duration,
+        )
 
         selector = LightTTSSelector(
             config.temp_dir,
@@ -3795,15 +3806,31 @@ def run_step_3(config: DubbingConfig) -> None:
                 continue
             selection = segment.get("light_tts_selection") or {}
             target = float(selection.get("target_duration") or 0.0)
+            available = float(
+                selection.get("available_duration")
+                or max(0.0, float(segment.get("end", 0.0)) - float(segment.get("start", 0.0)))
+            )
             actual = float(selection.get("actual_duration") or 0.0)
             measured = selection.get("duration_source") == "measured_audio"
-            ratio = actual / target if target > 0 and actual > 0 else 0.0
-            segment["asr_recovery_tts_duration_ratio"] = round(ratio, 4)
-            if measured and ratio < recovery_min_ratio:
+            duration_decision = classify_coarse_recovery_duration(
+                actual=actual,
+                target=target,
+                available=available,
+                measured=measured,
+                minimum_slot_ratio=recovery_min_ratio,
+                maximum_slot_ratio=recovery_max_ratio,
+            )
+            slot_ratio = float(duration_decision["slot_ratio"])
+            segment["asr_recovery_tts_target_ratio"] = duration_decision["target_ratio"]
+            segment["asr_recovery_tts_slot_ratio"] = duration_decision["slot_ratio"]
+            # Compatibility field now carries the hard-slot ratio because this
+            # gate answers whether synthesized audio physically fits.
+            segment["asr_recovery_tts_duration_ratio"] = round(slot_ratio, 4)
+            if duration_decision["status"] == "shorter_than_window":
                 # Short audio can be placed at the speech onset and followed by
                 # silence.  It is not a reason to reintroduce the source voice.
                 segment["asr_recovery_tts_duration_status"] = "shorter_than_window"
-            elif measured and ratio > recovery_max_ratio:
+            elif duration_decision["status"] == "too_long_blocking":
                 segment["asr_recovery_tts_duration_status"] = "too_long_blocking"
                 segment["translation_status"] = "duration_blocked"
                 segment["dubbing_enabled"] = False

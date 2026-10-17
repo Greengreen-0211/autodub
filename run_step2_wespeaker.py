@@ -103,6 +103,36 @@ CLUSTERING_DIAGNOSTICS_PATH = os.path.join(
     WORK_DIR, "speaker_clustering_diagnostics.json"
 )
 
+DOWNSTREAM_STATE_KEYS = (
+    "segments_emotion",
+    "segments_audio_analyzed",
+    "segments_step3",
+    "segments_scheme3",
+    "segments_json_path",
+    "audio_clips",
+    "segments_translation_candidates",
+    "translation_candidates_fingerprint",
+    "light_tts_selector_results",
+    "light_tts_selector_results_path",
+    "emotion_results",
+    "tts_router_results",
+    "tts_backend",
+    "tts_stage_manifest",
+    "tts_routing_summary",
+    "tts_routing_report_path",
+    "asr_tts_duration_blocked_ids",
+)
+
+
+def invalidate_downstream_state(state):
+    """Remove products whose segment IDs/timing depend on Step 2 output."""
+    removed = []
+    for key in DOWNSTREAM_STATE_KEYS:
+        if key in state:
+            state.pop(key, None)
+            removed.append(key)
+    return removed
+
 
 def load_state():
     with open(os.path.join(TEMP_DIR, "project_state.json"), "r", encoding="utf-8") as f:
@@ -1814,6 +1844,12 @@ def main():
     unique = sorted(set(s["speaker"] for s in aligned))
     print(f"🔍 最终识别出 {len(unique)} 个说话人: {unique}")
 
+    removed = invalidate_downstream_state(state)
+    if removed:
+        print(
+            "🧹 Step 2 结果已变化，清除下游旧缓存: "
+            + ", ".join(removed)
+        )
     state["segments_step2"] = aligned
     if diagnostics:
         state["speaker_clustering"] = diagnostics
