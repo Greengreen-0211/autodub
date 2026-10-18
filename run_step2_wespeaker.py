@@ -52,6 +52,13 @@ def _env_int(name, default):
         return int(default)
 
 
+def _env_bool(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 SAD_MIN_SILENCE_MS = _env_int("AUTODUB_DIAR_SAD_MIN_SILENCE_MS", 350)
 SAD_KEEP_MS = _env_int("AUTODUB_DIAR_SAD_KEEP_MS", 180)
 SAD_MERGE_GAP_MS = _env_int("AUTODUB_DIAR_SAD_MERGE_GAP_MS", 450)
@@ -96,6 +103,36 @@ CLUSTERING_DIAGNOSTICS_PATH = os.path.join(
     WORK_DIR, "speaker_clustering_diagnostics.json"
 )
 
+DOWNSTREAM_STATE_KEYS = (
+    "segments_emotion",
+    "segments_audio_analyzed",
+    "segments_step3",
+    "segments_scheme3",
+    "segments_json_path",
+    "audio_clips",
+    "segments_translation_candidates",
+    "translation_candidates_fingerprint",
+    "light_tts_selector_results",
+    "light_tts_selector_results_path",
+    "emotion_results",
+    "tts_router_results",
+    "tts_backend",
+    "tts_stage_manifest",
+    "tts_routing_summary",
+    "tts_routing_report_path",
+    "asr_tts_duration_blocked_ids",
+)
+
+
+def invalidate_downstream_state(state):
+    """Remove products whose segment IDs/timing depend on Step 2 output."""
+    removed = []
+    for key in DOWNSTREAM_STATE_KEYS:
+        if key in state:
+            state.pop(key, None)
+            removed.append(key)
+    return removed
+
 
 def load_state():
     with open(os.path.join(TEMP_DIR, "project_state.json"), "r", encoding="utf-8") as f:
@@ -121,18 +158,6 @@ def run_cmd(cmd, env=None, cwd=None, stdout_file=None):
         subprocess.run(cmd, env=full_env, cwd=cwd, check=True)
 
 
-def _merge_time_ranges(ranges, *, max_gap_ms):
-    merged = []
-    for start, end in sorted(ranges):
-        if end <= start:
-            continue
-        if merged and start - merged[-1][1] <= max_gap_ms:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return merged
-
-
 def detect_speech_regions(vocal_path):
     """Detect speech-bearing regions independently from the ASR transcript.
 
@@ -140,62 +165,31 @@ def detect_speech_regions(vocal_path):
     sentence boundaries, so merging a short pause cannot merge speaker labels.
     """
     try:
-        import soundfile as sf
+        from speech_activity import detect_speech_regions as shared_detect
 
-        if np is None:
-            raise RuntimeError("numpy 不可用")
-        samples, sample_rate = sf.read(vocal_path, dtype="float32")
-        if samples.ndim > 1:
-            samples = samples.mean(axis=1)
-        if len(samples) <= 0 or sample_rate <= 0:
-            return []
-
-        frame_samples = max(1, round(sample_rate * 0.030))
-        hop_samples = max(1, round(sample_rate * 0.010))
-        starts = np.arange(0, len(samples), hop_samples, dtype=int)
-        rms = np.asarray([
-            math.sqrt(float(np.mean(np.square(samples[start:start + frame_samples]))) + 1e-12)
-            for start in starts
-        ])
-        frame_dbfs = 20.0 * np.log10(np.maximum(rms, 1e-12))
-        reference_rms = math.sqrt(float(np.mean(np.square(samples))) + 1e-12)
-        reference_dbfs = 20.0 * math.log10(max(reference_rms, 1e-12))
-        silence_thresh = max(SAD_FLOOR_DBFS, reference_dbfs - SAD_DB_OFFSET)
-        active = np.flatnonzero(frame_dbfs >= silence_thresh)
-        duration_ms = len(samples) / sample_rate * 1000.0
-        if len(active):
-            raw = []
-            run_start = int(active[0])
-            previous = run_start
-            max_inactive_frames = max(1, round(SAD_MIN_SILENCE_MS / 10.0))
-            for frame_index in map(int, active[1:]):
-                if frame_index - previous > max_inactive_frames:
-                    raw.append([run_start * 10, previous * 10 + 30])
-                    run_start = frame_index
-                previous = frame_index
-            raw.append([run_start * 10, previous * 10 + 30])
-        else:
-            raw = []
-        padded = [
-            [max(0, start - SAD_KEEP_MS), min(duration_ms, end + SAD_KEEP_MS)]
-            for start, end in raw
-        ]
-        merged = _merge_time_ranges(padded, max_gap_ms=SAD_MERGE_GAP_MS)
-        regions = [
-            (start / 1000.0, end / 1000.0)
-            for start, end in merged
-            if end - start >= SAD_MIN_REGION_MS
-        ]
+        regions, diagnostics = shared_detect(
+            vocal_path,
+            min_silence_ms=SAD_MIN_SILENCE_MS,
+            keep_ms=SAD_KEEP_MS,
+            merge_gap_ms=SAD_MERGE_GAP_MS,
+            min_region_ms=SAD_MIN_REGION_MS,
+            db_offset=SAD_DB_OFFSET,
+            floor_dbfs=SAD_FLOOR_DBFS,
+        )
         if regions:
             covered = sum(end - start for start, end in regions)
             print(
                 f"✅ 独立语音活动检测: {len(regions)} 段, "
-                f"覆盖 {covered:.1f}s/{duration_ms / 1000.0:.1f}s, "
-                f"阈值 {silence_thresh:.1f} dBFS"
+                f"覆盖 {covered:.1f}s/{diagnostics['duration']:.1f}s, "
+                f"阈值 {diagnostics['threshold_dbfs']:.1f} dBFS"
             )
             return regions
-        print("⚠️ 独立语音活动检测未找到有效区域，将使用完整人声音轨。")
-        return [(0.0, duration_ms / 1000.0)]
+        print("⚠️ 独立语音活动检测未找到有效区域。")
+        # Preserve the historical WeSpeaker behaviour for silent or unusual
+        # files.  Step 1 coverage auditing intentionally does not use this
+        # fallback because a full-duration false positive would restore noise.
+        duration = float(diagnostics.get("duration", 0.0))
+        return [(0.0, duration)] if duration > 0.0 else []
     except Exception as exc:
         raise RuntimeError(f"无法对人声音轨执行独立语音活动检测: {exc}") from exc
 
@@ -319,6 +313,11 @@ def _timestamp_items(segments):
 
     items = []
     for segment_index, segment in enumerate(segments):
+        if segment.get("speaker_boundary_eligible") is False:
+            # Coarse ASR recovery keeps safe outer speech bounds only.  It may
+            # receive a speaker by RTTM overlap later, but must never create a
+            # word-level speaker-change constraint.
+            continue
         transcript = str(segment.get("text", ""))
         raw_items = list(segment.get("qwen3_time_stamps") or [])
         try:
@@ -326,12 +325,17 @@ def _timestamp_items(segments):
             chunk_end = float(segment.get("end", chunk_start))
         except (TypeError, ValueError):
             continue
-        normalized, _ = normalize_timestamp_items(
+        normalized, alignment = normalize_timestamp_items(
             raw_items,
             transcript=transcript,
             chunk_start=chunk_start,
             chunk_end=chunk_end,
         )
+        # Broken forced-alignment output (for example, most words collapsed
+        # onto the chunk endpoint) is audit evidence only.  It must never
+        # create temporal speaker-change constraints.
+        if alignment.get("status") == "unusable":
+            continue
         for item in normalized:
             items.append({
                 "start": float(item["start"]),
@@ -1819,6 +1823,20 @@ def main():
     if "segments_step1" not in state:
         print("❌ state 中缺少 segments_step1，请先运行 Step 1a/1b")
         sys.exit(1)
+    unresolved = state.get("asr_unresolved_dialogue_regions") or []
+    if unresolved and _env_bool("ASR_REQUIRE_COMPLETE_DIALOGUE", False):
+        spans = ", ".join(
+            f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
+            for item in unresolved[:8]
+        )
+        print(f"❌ 仍有确认对白未恢复，拒绝执行说话人聚类: {spans}")
+        sys.exit(2)
+    if unresolved:
+        spans = ", ".join(
+            f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
+            for item in unresolved[:8]
+        )
+        print(f"⚠️ 未恢复对白已记入降级报告，继续说话人聚类: {spans}")
 
     prepare_inputs(state)
     rttm_path = run_wespeaker_pipeline(state["segments_step1"])
@@ -1832,6 +1850,12 @@ def main():
     unique = sorted(set(s["speaker"] for s in aligned))
     print(f"🔍 最终识别出 {len(unique)} 个说话人: {unique}")
 
+    removed = invalidate_downstream_state(state)
+    if removed:
+        print(
+            "🧹 Step 2 结果已变化，清除下游旧缓存: "
+            + ", ".join(removed)
+        )
     state["segments_step2"] = aligned
     if diagnostics:
         state["speaker_clustering"] = diagnostics

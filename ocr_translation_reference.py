@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 
-REFERENCE_VERSION = "ocr-translation-reference-v8"
+REFERENCE_VERSION = "ocr-translation-reference-v9-repeated-clause"
 _REF_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
@@ -333,6 +333,21 @@ def _source_clauses(text: str) -> list[str]:
     ] or ([str(text).strip()] if str(text).strip() else [])
 
 
+def _repeated_clause_count_compatible(asr: str, subtitle: str) -> bool:
+    """Recognize stable subtitles that differ only in repetition count.
+
+    This does not delete ASR text.  It only lets the human subtitle compete as
+    a measured repair/compression candidate beside the standard translation.
+    """
+    left = [_normalize(value) for value in _source_clauses(asr)]
+    right = [_normalize(value) for value in _source_clauses(subtitle)]
+    left = [value for value in left if value]
+    right = [value for value in right if value]
+    if len(left) < 2 or len(right) < 2 or len(left) == len(right):
+        return False
+    return len(set(left)) == 1 and len(set(right)) == 1 and left[0] == right[0]
+
+
 def _subtitle_card_alignment(asr: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     """Expose a monotonic card-to-clause map for downstream hybrid translation.
 
@@ -644,6 +659,9 @@ def prepare_ocr_translation_references(
                 else "low"
             )
             boundary = _source_boundary_metrics(asr, group["source_text"])
+            repetition_count_mismatch = _repeated_clause_count_compatible(
+                asr, group["source_text"]
+            )
             subtitle_token_count = len(_alignment_tokens(group["source_text"]))
             timestamps = sorted(set(round(value, 3) for value in group["timestamps"]))
             midpoint = sum(timestamps) / len(timestamps) if timestamps else (start + end) / 2.0
@@ -663,6 +681,7 @@ def prepare_ocr_translation_references(
                 "source_clauses": group.get("source_clauses", _source_clauses(asr)),
                 "covered_clause_indices": group.get("covered_clause_indices", []),
                 "uncovered_source_clauses": group.get("uncovered_source_clauses", []),
+                "repetition_count_mismatch": repetition_count_mismatch,
             })
         candidates.sort(key=lambda item: (item["score"], item["frame_support"]), reverse=True)
         source_hints = []
@@ -759,7 +778,7 @@ def prepare_ocr_translation_references(
                     "source_similarity", "source_coverage", "missing_rate",
                     "extra_rate", "boundary_cost", "composed", "timestamps",
                     "subtitle_cards", "source_clauses", "covered_clause_indices",
-                    "uncovered_source_clauses",
+                    "uncovered_source_clauses", "repetition_count_mismatch",
                 )}
                 hint["confidence"] = "medium"
                 hint["reference_tier"] = "ambiguous_hint"
@@ -778,13 +797,17 @@ def prepare_ocr_translation_references(
                     "missing_rate", "extra_rate", "boundary_cost", "composed",
                     "timestamps", "subtitle_cards", "source_clauses",
                     "covered_clause_indices", "uncovered_source_clauses",
+                    "repetition_count_mismatch",
                 )}
                 reference["reference_tier"] = "exact" if perfect else "trusted"
                 if perfect:
                     reference["reference_policy"] = "direct"
                 elif (
                     float(reference["source_coverage"]) >= 0.78
-                    and float(reference["missing_rate"]) <= 0.22
+                    and (
+                        float(reference["missing_rate"]) <= 0.22
+                        or bool(reference.get("repetition_count_mismatch"))
+                    )
                     and float(reference["extra_rate"]) <= 0.12
                 ):
                     reference["reference_policy"] = (

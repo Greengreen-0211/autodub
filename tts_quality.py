@@ -31,7 +31,7 @@ def stage_fingerprint(state, config, backend):
     return hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
 
 
-def validate_mix_state(state, config, *, allow_missing=False):
+def validate_mix_state(state, config, *, allow_missing=False, filter_missing=True):
     from tts_router import _wav_duration
     rows=state.get("segments_step3",[])
     manifest=state.get("tts_stage_manifest",{})
@@ -46,22 +46,25 @@ def validate_mix_state(state, config, *, allow_missing=False):
     skipped={str(s.get("id",i)) for i,s in enumerate(rows)
              if s.get("translation_status")=="skipped"}
     dubbing=[sid for sid in ids if sid not in skipped]
-    issues=[]
+    quality_issues=[]
+    integrity_issues=[]
     if len(by_id)!=len(clips) or len(set(ids))!=len(ids) or set(by_id)-set(ids):
         raise RuntimeError("Step5 blocked: duplicate/unknown segment IDs in TTS clips")
     for sid in ids:
         if sid in skipped:
             if sid in by_id or sid in results:
-                issues.append(f"{sid}:skipped segment unexpectedly produced TTS audio")
+                integrity_issues.append(f"{sid}:skipped segment unexpectedly produced TTS audio")
             continue
         result=results.get(sid,{})
         clip=by_id.get(sid,{})
+        path=Path(str(clip.get("file") or ""))
+        if result.get("status")!="success" or not path.is_file() or not path.stat().st_size:
+            quality_issues.append(f"{sid}:missing or unsuccessful WAV")
+            continue
         try:
-            path=Path(str(clip.get("file") or ""))
-            if result.get("status")!="success" or not path.is_file() or not path.stat().st_size:
-                raise ValueError("missing or unsuccessful WAV")
             if _wav_duration(path)<=0:
-                raise ValueError("empty WAV")
+                quality_issues.append(f"{sid}:empty WAV")
+                continue
             if clip.get("request_fingerprint") != result.get("request_fingerprint"):
                 raise ValueError("clip/result generation fingerprint mismatch")
             from tts_router import _request_fingerprint, _file_sha256
@@ -70,20 +73,22 @@ def validate_mix_state(state, config, *, allow_missing=False):
             if result.get("audio_sha256") != _file_sha256(path):
                 raise ValueError("WAV content checksum mismatch")
         except Exception as exc:
-            issues.append(f"{sid}:{exc}")
+            integrity_issues.append(f"{sid}:{exc}")
     if manifest.get("success")!=len(dubbing) or len(clips)!=len(dubbing):
-        issues.append(f"incomplete Step4: {manifest.get('success')}/{len(dubbing)} dubbing segments"
-                      f" (of {len(rows)} total, {len(skipped)} skipped)")
-    if issues and not allow_missing:
-        raise RuntimeError("Step5 blocked: " + "; ".join(issues))
-    if issues:
-        print("⚠️ --allow-missing-tts explicit override:",issues)
+        quality_issues.append(f"incomplete Step4: {manifest.get('success')}/{len(dubbing)} dubbing segments"
+                              f" (of {len(rows)} total, {len(skipped)} skipped)")
+    if integrity_issues:
+        raise RuntimeError("Step5 blocked by integrity error: " + "; ".join(integrity_issues))
+    if quality_issues:
+        print("⚠️ Step5 发现可降级的 TTS 缺失:",quality_issues)
         # Only verified readable clips may reach the mixer.
-        valid=[]
-        for c in clips:
-            try:
-                if _wav_duration(Path(c["file"]))>0:
-                    valid.append(c)
-            except Exception:
-                pass
-        state["audio_clips"]=valid
+        if filter_missing:
+            valid=[]
+            for c in clips:
+                try:
+                    if _wav_duration(Path(c["file"]))>0:
+                        valid.append(c)
+                except Exception:
+                    pass
+            state["audio_clips"]=valid
+    return quality_issues

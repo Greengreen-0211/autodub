@@ -7,8 +7,11 @@ import hashlib
 import json
 import math
 import os
+import re
+import time
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Type
+from typing import Any, Dict, List, Mapping, Sequence, Tuple, Type
 from urllib.parse import urlsplit, urlunsplit
 
 from autodub_ocr_runtime import VERSION as OCR_OPTIMIZED_VERSION
@@ -150,6 +153,8 @@ class OCRV211Client:
 
     def __init__(self, config: Any) -> None:
         self.config = config
+        self.frame_texts_by_segment: Dict[str, List[str]] = {}
+        self.frame_records_by_segment: Dict[str, List[Dict[str, Any]]] = {}
         try:
             import requests
         except ImportError as exc:
@@ -166,12 +171,20 @@ class OCRV211Client:
 
     def check_health(self) -> Dict[str, Any]:
         health_url = self._health_url()
-        try:
-            response = self.session.get(health_url, timeout=self.config.ocr_health_timeout)
-            response.raise_for_status()
-            data = response.json()
-        except Exception as exc:
-            raise RuntimeError(f"OCR 健康检查失败 ({health_url}): {exc}") from exc
+        last_error = None
+        for attempt in range(1, 3):
+            try:
+                response = self.session.get(health_url, timeout=self.config.ocr_health_timeout)
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    print(f"⚠️ OCR 健康检查失败，快速重试 {attempt}/2: {exc}")
+                    time.sleep(0.5)
+        else:
+            raise RuntimeError(f"OCR 健康检查失败 ({health_url}): {last_error}") from last_error
         if not data.get("model_loaded"):
             raise RuntimeError(f"OCR 模型尚未加载完成: {data}")
         if data.get("busy"):
@@ -193,11 +206,22 @@ class OCRV211Client:
             "frame_index": self.config.ocr_frame_index,
             "request_id": f"seg-{segment.get('id', 'unknown')}",
         }
-        response = self.session.post(
-            self.config.ocr_url,
-            json=payload,
-            timeout=(self.config.ocr_connect_timeout, self.config.ocr_read_timeout),
-        )
+        response = None
+        last_error = None
+        for attempt in range(1, 3):
+            try:
+                response = self.session.post(
+                    self.config.ocr_url,
+                    json=payload,
+                    timeout=(self.config.ocr_connect_timeout, self.config.ocr_read_timeout),
+                )
+                break
+            except self.requests.exceptions.RequestException as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.5)
+        if response is None:
+            raise RuntimeError(f"OCR 请求两次失败: {last_error}") from last_error
         if response.status_code != 200:
             raise RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
         data = response.json()
@@ -232,29 +256,82 @@ class OCRV211Client:
         media_key = _ocr_digest({"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
         cache_path = _runtime_dir(self.config) / "ocr_frames.json"
         cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.exists() else {}
-        selected = segments[:self.config.ocr_max_segments] if self.config.ocr_max_segments > 0 else segments
         if self.config.ocr_max_segments > 0:
-            print(f"按配置仅处理前 {len(selected)} 个 ASR 片段。")
+            regular = [
+                item
+                for item in segments
+                if not (
+                    item.get("ocr_recovery_probe")
+                    or str(item.get("id", "")).startswith(
+                        ("deferred-", "recovery-group-")
+                    )
+                )
+            ][: self.config.ocr_max_segments]
+            probes = [
+                item
+                for item in segments
+                if item.get("ocr_recovery_probe")
+                or str(item.get("id", "")).startswith(
+                    ("deferred-", "recovery-group-")
+                )
+            ]
+            # The user-facing cap limits ordinary ASR correction cost.  It must
+            # not silently disable safety probes for confirmed missing speech.
+            selected = [*regular, *probes]
+        else:
+            selected = segments
+        if self.config.ocr_max_segments > 0:
+            print(
+                f"按配置处理前 {len(regular)} 个 ASR 片段，并保留 "
+                f"{len(probes)} 个漏段安全探针。"
+            )
         outputs: Dict[str, str] = {}
+        self.frame_texts_by_segment = {}
+        self.frame_records_by_segment = {}
         health_checked = False
-        stopped = False
+        consecutive_service_failures = 0
+        service_circuit_open = False
         for index, segment in enumerate(selected, start=1):
             segment_id = str(segment.get("id", index - 1))
             start, end = float(segment["start"]), float(segment["end"])
-            times = self._sample_times(start, end)
+            is_recovery_probe = bool(segment.get("ocr_recovery_probe")) or segment_id.startswith(
+                ("deferred-", "recovery-group-")
+            )
+            if is_recovery_probe:
+                sample_start = float(segment.get("probe_start", start))
+                sample_end = float(segment.get("probe_end", end))
+                duration = max(0.0, sample_end - sample_start)
+                step = max(0.2, float(self.config.ocr_recovery_frame_step))
+                count = max(3, int(math.ceil(duration / step)) + 1)
+                count = min(max(3, int(self.config.ocr_recovery_max_frames)), count)
+                if count <= 1 or duration <= 0:
+                    times = [round((sample_start + sample_end) / 2.0, 3)]
+                else:
+                    times = [
+                        round(sample_start + duration * frame_index / (count - 1), 3)
+                        for frame_index in range(count)
+                    ]
+                sampling_version = "dense-context-recovery-v2"
+            else:
+                # Ordinary ASR segments use the subtitle-aware adaptive sampler
+                # from the OCR translation branch.  Recovery probes keep their
+                # denser context sampling because they must search an uncertain
+                # acoustic interval rather than inspect a known utterance.
+                times = self._sample_times(start, end)
+                sampling_version = "adaptive-subtitle-v3"
             texts: List[str] = []
             for frame_number, timestamp in enumerate(times, start=1):
                 key = _ocr_digest({
                     "media": media_key,
                     "time": timestamp,
                     "service": self.config.ocr_url,
-                    "sampling": "adaptive-subtitle-v3",
+                    "sampling": sampling_version,
                     "frame_index": self.config.ocr_frame_index,
                 })
                 cached = cache.get(key)
                 if cached and cached.get("status") == "ok":
                     text = str(cached["text"])
-                elif stopped:
+                elif service_circuit_open:
                     continue
                 else:
                     print(
@@ -268,6 +345,7 @@ class OCRV211Client:
                             health_checked = True
                         point = dict(segment, id=f"{segment_id}-f{frame_number}", start=timestamp, end=timestamp)
                         text = self._extract_one(str(path), point)
+                        consecutive_service_failures = 0
                         cache[key] = {
                             "status": "ok",
                             "timestamp": timestamp,
@@ -282,17 +360,34 @@ class OCRV211Client:
                             "segment_id": segment_id,
                         }
                         _ocr_atomic_json(cache_path, cache)
-                        print(f"⚠️ OCR 服务失败，本轮停止请求并回退到纯 Qwen3-ASR: {exc}")
-                        stopped = True
+                        consecutive_service_failures += 1
+                        print(
+                            f"⚠️ OCR 帧失败，已记录并继续其他帧 "
+                            f"(连续失败 {consecutive_service_failures}): {exc}"
+                        )
                         if self.config.ocr_required:
                             raise
+                        if consecutive_service_failures >= 2:
+                            service_circuit_open = True
+                            print(
+                                "⚠️ OCR 服务连续两帧失败，本轮停止新增请求；"
+                                "保留此前成功帧并继续主流程。"
+                            )
                         continue
                     _ocr_atomic_json(cache_path, cache)
                 if text and text not in texts:
                     texts.append(text)
+                if text:
+                    self.frame_texts_by_segment.setdefault(segment_id, []).append(text)
+                    self.frame_records_by_segment.setdefault(segment_id, []).append(
+                        {"timestamp": timestamp, "text": text}
+                    )
             outputs[segment_id] = "\n".join(texts)
         success_count = sum(bool(text.strip()) for text in outputs.values())
-        print(f"✅ OCR 完成: {success_count}/{len(selected)} 个片段获得文本，自适应抽帧记录保存至: {cache_path}")
+        print(
+            f"✅ OCR 完成: {success_count}/{len(selected)} 个片段获得文本，"
+            f"自适应抽帧记录保存至: {cache_path}"
+        )
         if self.config.ocr_required and success_count == 0:
             raise RuntimeError("已要求 OCR 必须成功，但本轮没有获得任何 OCR 文本。")
         return outputs
@@ -373,12 +468,488 @@ class OCRV211Corrector:
         return corrected
 
 
+_ENTITY_WORD = re.compile(r"[A-Za-z][A-Za-z'’\-]{1,23}")
+_NON_ENTITY_UTTERANCES = {
+    "ah", "come", "go", "goodbye", "hello", "hey", "hi", "hmm",
+    "how", "look", "no", "oh", "okay", "ok", "please", "psst",
+    "ready", "sorry", "thanks", "thank", "uh", "uhhm", "um", "wait",
+    "what", "when", "where", "who", "why", "yes",
+}
+
+
+def _entity_token(value: Any) -> str:
+    match = _ENTITY_WORD.fullmatch(str(value or "").strip(" \t\r\n,.:;!?，。！？：；\"'“”‘’()[]{}"))
+    return match.group(0) if match else ""
+
+
+def _looks_like_entity_token(value: Any) -> bool:
+    token = _entity_token(value)
+    if not token or token.casefold() in _NON_ENTITY_UTTERANCES:
+        return False
+    return token.isupper() or (token[:1].isupper() and token[1:].islower())
+
+
+def _stable_bilingual_entity_evidence(
+    frame_records: Sequence[Mapping[str, Any]],
+    source_language: Any,
+    target_language: Any,
+) -> List[Dict[str, Any]]:
+    """Extract conservative, repeated source-name/target-name OCR pairs.
+
+    The target text is corroboration only.  No target translation is ever
+    copied into ASR.  Exact source/target pairs must occur in at least two
+    different sampled frames, and ambiguous target variants are rejected.
+    """
+    from ocr_translation_reference import (
+        _line_matches_script,
+        _normalize,
+        _parse_lines,
+        _script_family,
+        _spatial_score,
+    )
+
+    source_family = _script_family(source_language)
+    target_family = _script_family(target_language)
+    if source_family != "latin" or target_family not in {"han", "japanese"}:
+        return []
+
+    grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        lines = _parse_lines(record.get("text"))
+        sources = []
+        targets = []
+        for line in lines:
+            text = str(line.get("text") or "")
+            source_match = _line_matches_script(text, source_family)
+            target_match = _line_matches_script(text, target_family)
+            if source_match and not target_match:
+                sources.append(line)
+            elif target_match:
+                targets.append(line)
+        for source in sources:
+            words = _ENTITY_WORD.findall(str(source["text"]))
+            possible = [word for word in words if _looks_like_entity_token(word)]
+            # Entity-only subtitle cards may contain a short filler beside the
+            # name (for example "Elsa! Psst").  More complex lines are not
+            # deterministic enough for automatic spelling correction.
+            if len(words) > 3 or len(possible) != 1:
+                continue
+            source_name = possible[0]
+            for target in targets:
+                target_text = str(target["text"])
+                han = re.findall(r"[\u3400-\u9fff]", target_text)
+                if not 2 <= len(han) <= 6:
+                    continue
+                spatial = _spatial_score(source.get("bbox"), target.get("bbox"))
+                if source.get("bbox") and target.get("bbox") and spatial < 0.28:
+                    continue
+                key = (source_name.casefold(), _normalize(target_text))
+                entry = grouped.setdefault(key, {
+                    "source_name": source_name,
+                    "target_text": target_text,
+                    "timestamps": set(),
+                    "spatial_scores": [],
+                })
+                entry["timestamps"].add(round(timestamp, 3))
+                entry["spatial_scores"].append(float(spatial))
+
+    by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for (source_key, _), entry in grouped.items():
+        support = len(entry["timestamps"])
+        if support < 2:
+            continue
+        timestamps = sorted(entry["timestamps"])
+        # Text visible throughout a long scene is much more likely to be UI or
+        # a watermark than a spoken subtitle card.
+        if timestamps[-1] - timestamps[0] > 3.5:
+            continue
+        candidate = {
+            "source_name": entry["source_name"],
+            "target_text": entry["target_text"],
+            "timestamps": timestamps,
+            "frame_support": support,
+            "first_seen": timestamps[0],
+            "last_seen": timestamps[-1],
+            "spatial_score": round(max(entry["spatial_scores"]), 4),
+        }
+        by_source.setdefault(source_key, []).append(candidate)
+
+    stable: List[Dict[str, Any]] = []
+    for candidates in by_source.values():
+        candidates.sort(key=lambda item: item["frame_support"], reverse=True)
+        best = candidates[0]
+        # Two similarly supported target renderings mean the bilingual pairing
+        # is ambiguous.  Preserve ASR rather than choosing one.
+        if len(candidates) > 1 and (
+            candidates[1]["frame_support"] >= best["frame_support"] - 1
+        ):
+            continue
+        stable.append(best)
+    return stable
+
+
+def _timestamp_entity_words(segment: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    for index, item in enumerate(segment.get("qwen3_time_stamps") or []):
+        token = _entity_token(item.get("text")) if isinstance(item, Mapping) else ""
+        if not _looks_like_entity_token(token):
+            continue
+        try:
+            start = float(item.get("start"))
+            end = float(item.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            continue
+        output.append({"index": index, "token": token, "start": start, "end": end})
+    return output
+
+
+def _entity_time_distance(word: Mapping[str, Any], evidence: Mapping[str, Any]) -> float:
+    if float(evidence["last_seen"]) < float(word["start"]):
+        return float(word["start"]) - float(evidence["last_seen"])
+    if float(evidence["first_seen"]) > float(word["end"]):
+        return float(evidence["first_seen"]) - float(word["end"])
+    return 0.0
+
+
+def apply_stable_bilingual_entity_corrections(
+    segments: Sequence[Dict[str, Any]],
+    frame_records: Sequence[Mapping[str, Any]],
+    source_language: Any,
+    target_language: Any,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Correct a mistyped ASR name only under repeated bilingual OCR evidence.
+
+    This deliberately edits one token at a time and preserves its original
+    word timestamps.  It does not merge/split segments or alter any boundary.
+    """
+    evidence = _stable_bilingual_entity_evidence(
+        frame_records, source_language, target_language
+    )
+    corrected: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    for original in segments:
+        segment = deepcopy(original)
+        text = str(segment.get("text") or "")
+        timed_words = _timestamp_entity_words(segment)
+        proposals: List[Dict[str, Any]] = []
+        for word in timed_words:
+            nearby = []
+            for item in evidence:
+                distance = _entity_time_distance(word, item)
+                if distance <= 1.6:
+                    nearby.append((distance, -int(item["frame_support"]), item))
+            if not nearby:
+                continue
+            nearby.sort(key=lambda row: (row[0], row[1], str(row[2]["source_name"])))
+            exact = [
+                row for row in nearby
+                if str(row[2]["source_name"]).casefold() == str(word["token"]).casefold()
+            ]
+            if exact:
+                # OCR independently supports the existing name; never replace it.
+                continue
+            best = nearby[0]
+            competing_names = {
+                str(row[2]["source_name"]).casefold()
+                for row in nearby
+                if row[0] <= best[0] + 0.35
+                and int(row[2]["frame_support"]) >= int(best[2]["frame_support"]) - 1
+            }
+            if len(competing_names) != 1:
+                continue
+            source_name = str(best[2]["source_name"])
+            if re.search(
+                rf"(?<![A-Za-z]){re.escape(source_name)}(?![A-Za-z])",
+                text,
+                flags=re.IGNORECASE,
+            ):
+                # Both names already occur in the utterance; identity is not
+                # resolvable by this local evidence.
+                continue
+            occurrences = list(re.finditer(
+                rf"(?<![A-Za-z]){re.escape(str(word['token']))}(?![A-Za-z])",
+                text,
+                flags=re.IGNORECASE,
+            ))
+            if len(occurrences) != 1:
+                continue
+            occurrence = occurrences[0]
+            before = text[:occurrence.start()].rstrip()
+            after = text[occurrence.end():].lstrip()
+            at_clause_start = not before or before[-1:] in ".!?。！？"
+            address_punctuation = bool(after[:1] in ",，:：!?！")
+            if not (at_clause_start and address_punctuation):
+                continue
+            proposals.append({
+                "word": word,
+                "evidence": best[2],
+                "distance": round(float(best[0]), 4),
+                "span": (occurrence.start(), occurrence.end()),
+            })
+
+        # Multiple simultaneous edits are intentionally unsupported.  A
+        # single auditable name repair is safe; a compound rewrite belongs to
+        # the existing frozen classifier.
+        if len(proposals) != 1:
+            corrected.append(segment)
+            if proposals:
+                audit.append({
+                    "segment_id": str(segment.get("id")),
+                    "accepted": False,
+                    "reason": "multiple_entity_repairs_not_allowed",
+                    "proposal_count": len(proposals),
+                })
+            continue
+
+        proposal = proposals[0]
+        start, end = proposal["span"]
+        old_name = text[start:end]
+        new_name = str(proposal["evidence"]["source_name"])
+        segment["text"] = text[:start] + new_name + text[end:]
+        segment.setdefault("ocr_original_asr", text)
+        normalized_items = segment.get("qwen3_time_stamps")
+        target_index = int(proposal["word"]["index"])
+        if (
+            isinstance(normalized_items, list)
+            and target_index < len(normalized_items)
+            and isinstance(normalized_items[target_index], dict)
+            and _entity_token(normalized_items[target_index].get("text")).casefold()
+            == old_name.casefold()
+        ):
+            normalized_items[target_index]["text"] = new_name
+        raw_items = segment.get("qwen3_time_stamps_raw")
+        if isinstance(raw_items, list):
+            raw_matches = []
+            for raw_index, item in enumerate(raw_items):
+                if not isinstance(item, Mapping):
+                    continue
+                if _entity_token(item.get("text")).casefold() != old_name.casefold():
+                    continue
+                try:
+                    delta = abs(float(item.get("start")) - float(proposal["word"]["start"]))
+                    delta += abs(float(item.get("end")) - float(proposal["word"]["end"]))
+                except (TypeError, ValueError):
+                    continue
+                raw_matches.append((delta, raw_index))
+            raw_matches.sort()
+            if raw_matches and raw_matches[0][0] <= 0.4 and (
+                len(raw_matches) == 1 or raw_matches[1][0] > raw_matches[0][0] + 0.05
+            ):
+                raw_items[raw_matches[0][1]]["text"] = new_name
+        segment["qwen3_timestamp_status"] = "ocr_entity_token_substitution_preserved"
+        decision = {
+            "accepted": True,
+            "reason": "stable_bilingual_entity_timeline",
+            "original_name": old_name,
+            "corrected_name": new_name,
+            "target_evidence": proposal["evidence"]["target_text"],
+            "frame_support": proposal["evidence"]["frame_support"],
+            "evidence_timestamps": proposal["evidence"]["timestamps"],
+            "time_distance": proposal["distance"],
+        }
+        segment["ocr_entity_correction"] = decision
+        previous_optimized = deepcopy(segment.get("ocr_optimized") or {})
+        segment["ocr_optimized"] = {
+            "version": OCR_OPTIMIZED_VERSION,
+            "accepted": True,
+            "reason": decision["reason"],
+            "base_decision": previous_optimized,
+        }
+        audit.append({"segment_id": str(segment.get("id")), **decision})
+        corrected.append(segment)
+    return corrected, audit
+
+
 def _implementation_binding(main_path: Path) -> str:
     return _ocr_digest({
         "runtime": FrozenBOCRPipeline(FROZEN_B_PROMPT).binding,
         "pipeline": hashlib.sha256(main_path.read_bytes()).hexdigest(),
+        "integration": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "speech_activity": hashlib.sha256(
+            Path(__file__).with_name("speech_activity.py").read_bytes()
+        ).hexdigest(),
         "prompt": FROZEN_B_PROMPT_SHA256,
     })
+
+
+def _recover_deferred_from_ocr(
+    deferred_regions: Sequence[Dict[str, Any]],
+    frame_records: Dict[str, List[Dict[str, Any]]],
+    source_language: str,
+    known_segments: Sequence[Dict[str, Any]] = (),
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Promote stable ordered subtitle events to coarse ASR segments."""
+    from asr_recovery import coarse_segment, ocr_source_events
+
+    recovered: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    for region in deferred_regions:
+        region_id = str(region.get("id") or "")
+        # Only suppress text already assigned inside the acoustic core.  Merely
+        # adjacent identical calls (e.g. repeated "Come on") must remain
+        # eligible even when their subtitle frames overlap in the context.
+        known_neighbor_texts = [
+            str(item.get("text") or "")
+            for item in known_segments
+            if float(item.get("start", 0.0)) < float(region["end"])
+            and float(item.get("end", 0.0)) > float(region["start"])
+        ]
+        events, decision = ocr_source_events(
+            frame_records.get(region_id, []),
+            source_language,
+            region_start=float(region["start"]),
+            region_end=float(region["end"]),
+            exclude_texts=known_neighbor_texts,
+        )
+        record = {
+            "id": region_id,
+            "start": round(float(region["start"]), 3),
+            "end": round(float(region["end"]), 3),
+            "decision": decision,
+        }
+        if not events:
+            dialogue_evidence = (
+                bool(region.get("dialogue_evidence", False))
+                or bool(decision.get("dialogue_evidence", False))
+                or bool(str(region.get("original_text") or "").strip())
+            )
+            remaining.append(
+                dict(
+                    region,
+                    dialogue_evidence=dialogue_evidence,
+                    asr_recovery_status=(
+                        "unresolved_blocking"
+                        if dialogue_evidence
+                        else "unresolved_uncertain"
+                    ),
+                )
+            )
+            record["status"] = "deferred"
+            audit.append(record)
+            continue
+        event_records = []
+        for event_index, event in enumerate(events):
+            seed = {
+                "id": -1,
+                "text": str(event["text"]),
+                "asr_model": "qwen3+ocr",
+                "asr_repair_source": "stable_ocr_timeline",
+                "ocr_recovered": True,
+                "ocr_recovery_frame_count": event.get("frame_count", 0),
+                "ocr_recovery_parent_id": region_id,
+                "ocr_recovery_event_index": event_index,
+                "ocr_subtitle_first_seen": round(float(event["first_seen"]), 3),
+                "ocr_subtitle_last_seen": round(float(event["last_seen"]), 3),
+            }
+            segment = coarse_segment(
+                seed,
+                start=float(event["start"]),
+                end=float(event["end"]),
+                origin="ocr_deferred_source_subtitle",
+                text_confidence=float(event.get("confidence", 0.74)),
+                reason="stable_source_language_subtitle_timeline_over_confirmed_speech",
+            )
+            segment["asr_retry_candidate_kind"] = region.get("candidate_kind")
+            segment["asr_recovered_parent_start"] = round(float(region["start"]), 3)
+            segment["asr_recovered_parent_end"] = round(float(region["end"]), 3)
+            recovered.append(segment)
+            event_records.append(
+                {
+                    "text": event["text"],
+                    "start": event["start"],
+                    "end": event["end"],
+                    "frame_count": event.get("frame_count", 0),
+                }
+            )
+        record.update({"status": "accepted_coarse", "events": event_records})
+        audit.append(record)
+    return recovered, remaining, audit
+
+
+def _partition_deferred_regions(
+    remaining_deferred: Sequence[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Partition unresolved regions without equating energy with dialogue."""
+    blocking_regions = [
+        dict(item, asr_recovery_status="unresolved_blocking")
+        for item in remaining_deferred
+        if item.get("dialogue_evidence")
+        or item.get("asr_recovery_status") == "unresolved_blocking"
+        or str(item.get("original_text") or "").strip()
+    ]
+    blocking_ids = {str(item.get("id") or "") for item in blocking_regions}
+    acoustic_uncertain = [
+        dict(item, asr_recovery_status="acoustic_candidate_unconfirmed")
+        for item in remaining_deferred
+        if str(item.get("id") or "") not in blocking_ids
+        and not item.get("dialogue_evidence")
+        and (
+            bool(item.get("acoustic_candidate"))
+            or any(
+                bool(member.get("acoustic_candidate"))
+                for member in item.get("members", [])
+                if isinstance(member, dict)
+            )
+        )
+    ]
+    acoustic_ids = {str(item.get("id") or "") for item in acoustic_uncertain}
+    non_dialogue_audited = [
+        dict(item, asr_recovery_status="non_dialogue_audited")
+        for item in remaining_deferred
+        if str(item.get("id") or "") not in blocking_ids
+        and str(item.get("id") or "") not in acoustic_ids
+        and not item.get("dialogue_evidence")
+        and item.get("asr_recovery_status") != "unresolved_blocking"
+    ]
+    return blocking_regions, acoustic_uncertain, non_dialogue_audited
+
+
+def _load_initial_recovery_state(
+    state: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return immutable Step 1a recovery inputs for every Step 1b run.
+
+    Older checkpoints used ``asr_deferred_regions`` and
+    ``asr_uncovered_regions`` for both the original Step 1a inventory and the
+    remaining Step 1b output.  Once Step 1b had run, those fields were lossy and
+    could not safely be used to reproduce previously recovered dialogue.
+    """
+    initial_deferred = state.get("asr_deferred_regions_initial")
+    initial_uncovered = state.get("asr_uncovered_regions_initial")
+    initial_report = state.get("asr_recovery_report_initial")
+    if (
+        initial_deferred is not None
+        and initial_uncovered is not None
+        and initial_report is not None
+    ):
+        return (
+            deepcopy(list(initial_deferred)),
+            deepcopy(list(initial_uncovered)),
+            deepcopy(list(initial_report)),
+        )
+
+    # A legacy checkpoint is safe only before its first Step 1b run.  If an OCR
+    # manifest already exists, the legacy fields may already contain only the
+    # remainder.  Failing explicitly prevents a silent 9 -> 6 segment rollback.
+    if state.get("ocr_optimized_manifest") or "segments_ocr_corrected" in state:
+        raise RuntimeError(
+            "当前项目状态由旧版 Step 1b 写入，原始 ASR 恢复清单已经无法可靠重建。"
+            "请先使用当前代码重新运行 --step 1a，再运行 --step 1b；"
+            "不要继续使用可能缺句的旧检查点。"
+        )
+
+    return (
+        deepcopy(list(state.get("asr_deferred_regions", []))),
+        deepcopy(list(state.get("asr_uncovered_regions", []))),
+        deepcopy(list(state.get("asr_recovery_report", []))),
+    )
 
 
 def run_step_1b_optimized(
@@ -417,11 +988,45 @@ def run_step_1b_optimized(
     })
     enabled = not disable_ocr and config.ocr_enabled and _mode() != "off"
     ocr_texts: Dict[str, str] = {}
+    (
+        deferred_regions,
+        initial_uncovered_regions,
+        initial_recovery_report,
+    ) = _load_initial_recovery_state(state)
+    from asr_recovery import build_recovery_groups
+
+    recovery_groups = build_recovery_groups(
+        deferred_regions,
+        max_gap=float(getattr(config, "ocr_recovery_group_gap", 0.18)),
+        context=float(getattr(config, "ocr_recovery_context", 0.8)),
+        media_duration=float(state.get("duration") or 0.0) or None,
+    )
+    deferred_frame_records: Dict[str, List[Dict[str, Any]]] = {}
+    all_frame_records: List[Dict[str, Any]] = []
     if enabled:
         try:
             client = OCRV211Client(config)
             try:
-                ocr_texts = client.extract_texts(input_file, raw_segments)
+                # OCR is also sampled over confirmed speech regions that ASR
+                # could not safely promote.  These probe records stay internal
+                # and do not alter the frontend segment contract.
+                ocr_inputs = [*raw_segments, *recovery_groups]
+                all_ocr_texts = client.extract_texts(input_file, ocr_inputs)
+                ocr_texts = {
+                    str(segment["id"]): all_ocr_texts.get(str(segment["id"]), "")
+                    for segment in raw_segments
+                }
+                deferred_frame_records = {
+                    str(region.get("id")): list(
+                        client.frame_records_by_segment.get(str(region.get("id")), [])
+                    )
+                    for region in recovery_groups
+                }
+                all_frame_records = [
+                    dict(record, segment_id=str(segment_id))
+                    for segment_id, records in client.frame_records_by_segment.items()
+                    for record in records
+                ]
             finally:
                 client.session.close()
         except Exception as exc:
@@ -440,19 +1045,208 @@ def run_step_1b_optimized(
             for segment in raw_segments
         ]
 
+    recovered_segments: List[Dict[str, Any]] = []
+    ocr_recovery_audit: List[Dict[str, Any]] = []
+    remaining_deferred = recovery_groups
+    if enabled and recovery_groups:
+        recovered_segments, remaining_deferred, ocr_recovery_audit = (
+            _recover_deferred_from_ocr(
+                recovery_groups,
+                deferred_frame_records,
+                str(config.ocr_source_language or state.get("src_lang", "")),
+                segments,
+            )
+        )
+        if recovered_segments:
+            recovered_parent_count = len(
+                {
+                    str(item.get("ocr_recovery_parent_id") or "")
+                    for item in recovered_segments
+                }
+            )
+            print(
+                f"✅ OCR 延迟救援采纳 {recovered_parent_count}/"
+                f"{len(recovery_groups)} 个恢复组（仅使用粗时间边界）。"
+            )
+        else:
+            print(
+                f"ℹ️ OCR 延迟救援未形成稳定源语言字幕证据；"
+                f"{len(remaining_deferred)} 个区间进入未解决对白/弱候选审计。"
+            )
+
+    if recovered_segments:
+        from speech_activity import subtract_ranges
+
+        segments = sorted(
+            [*segments, *recovered_segments],
+            key=lambda item: (float(item["start"]), float(item["end"])),
+        )
+        for left, right in zip(segments, segments[1:]):
+            if float(left["end"]) - float(right["start"]) > 0.02:
+                raise RuntimeError(
+                    "OCR 延迟救援内部错误：恢复片段与既有 ASR 片段重叠 "
+                    f"{left.get('id')}->{right.get('id')}"
+                )
+        for index, segment in enumerate(segments):
+            segment["id"] = index
+        # Every accepted OCR event set partitions its complete confirmed parent
+        # speech region, so remove that parent from the unresolved inventory.
+        recovered_ranges = sorted(
+            {
+                (
+                    float(item.get("asr_recovered_parent_start", item["start"])),
+                    float(item.get("asr_recovered_parent_end", item["end"])),
+                )
+                for item in recovered_segments
+            }
+        )
+        updated_uncovered: List[Dict[str, Any]] = []
+        for region in initial_uncovered_regions:
+            remaining_ranges = subtract_ranges(
+                [(float(region["start"]), float(region["end"]))],
+                recovered_ranges,
+                min_duration=0.08,
+            )
+            for start, end in remaining_ranges:
+                updated_uncovered.append(
+                    dict(region, start=round(start, 3), end=round(end, 3))
+                )
+    else:
+        updated_uncovered = deepcopy(initial_uncovered_regions)
+
+    # Coarse segments can originate from OCR events or from independent Qwen
+    # views agreeing on text without safe alignment.  Reconcile both sources;
+    # the helper only edits a boundary when exact repeated-clause evidence
+    # proves which existing token belongs on the left.
+    from asr_recovery import reconcile_coarse_recovery_boundaries
+
+    segments, boundary_repair_audit = reconcile_coarse_recovery_boundaries(
+        segments
+    )
+    if boundary_repair_audit:
+        print(
+            f"✅ 恢复句边界校正: 修复 {len(boundary_repair_audit)} 个"
+            "被重复短语截断的相邻边界。"
+        )
+
+    entity_correction_audit: List[Dict[str, Any]] = []
+    if enabled and all_frame_records:
+        segments, entity_correction_audit = (
+            apply_stable_bilingual_entity_corrections(
+                segments,
+                all_frame_records,
+                str(config.ocr_source_language or state.get("src_lang", "")),
+                str(getattr(config, "target_lang", "")),
+            )
+        )
+        accepted_entities = sum(
+            bool(item.get("accepted")) for item in entity_correction_audit
+        )
+        if accepted_entities:
+            print(
+                f"✅ OCR 双语实体纠错: 采纳 {accepted_entities} 个"
+                "多帧稳定的人名拼写修复。"
+            )
+
+    from speech_activity import attach_coarse_tts_placement, detect_speech_regions
+
+    recovery_timing_audit: List[Dict[str, Any]] = []
+    vocals_path = str(state.get("vocals_path") or "")
+    if vocals_path and os.path.isfile(vocals_path):
+        try:
+            speech_ranges, timing_diagnostics = detect_speech_regions(
+                vocals_path,
+                min_silence_ms=160,
+                keep_ms=20,
+                merge_gap_ms=100,
+                min_region_ms=140,
+            )
+            segments, recovery_timing_audit = attach_coarse_tts_placement(
+                segments, speech_ranges
+            )
+            accepted_timing = sum(
+                bool(item.get("accepted")) for item in recovery_timing_audit
+            )
+            if recovery_timing_audit:
+                print(
+                    f"✅ 粗恢复句声学落点: {accepted_timing}/"
+                    f"{len(recovery_timing_audit)} 个句子获得独立 TTS 放置窗口。"
+                )
+            for item in recovery_timing_audit:
+                item["detector"] = timing_diagnostics
+        except Exception as exc:
+            print(
+                "⚠️ 粗恢复句声学落点分析失败，保留原始粗边界: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
     state_mgr.delete_keys(downstream_state_keys)
+    combined_recovery_report = [
+        *deepcopy(initial_recovery_report),
+        *[dict(item, stage="ocr_deferred_recovery") for item in ocr_recovery_audit],
+    ]
+    blocking_regions, acoustic_uncertain, non_dialogue_audited = (
+        _partition_deferred_regions(remaining_deferred)
+    )
     state_mgr.save({
         "ocr_texts_by_segment": ocr_texts,
         "segments_ocr_corrected": segments,
         "segments_step1": segments,
+        "asr_deferred_regions_initial": deepcopy(deferred_regions),
+        "asr_deferred_regions_remaining": remaining_deferred,
+        # Compatibility alias for older diagnostics.  Step 1b never reads this
+        # mutable remainder again; it always reads the immutable initial field.
+        "asr_deferred_regions": remaining_deferred,
+        "asr_uncovered_regions_initial": deepcopy(initial_uncovered_regions),
+        "asr_uncovered_regions_remaining": updated_uncovered,
+        "asr_uncovered_regions": updated_uncovered,
+        "asr_recovery_report_initial": deepcopy(initial_recovery_report),
+        "asr_ocr_recovery_report": ocr_recovery_audit,
+        "asr_boundary_repair_report": boundary_repair_audit,
+        "asr_ocr_entity_correction_report": entity_correction_audit,
+        "asr_recovery_timing_report": recovery_timing_audit,
+        "asr_recovery_report": combined_recovery_report,
+        "asr_unresolved_dialogue_regions": blocking_regions,
+        "asr_acoustic_uncertain_regions": acoustic_uncertain,
+        "asr_non_dialogue_audited_regions": non_dialogue_audited,
         "ocr_optimized_manifest": {
             "version": OCR_OPTIMIZED_VERSION,
+            "recovery_version": "grouped-dense-context-v7-acoustic-placement",
             "binding": _implementation_binding(main_path),
             "mode": _mode() if enabled else "off",
             "input_scope": config.ocr_scope,
             "segments_sha256": _ocr_digest(segments),
         },
     })
+    if blocking_regions and getattr(config, "asr_require_complete_dialogue", False):
+        summary = ", ".join(
+            f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
+            for item in blocking_regions[:8]
+        )
+        raise RuntimeError(
+            "多源 ASR/OCR 仍有确认对白未恢复，严格覆盖模式拒绝继续："
+            f"{summary}。详细证据已保存到 project_state.json 的 "
+            "asr_unresolved_dialogue_regions。"
+        )
+    if blocking_regions:
+        summary = ", ".join(
+            f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
+            for item in blocking_regions[:8]
+        )
+        print(
+            "⚠️ 多源 ASR/OCR 仍有确认对白未恢复；"
+            f"已记入降级报告并继续流程: {summary}"
+        )
+    if non_dialogue_audited:
+        print(
+            f"ℹ️ {len(non_dialogue_audited)} 个区域经多源检查未发现可翻译对白，"
+            "已记入 asr_non_dialogue_audited_regions，未生成伪文本。"
+        )
+    if acoustic_uncertain:
+        print(
+            f"ℹ️ {len(acoustic_uncertain)} 个区域只有声学活动、没有任何文字证据，"
+            "已记入 asr_acoustic_uncertain_regions；不会伪造对白，也不会仅凭音量阻断。"
+        )
     print("✅ Step 1b 完成。最终 Step 1 文本已保存，可继续运行 --step 2。")
 
 
