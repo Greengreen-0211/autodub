@@ -63,6 +63,40 @@ def normalize_translation_candidates(
     return normalized
 
 
+def classify_coarse_recovery_duration(
+    *,
+    actual: float,
+    target: float,
+    available: float,
+    measured: bool,
+    minimum_slot_ratio: float = 0.65,
+    maximum_slot_ratio: float = 1.50,
+) -> Dict[str, Any]:
+    """Classify recovered TTS against its physical slot, not word timing.
+
+    ``target`` remains diagnostic because it is useful for natural pacing, but
+    it must not decide whether audio physically fits a coarse recovery window.
+    """
+    actual = max(0.0, float(actual))
+    target = max(0.0, float(target))
+    available = max(0.0, float(available))
+    target_ratio = actual / target if actual > 0 and target > 0 else 0.0
+    slot_ratio = actual / available if actual > 0 and available > 0 else 0.0
+    if not measured:
+        status = "suitable"
+    elif slot_ratio < float(minimum_slot_ratio):
+        status = "shorter_than_window"
+    elif slot_ratio > float(maximum_slot_ratio):
+        status = "too_long_blocking"
+    else:
+        status = "suitable"
+    return {
+        "status": status,
+        "target_ratio": round(target_ratio, 4),
+        "slot_ratio": round(slot_ratio, 4),
+    }
+
+
 def _language_code(value: Any) -> str:
     language = str(value or "").strip().lower().replace("_", "-")
     aliases = {"chinese": "zh", "mandarin": "zh", "english": "en"}
@@ -290,6 +324,25 @@ class LightTTSSelector:
         start = float(segment["start"])
         end = float(segment["end"])
         available = max(0.4, end - start)
+        # Coarse recovery explicitly means that only the outer acoustic bounds
+        # are trusted.  Speaker alignment can carry stale/collapsed Qwen word
+        # timestamps into a copied segment; using those values would turn a
+        # valid five-second slot into a fictitious 0.44-second target.
+        if segment.get("timestamp_precision") == "coarse":
+            try:
+                placement_start = float(segment.get("tts_placement_start"))
+                placement_end = float(segment.get("tts_placement_end"))
+                available_end = float(segment.get("tts_available_end", end))
+            except (TypeError, ValueError):
+                placement_start = placement_end = available_end = 0.0
+            if (
+                start <= placement_start < placement_end <= end + 0.001
+                and placement_start < available_end <= end + 0.001
+            ):
+                ideal = max(0.4, placement_end - placement_start)
+                maximum = max(0.4, available_end - placement_start)
+                return ideal, maximum
+            return available, available
         starts: List[float] = []
         ends: List[float] = []
         for item in segment.get("qwen3_time_stamps", []) or []:
@@ -416,9 +469,12 @@ class LightTTSSelector:
         target_language: Any,
         force: bool = False,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        from translation_quality import require_translated
+        from translation_quality import is_skipped, require_translated
         segments = list(segments)
         require_translated(segments, str(target_language))
+        segments = [segment for segment in segments if not is_skipped(segment)]
+        if not segments:
+            return [], []
         if hasattr(self.backend, "preflight"):
             self.backend.preflight(str(target_language))
         state = self._load()
@@ -572,6 +628,9 @@ class LightTTSSelector:
         failures = sum(r["status"] == "fallback" for r in selection_rows)
         fraction = float(os.getenv("AUTODUB_LIGHT_TTS_MAX_FALLBACK_FRACTION", "0.5"))
         if failures >= 2 and failures / max(1, len(selection_rows)) > fraction:
-            raise RuntimeError(f"LightTTS widespread failure: {failures}/{len(selection_rows)}; see {self.results_path}")
+            print(
+                f"⚠️ LightTTS 大面积测量失败: {failures}/{len(selection_rows)}；"
+                f"已使用文本时长估算继续，详见 {self.results_path}"
+            )
         print(f"LightTTS: measured={len(selection_rows)-failures} fallback={failures}")
         return output, selection_rows

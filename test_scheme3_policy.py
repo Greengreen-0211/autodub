@@ -68,8 +68,8 @@ def check_emotions() -> None:
     assert normalize_emotion("other") == "neutral"
     assert normalize_emotion("unknown-label") == "neutral"
     assert normalize_emotion("happy", score=0.49, duration=2.0) == "neutral"
-    assert normalize_emotion("happy", score=0.99, duration=0.79) == "neutral"
-    assert normalize_emotion("happy", score=0.99, duration=0.8) == "happy"
+    assert normalize_emotion("happy", score=0.99, duration=0.39) == "neutral"
+    assert normalize_emotion("happy", score=0.99, duration=0.4) == "happy"
 
 
 def check_complexity() -> None:

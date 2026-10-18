@@ -288,5 +288,24 @@ def recognize_segments(
         elif item:
             segment["emotion_status"] = item.get("status", "failed")
             segment["emotion_error"] = item.get("error", "")
+            segment["emotion_raw"] = "unknown"
+            segment["raw_emotion"] = "unknown"
+            segment["emotion"] = "neutral"
+            segment["normalized_emotion"] = "neutral"
+            segment["emotion_score"] = 0.0
+            segment["emotion_raw_score"] = 0.0
+            segment["emotion_reliable"] = False
+            segment["emotion_fallback_reason"] = "recognition_failed_neutral"
+        else:
+            segment["emotion_status"] = "degraded_neutral"
+            segment["emotion_error"] = "missing_worker_result"
+            segment["emotion_raw"] = "unknown"
+            segment["raw_emotion"] = "unknown"
+            segment["emotion"] = "neutral"
+            segment["normalized_emotion"] = "neutral"
+            segment["emotion_score"] = 0.0
+            segment["emotion_raw_score"] = 0.0
+            segment["emotion_reliable"] = False
+            segment["emotion_fallback_reason"] = "missing_result_neutral"
     _atomic_json(result_path, results)
     return apply_emotion_reliability(updated, model=model_dir)

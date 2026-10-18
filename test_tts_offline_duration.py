@@ -97,6 +97,18 @@ class OfflineTests(unittest.TestCase):
 
 
 class DurationTests(unittest.TestCase):
+    def test_reference_precision_gate_only_rejects_coarse_recovery(self):
+        self.assertTrue(tts_router._is_precise_reference_segment({}))
+        self.assertTrue(tts_router._is_precise_reference_segment({
+            "timestamp_precision": "word", "asr_source": "primary"
+        }))
+        self.assertFalse(tts_router._is_precise_reference_segment({
+            "timestamp_precision": "coarse"
+        }))
+        self.assertFalse(tts_router._is_precise_reference_segment({
+            "asr_recovery_status": "accepted_coarse"
+        }))
+
     def test_f5_native_duration_includes_processed_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
             raw = Path(tmp, "reference.wav")
@@ -142,6 +154,40 @@ class DurationTests(unittest.TestCase):
             ref = router._speaker_references(segments, str(source))["A"]
             self.assertAlmostEqual(tts_worker.wav_duration(Path(ref["audio"])), 7)
             self.assertEqual(ref["text"], "Complete short sentence.")
+
+    def test_reference_excludes_coarse_recovery_segments(self):
+        from pydub import AudioSegment
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp, "vocals.wav")
+            AudioSegment.silent(duration=20000).export(source, format="wav")
+            router = tts_router.TTSRouter(SimpleNamespace(temp_dir=tmp), scheme="scheme3")
+            router._reference_score = lambda segment, clip: float(segment["id"])
+            segments = [
+                {"id": 1, "start": 0, "end": 4, "speaker": "A",
+                 "original_text": "Clean precise reference.",
+                 "timestamp_precision": "word", "asr_source": "primary"},
+                {"id": 99, "start": 5, "end": 12, "speaker": "A",
+                 "original_text": "Recovered words.",
+                 "timestamp_precision": "coarse",
+                 "asr_recovery_status": "accepted_coarse"},
+            ]
+            ref = router._speaker_references(segments, str(source))["A"]
+            self.assertEqual(ref["text"], "Clean precise reference.")
+            self.assertAlmostEqual(tts_worker.wav_duration(Path(ref["audio"])), 4)
+
+    def test_reference_skips_speaker_with_only_coarse_recovery(self):
+        from pydub import AudioSegment
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp, "vocals.wav")
+            AudioSegment.silent(duration=5000).export(source, format="wav")
+            router = tts_router.TTSRouter(SimpleNamespace(temp_dir=tmp), scheme="scheme3")
+            segments = [{
+                "id": 1, "start": 0, "end": 4, "speaker": "A",
+                "original_text": "Recovered only.",
+                "timestamp_precision": "coarse",
+                "asr_recovery_status": "accepted_coarse",
+            }]
+            self.assertEqual(router._speaker_references(segments, str(source)), {})
 
     def test_worker_still_loads_once_for_two_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:

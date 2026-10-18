@@ -25,7 +25,7 @@ from scheme3_policy import (
     select_scheme3_tts_engine,
 )
 from tts_preflight import cache_environment, offline_mode, preflight_models
-from tts_quality import duration_quality
+from tts_quality import duration_quality, electricity_quality
 
 
 MODEL_DISPLAY = {
@@ -43,6 +43,15 @@ MODEL_ENVS = {
     "omnivoice": "omnivoice",
 }
 MODEL_ORDER = ("f5tts", "indextts2", "cosyvoice3", "confucius4", "omnivoice")
+
+
+def _is_precise_reference_segment(segment: Dict[str, Any]) -> bool:
+    """Whether a segment has audio/text alignment safe for voice reference."""
+    return not (
+        str(segment.get("timestamp_precision", "")).lower() == "coarse"
+        or str(segment.get("asr_recovery_status", "")).lower()
+        == "accepted_coarse"
+    )
 
 
 def _language_code(language: Any) -> str:
@@ -113,6 +122,13 @@ def _safe_id(value: Any) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value))
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _request_fingerprint(item: Dict[str, Any]) -> str:
     payload = {
         key: item.get(key)
@@ -147,6 +163,26 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _tts_timing(segment: Dict[str, Any]) -> tuple[float, float]:
+    """Return TTS placement and duration without mutating public boundaries."""
+    start = float(segment["start"])
+    end = float(segment["end"])
+    legacy = (start, max(0.0, end - start))
+    if not (
+        str(segment.get("asr_recovery_status") or "") == "accepted_coarse"
+        and str(segment.get("timestamp_precision") or "") == "coarse"
+    ):
+        return legacy
+    try:
+        placement_start = float(segment.get("tts_placement_start"))
+        placement_end = float(segment.get("tts_placement_end"))
+    except (TypeError, ValueError):
+        return legacy
+    if not (start <= placement_start < placement_end <= end + 0.001):
+        return legacy
+    return placement_start, placement_end - placement_start
+
+
 def _file_sha256(path: Path) -> str:
     digest=hashlib.sha256()
     with path.open("rb") as handle:
@@ -155,13 +191,37 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _atempo_factor(current: float, target: float) -> tuple[float, bool, float]:
+    """Time-scale factor with a configurable safety range (变速限制).
+
+    Returns ``(factor, capped, raw)``. ``capped`` is True only when a
+    speed-up was limited (``raw > maximum``): that direction produces
+    unnaturally fast speech, so the resulting over-length clip is accepted
+    rather than re-stretched. A slow-down clamp (``raw < minimum``) is not
+    flagged as ``capped`` because an under-length clip is a genuine synthesis
+    failure that should still trigger the duration retry.
+    """
+    if target <= 0.1 or abs(current - target) < 0.2:
+        return 1.0, False, 1.0
+    minimum = float(os.getenv("AUTODUB_TTS_ATEMPO_MIN", "0.8"))
+    maximum = float(os.getenv("AUTODUB_TTS_ATEMPO_MAX", "1.25"))
+    # ffmpeg's single atempo filter only accepts [0.5, 2.0]; clamp defensively.
+    minimum = max(0.5, min(minimum, 2.0))
+    maximum = max(0.5, min(maximum, 2.0))
+    if minimum > maximum:
+        minimum, maximum = maximum, minimum
+    raw = current / target
+    capped = raw > maximum
+    return max(minimum, min(raw, maximum)), capped, raw
+
+
 def _apply_atempo(source: Path, destination: Path, target_duration: float) -> Path:
     current = _wav_duration(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if target_duration <= 0.1 or abs(current - target_duration) < 0.2:
+    factor, _, _ = _atempo_factor(current, target_duration)
+    if factor == 1.0:
         shutil.copy2(source, destination)
         return destination
-    factor = max(0.6, min(current / target_duration, 2.0))
     temporary = destination.with_name(destination.stem + ".tmp.wav")
     subprocess.run(
         ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-filter:a", f"atempo={factor:.6f}", "-vn", str(temporary)],
@@ -169,6 +229,61 @@ def _apply_atempo(source: Path, destination: Path, target_duration: float) -> Pa
     )
     os.replace(temporary, destination)
     return destination
+
+
+def _trim_silence(source: Path, destination: Path) -> Path:
+    """Trim leading/trailing silence (TTS首尾静音).
+
+    Leading silence delays the dub relative to the on-screen mouth movement;
+    trailing silence needlessly extends the clip. A fully-silent clip is left
+    untouched rather than dropped.
+    """
+    if not _env_bool("AUTODUB_TTS_TRIM_SILENCE", True):
+        shutil.copy2(source, destination)
+        return destination
+    from pydub import AudioSegment
+    from pydub import silence as pydub_silence
+    clip = AudioSegment.from_wav(str(source))
+    if len(clip) <= 300:
+        shutil.copy2(source, destination)
+        return destination
+    threshold = float(os.getenv("AUTODUB_TTS_SILENCE_THRESH_DBFS", "-45"))
+    min_len = int(os.getenv("AUTODUB_TTS_SILENCE_MIN_LEN_MS", "100"))
+    pad = int(os.getenv("AUTODUB_TTS_SILENCE_PAD_MS", "30"))
+    ranges = pydub_silence.detect_nonsilent(clip, min_silence_len=min_len, silence_thresh=threshold)
+    if not ranges:
+        shutil.copy2(source, destination)
+        return destination
+    start = max(0, ranges[0][0] - pad)
+    end = min(len(clip), ranges[-1][1] + pad)
+    if end <= start:
+        shutil.copy2(source, destination)
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    clip[start:end].export(str(destination), format="wav")
+    return destination
+
+
+def _postprocess(source: Path, destination: Path, target_duration: float) -> Dict[str, Any]:
+    """Trim silence then time-scale to target; return post-processing metrics."""
+    trimmed = destination.with_name(destination.stem + ".trim.wav")
+    try:
+        pre_trim = _wav_duration(source)
+        _trim_silence(source, trimmed)
+        post_trim = _wav_duration(trimmed)
+        factor, capped, raw = _atempo_factor(post_trim, target_duration)
+        _apply_atempo(trimmed, destination, target_duration)
+    finally:
+        if trimmed.exists():
+            trimmed.unlink(missing_ok=True)
+    return {
+        "pre_trim_duration": pre_trim,
+        "post_trim_duration": post_trim,
+        "atempo_factor": factor,
+        "atempo_raw_factor": round(raw, 6),
+        "atempo_capped": bool(capped),
+        "actual_duration": _wav_duration(destination),
+    }
 
 
 def _worker_environment(model: str) -> Dict[str, str]:
@@ -256,11 +371,11 @@ def synthesize(
     metadata = results.get("0", {})
     if code != 0 or metadata.get("status") != "success":
         raise RuntimeError(metadata.get("error", f"{model} worker exited with {code}"))
-    _apply_atempo(raw, destination, float(target_duration or 0.0))
+    metadata.update(_postprocess(raw, destination, float(target_duration or 0.0)))
     metadata["file"] = str(destination)
-    metadata["actual_duration"] = _wav_duration(destination)
     metadata["target_duration"] = float(target_duration or 0.0)
     metadata["duration_error"] = metadata["actual_duration"] - metadata["target_duration"] if target_duration else None
+    metadata.update(electricity_quality(destination))
     _atomic_json(result, results)
     return metadata
 
@@ -304,6 +419,13 @@ class TTSRouter:
             for index, segment in enumerate(segments):
                 if str(segment.get("speaker", "SPEAKER_00")) != speaker:
                     continue
+                # Coarse ASR recovery provides only an outer dialogue window.
+                # Its audio may contain additional words, pauses, or another
+                # turn that are absent from the recovered transcript.  Such a
+                # clip is valid for dubbing, but unsafe as paired reference
+                # audio/text for a voice-cloning model.
+                if not _is_precise_reference_segment(segment):
+                    continue
                 start = max(0, int(round(float(segment["start"]) * 1000)))
                 end = min(len(full_audio), int(round(float(segment["end"]) * 1000)))
                 clip = full_audio[start:end]
@@ -311,7 +433,11 @@ class TTSRouter:
                     continue
                 candidates.append((self._reference_score(segment, clip), index, segment, clip))
             if not candidates:
-                raise RuntimeError(f"{speaker} 没有可用参考音频")
+                print(
+                    f"⚠️ {speaker} 没有可用的精确边界参考音频；"
+                    "粗边界恢复句仍不会用于声纹参考，该说话人将单独降级"
+                )
+                continue
             candidates.sort(key=lambda item: (item[0], len(item[3])), reverse=True)
             chosen = []
             total_ms = 0
@@ -345,9 +471,9 @@ class TTSRouter:
 
     def run(self, segments: Iterable[Dict[str, Any]], vocal_path: str, *, force: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         from translation_quality import is_skipped, require_translated
-        # Segments degraded by the translation policy keep their original audio
-        # and must never reach a TTS engine: by construction they carry no
-        # validated text.
+        # Segments without any safe target-language text never reach a TTS
+        # engine. Step 5 leaves their position silent instead of restoring the
+        # source vocal, so the final mix cannot leak the source language.
         segment_list = [dict(segment) for segment in segments if not is_skipped(segment)]
         require_translated(segment_list, self.config.target_lang, getattr(self.config, "source_lang", ""))
         self.raw_dir.mkdir(parents=True, exist_ok=True)
@@ -355,6 +481,7 @@ class TTSRouter:
         references = self._speaker_references(segment_list, vocal_path)
         previous = _load_results(self.result_path)
         items = []
+        unreferenced_results = []
         seen = set()
         for index, segment in enumerate(segment_list):
             text = str(segment.get("text", "")).strip()
@@ -363,7 +490,19 @@ class TTSRouter:
                 raise ValueError(f"invalid/duplicate TTS segment: {segment_id}")
             seen.add(segment_id)
             speaker = str(segment.get("speaker", "SPEAKER_00"))
-            duration = float(segment["end"]) - float(segment["start"])
+            if speaker not in references:
+                failure = {
+                    "segment_id": segment_id,
+                    "status": "failed",
+                    "error": "no_safe_precise_reference_audio",
+                    "planned_engine": segment.get("tts_engine"),
+                    "actual_engine": None,
+                    "fallback_count": 0,
+                }
+                previous[segment_id] = failure
+                unreferenced_results.append(failure)
+                continue
+            placement_start, duration = _tts_timing(segment)
             raw_emotion = segment.get("raw_emotion", segment.get("emotion_raw", segment.get("emotion")))
             if "emotion_reliable" in segment:
                 emotion = normalize_emotion(segment.get("emotion")) if segment["emotion_reliable"] else "neutral"
@@ -385,7 +524,12 @@ class TTSRouter:
                 "emotion": emotion, "emotion_score": segment.get("emotion_score"),
                 "speaker": speaker, "ref_audio": references[speaker]["audio"],
                 "ref_text": references[speaker]["text"], "target_duration": duration,
-                "start": float(segment["start"]), "model": model, "tts_engine": model,
+                "start": placement_start, "model": model, "tts_engine": model,
+                "placement_source": (
+                    segment.get("recovery_timing_method")
+                    if placement_start != float(segment["start"])
+                    else "segment_start"
+                ),
                 "planned_engine": model, "fallback_count": 0, "fallback_reason": "",
                 "translations_candidates": segment.get("translations_candidates", []),
                 "attempted_engines": [model], "attempted_texts": [text],
@@ -395,7 +539,6 @@ class TTSRouter:
             job["planned_request_fingerprint"] = job["request_fingerprint"]
             items.append(job)
 
-        preflight_models({item["model"] for item in items})
         active = []
         for item in items:
             known = previous.get(item["segment_id"], {})
@@ -411,8 +554,14 @@ class TTSRouter:
                 try:
                     valid = known.get("request_fingerprint")==resumed["request_fingerprint"]
                     actual = _wav_duration(Path(known["file"])) if valid else 0
+                    measured_quality = duration_quality(actual, item["target_duration"])["duration_quality"]
+                    saved_quality = str(known.get("duration_quality", ""))
                     if (valid and known.get("audio_sha256")==_file_sha256(Path(known["file"])) and
-                            duration_quality(actual,item["target_duration"])["duration_quality"]=="passed"):
+                            (
+                                measured_quality == "passed"
+                                or saved_quality == "degraded"
+                                or bool(known.get("atempo_capped"))
+                            )):
                         item.update(resumed, fallback_count=known.get("fallback_count",0),
                                     fallback_reason=known.get("fallback_reason",""))
                         previous[item["segment_id"]] = dict(known)
@@ -427,32 +576,10 @@ class TTSRouter:
             self._execute(active, force=force)
             previous = _load_results(self.result_path)
 
-        # Retry duration violations using another validated translation candidate.
-        retries = max(0, min(3, int(os.getenv("AUTODUB_TTS_DURATION_RETRIES", "1"))))
-        for _ in range(retries):
-            retry = []
-            for item in items:
-                result = previous.get(item["segment_id"], {})
-                if result.get("status")=="success" or result.get("duration_quality")!="failed":
-                    continue
-                alternatives = [str(c.get("text","")).strip() for c in item["translations_candidates"]
-                                if str(c.get("text","")).strip() not in item["attempted_texts"]]
-                if not alternatives:
-                    continue
-                generated = float(result.get("generated_duration") or result.get("actual_duration") or 0.1)
-                desired = len(item["text"]) * item["target_duration"] / max(0.1, generated)
-                item["text"] = min(alternatives, key=lambda text: abs(len(text)-desired))
-                item["attempted_texts"].append(item["text"])
-                item["request_fingerprint"] = _request_fingerprint(item)
-                item["force_regenerate"] = True
-                retry.append(item)
-            if not retry:
-                break
-            self._execute(retry, force=True)
-            previous = _load_results(self.result_path)
-
         if not getattr(self.config, "disable_tts_fallback", False):
-            for _ in range(4):
+            # Planned engine plus at most two fallback engines. Duration
+            # mismatch is not an engine failure and never enters this loop.
+            for _ in range(2):
                 retry = []
                 for item in items:
                     result = previous.get(item["segment_id"], {})
@@ -472,12 +599,7 @@ class TTSRouter:
                     self._job_paths(item)
                     item["request_fingerprint"] = _request_fingerprint(item)
                     item["force_regenerate"] = True
-                    try:
-                        preflight_models([model])
-                        retry.append(item)
-                    except RuntimeError as exc:
-                        previous[item["segment_id"]] = dict(result, status="failed", error=str(exc))
-                        _atomic_json(self.result_path, previous)
+                    retry.append(item)
                 if not retry:
                     if any(previous.get(i["segment_id"],{}).get("status")!="success" and
                            any(m not in i["attempted_engines"] for m in self._fallback_chain(i["planned_engine"],i["target_language"])) for i in items):
@@ -499,7 +621,9 @@ class TTSRouter:
                             planned_request_fingerprint=item["planned_request_fingerprint"],
                             request_fingerprint=item["request_fingerprint"], target_duration=item["target_duration"],
                             generation_request={k:item[k] for k in ("text","language","target_language","emotion",
-                                               "speaker","ref_audio","ref_text","target_duration","model")},
+                                               "speaker","ref_audio","ref_text","target_duration","start","model")},
+                            placement_start=item["start"],
+                            placement_source=item.get("placement_source", "segment_start"),
                             speaker=item["speaker"], emotion=item["emotion"],
                             source_language=item["source_language"], target_language=item["target_language"],
                             target_language_raw=item["target_language_raw"])
@@ -513,6 +637,7 @@ class TTSRouter:
                   f"status={metadata.get('status','failed')} fallback={item['fallback_count']}")
         _atomic_json(self.result_path, previous)
         _atomic_json(self.plan_path, {"items":items})
+        output_rows.extend(unreferenced_results)
         print("TTS quality failures:", [{"id":r["segment_id"], "error":r.get("error")} for r in output_rows if r.get("status")!="success"])
         return clips, output_rows
 
@@ -533,7 +658,9 @@ class TTSRouter:
             raise ValueError(f"invalid fallback chain for {model}: {chain}")
         if language not in {"zh","en"} and any(m!="omnivoice" for m in chain):
             raise ValueError("non-Chinese/English fallback must stay on OmniVoice")
-        return chain
+        # Planned engine plus at most two distinct fallbacks: three engines in
+        # total, with no repeated execution of a deterministically failed one.
+        return chain[:2]
 
     def _execute(self, items, *, force):
         # Each worker receives ONLY its pending jobs; raw reuse must match fingerprints.
@@ -541,6 +668,18 @@ class TTSRouter:
         for model in MODEL_ORDER:
             pending = [item for item in items if item["model"]==model]
             if not pending:
+                continue
+            try:
+                preflight_models([model])
+            except RuntimeError as exc:
+                for item in pending:
+                    results[item["segment_id"]] = {
+                        "segment_id": item["segment_id"],
+                        "status": "failed",
+                        "error": str(exc),
+                        "request_fingerprint": item["request_fingerprint"],
+                    }
+                _atomic_json(self.result_path, results)
                 continue
             _atomic_json(self.plan_path, {"items":pending})
             for item in pending:
@@ -558,13 +697,33 @@ class TTSRouter:
                     metadata.update(status="failed",error=f"{model} worker exited with {code}")
                 if metadata.get("status")=="success":
                     try:
-                        _apply_atempo(Path(item["raw_path"]),Path(item["final_path"]),item["target_duration"])
-                        actual = _wav_duration(Path(item["final_path"]))
-                        metadata.update(file=item["final_path"],actual_duration=actual,
+                        post = _postprocess(Path(item["raw_path"]), Path(item["final_path"]), item["target_duration"])
+                        actual = post["actual_duration"]
+                        metadata.update(post)
+                        metadata.update(file=item["final_path"], actual_duration=actual,
                                         audio_sha256=_file_sha256(Path(item["final_path"])),
-                                        **duration_quality(actual,item["target_duration"]))
-                        if metadata["duration_quality"]=="failed":
-                            metadata.update(status="failed",error=f"duration quality failed: {actual:.3f}/{item['target_duration']:.3f}")
+                                        **duration_quality(actual, item["target_duration"]))
+                        # When atempo was deliberately capped to keep the voice
+                        # natural, keep that fact in the audit metadata.
+                        if metadata["atempo_capped"] and metadata["duration_quality"]=="failed":
+                            metadata["duration_quality_note"] = "atempo capped: duration mismatch accepted to avoid unnatural speed"
+                        metadata.update(electricity_quality(Path(item["final_path"])))
+                        # 电音检测：block policy turns a detected artifact into a
+                        # failure so the fallback chain can try another engine.
+                        if (metadata.get("electricity_quality")=="failed" and
+                                os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY","warn").strip().lower()=="block"):
+                            metadata.update(status="failed", error=metadata.get("electricity_reason","electric artifact detected"))
+                        elif metadata["duration_quality"]=="failed":
+                            # Keep the best generated clip instead of dropping
+                            # the sentence.  The mismatch remains auditable and
+                            # Step 5 can still place the usable audio.
+                            metadata.update(
+                                status="success",
+                                duration_quality="degraded",
+                                duration_degraded_reason=(
+                                    f"best_available_duration: {actual:.3f}/{item['target_duration']:.3f}"
+                                ),
+                            )
                     except Exception as exc:
                         metadata.update(status="failed",error=f"duration adaptation failed: {exc}")
                 results[sid] = metadata
