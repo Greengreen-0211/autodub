@@ -3374,6 +3374,7 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
         "asr_deferred_regions_initial", "asr_deferred_regions_remaining",
         "asr_uncovered_regions_initial", "asr_uncovered_regions_remaining",
         "asr_recovery_report_initial",
+        "asr_recovery_timing_report",
         "asr_unresolved_dialogue_regions", "asr_acoustic_uncertain_regions",
         "asr_non_dialogue_audited_regions",
         "asr_tts_duration_blocked_ids",

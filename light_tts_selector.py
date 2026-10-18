@@ -329,6 +329,19 @@ class LightTTSSelector:
         # timestamps into a copied segment; using those values would turn a
         # valid five-second slot into a fictitious 0.44-second target.
         if segment.get("timestamp_precision") == "coarse":
+            try:
+                placement_start = float(segment.get("tts_placement_start"))
+                placement_end = float(segment.get("tts_placement_end"))
+                available_end = float(segment.get("tts_available_end", end))
+            except (TypeError, ValueError):
+                placement_start = placement_end = available_end = 0.0
+            if (
+                start <= placement_start < placement_end <= end + 0.001
+                and placement_start < available_end <= end + 0.001
+            ):
+                ideal = max(0.4, placement_end - placement_start)
+                maximum = max(0.4, available_end - placement_start)
+                return ideal, maximum
             return available, available
         starts: List[float] = []
         ends: List[float] = []

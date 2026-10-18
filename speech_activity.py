@@ -8,7 +8,7 @@ SAD mask.  It never creates sentence boundaries by itself.
 from __future__ import annotations
 
 import math
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 
 TimeRange = Tuple[float, float]
@@ -73,6 +73,141 @@ def intersect_ranges(
         else:
             right_index += 1
     return intersections
+
+
+def attach_coarse_tts_placement(
+    segments: Sequence[Mapping[str, Any]],
+    speech_ranges: Sequence[TimeRange],
+    *,
+    pre_roll: float = 0.06,
+    post_roll: float = 0.08,
+    subtitle_tolerance: float = 0.70,
+    min_activity: float = 0.16,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Attach acoustic TTS windows only to coarse recovered dialogue.
+
+    Existing ``start``/``end`` values are immutable. OCR timing is merely a
+    soft ordering hint; final placement always starts on detected vocal
+    activity. Precise ASR segments never receive these internal fields.
+    """
+    active = merge_ranges(speech_ranges, max_gap=0.10)
+    output: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    for source in segments:
+        segment = dict(source)
+        if not (
+            str(segment.get("asr_recovery_status") or "") == "accepted_coarse"
+            and str(segment.get("timestamp_precision") or "") == "coarse"
+        ):
+            output.append(segment)
+            continue
+
+        outer_start = float(segment.get("start", 0.0))
+        outer_end = float(segment.get("end", outer_start))
+        overlaps = intersect_ranges(active, [(outer_start, outer_end)])
+        record: Dict[str, Any] = {
+            "segment_id": str(segment.get("id")),
+            "outer_start": round(outer_start, 3),
+            "outer_end": round(outer_end, 3),
+            "speech_candidates": [
+                [round(start, 3), round(end, 3)] for start, end in overlaps
+            ],
+        }
+        if not overlaps:
+            record.update(accepted=False, reason="no_acoustic_activity_in_outer_window")
+            audit.append(record)
+            output.append(segment)
+            continue
+
+        hint_value = segment.get("ocr_subtitle_first_seen")
+        try:
+            hint = float(hint_value) if hint_value is not None else None
+        except (TypeError, ValueError):
+            hint = None
+
+        first_index = 0
+        if hint is not None and len(overlaps) > 1:
+            # Prefer speech that contains or follows the subtitle observation.
+            # Subtitle text commonly appears shortly before the voice; choosing
+            # a nearby *preceding* speech island would recreate the early-start
+            # bug this function is meant to prevent.
+            eligible = [
+                index
+                for index, (_, end) in enumerate(overlaps)
+                if end >= hint
+            ]
+            if not eligible:
+                eligible = [
+                    index
+                    for index, (_, end) in enumerate(overlaps)
+                    if end >= hint - float(subtitle_tolerance)
+                ]
+            if eligible:
+                first_index = min(
+                    eligible,
+                    key=lambda index: (
+                        0.0
+                        if overlaps[index][0] <= hint <= overlaps[index][1]
+                        else min(
+                            abs(hint - overlaps[index][0]),
+                            abs(hint - overlaps[index][1]),
+                        ),
+                        index,
+                    ),
+                )
+
+        selected = overlaps[first_index:]
+        active_duration = sum(end - start for start, end in selected)
+        if active_duration < float(min_activity):
+            record.update(
+                accepted=False,
+                reason="insufficient_acoustic_activity",
+                active_duration=round(active_duration, 3),
+            )
+            audit.append(record)
+            output.append(segment)
+            continue
+
+        acoustic_start = float(selected[0][0])
+        acoustic_end = float(selected[-1][1])
+        placement_start = max(outer_start, acoustic_start - float(pre_roll))
+        placement_end = min(outer_end, acoustic_end + float(post_roll))
+        if placement_end - placement_start < float(min_activity):
+            record.update(accepted=False, reason="invalid_refined_window")
+            audit.append(record)
+            output.append(segment)
+            continue
+
+        outer_duration = max(0.001, outer_end - outer_start)
+        activity_ratio = min(1.0, active_duration / outer_duration)
+        confidence = min(0.95, 0.62 + 0.25 * activity_ratio)
+        segment.update(
+            {
+                "recovery_outer_start": round(outer_start, 3),
+                "recovery_outer_end": round(outer_end, 3),
+                "speech_anchor_start": round(acoustic_start, 3),
+                "speech_anchor_end": round(acoustic_end, 3),
+                "tts_placement_start": round(placement_start, 3),
+                "tts_placement_end": round(placement_end, 3),
+                "tts_available_end": round(outer_end, 3),
+                "recovery_timing_method": "vocal_activity_with_ocr_soft_hint",
+                "recovery_timing_confidence": round(confidence, 4),
+            }
+        )
+        record.update(
+            accepted=True,
+            reason="acoustic_activity_window",
+            subtitle_first_seen=(round(hint, 3) if hint is not None else None),
+            selected_candidate_index=first_index,
+            placement_start=round(placement_start, 3),
+            placement_end=round(placement_end, 3),
+            available_end=round(outer_end, 3),
+            active_duration=round(active_duration, 3),
+            confidence=round(confidence, 4),
+        )
+        audit.append(record)
+        output.append(segment)
+    return output, audit
 
 
 def detect_speech_regions(

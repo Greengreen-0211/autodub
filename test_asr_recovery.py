@@ -19,6 +19,9 @@ from light_tts_selector import (
 )
 from ocr_translation_reference import prepare_ocr_translation_references
 from run_step2_wespeaker import invalidate_downstream_state
+from speaker_alignment import merge_adjacent_speaker_turns
+from speech_activity import attach_coarse_tts_placement
+from tts_router import _tts_timing
 from ocr_v211_integration import (
     _load_initial_recovery_state,
     _partition_deferred_regions,
@@ -28,6 +31,101 @@ from ocr_v211_integration import (
 
 
 class OCRTimelineTests(unittest.TestCase):
+    def test_coarse_tts_placement_uses_acoustic_onset_without_moving_bounds(self):
+        segment = {
+            "id": 7,
+            "start": 40.0,
+            "end": 50.0,
+            "text": "Do the magic!",
+            "asr_recovery_status": "accepted_coarse",
+            "timestamp_precision": "coarse",
+            "ocr_subtitle_first_seen": 43.0,
+        }
+        refined, audit = attach_coarse_tts_placement(
+            [segment], [(40.1, 40.8), (43.4, 46.2)]
+        )
+        self.assertEqual(refined[0]["start"], 40.0)
+        self.assertEqual(refined[0]["end"], 50.0)
+        self.assertEqual(refined[0]["tts_placement_start"], 43.34)
+        self.assertEqual(refined[0]["tts_placement_end"], 46.28)
+        self.assertTrue(audit[0]["accepted"])
+        placement, duration = _tts_timing(refined[0])
+        self.assertAlmostEqual(placement, 43.34)
+        self.assertAlmostEqual(duration, 2.94)
+        ideal, available = LightTTSSelector._speech_window(refined[0])
+        self.assertAlmostEqual(ideal, 2.94)
+        self.assertAlmostEqual(available, 6.66)
+
+    def test_precise_segment_is_unchanged_by_coarse_timing_refiner(self):
+        segment = {
+            "id": 1,
+            "start": 13.09,
+            "end": 17.29,
+            "text": "Elsa, wake up!",
+            "asr_recovery_status": "primary",
+            "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Elsa", "start": 13.09, "end": 13.40}
+            ],
+        }
+        refined, audit = attach_coarse_tts_placement([segment], [(13.1, 17.2)])
+        self.assertEqual(refined[0], segment)
+        self.assertEqual(audit, [])
+
+    def test_coarse_tts_placement_is_idempotent(self):
+        segment = {
+            "id": 8,
+            "start": 50.0,
+            "end": 60.0,
+            "text": "This is amazing!",
+            "asr_recovery_status": "accepted_coarse",
+            "timestamp_precision": "coarse",
+        }
+        once, _ = attach_coarse_tts_placement([segment], [(53.0, 55.0)])
+        twice, _ = attach_coarse_tts_placement(once, [(53.0, 55.0)])
+        self.assertEqual(once, twice)
+
+    def test_coarse_without_activity_keeps_legacy_timing(self):
+        segment = {
+            "id": 9,
+            "start": 60.0,
+            "end": 64.0,
+            "text": "Hello!",
+            "asr_recovery_status": "accepted_coarse",
+            "timestamp_precision": "coarse",
+        }
+        refined, audit = attach_coarse_tts_placement([segment], [])
+        self.assertEqual(refined[0], segment)
+        self.assertFalse(audit[0]["accepted"])
+        self.assertEqual(_tts_timing(refined[0]), (60.0, 4.0))
+
+    def test_step2_does_not_merge_away_a_coarse_tts_window(self):
+        segments = [
+            {
+                "id": 1,
+                "start": 40.0,
+                "end": 42.0,
+                "text": "Come on!",
+                "speaker": "SPEAKER_00",
+                "timestamp_precision": "word",
+                "asr_recovery_status": "primary",
+            },
+            {
+                "id": 2,
+                "start": 42.1,
+                "end": 48.0,
+                "text": "Do the magic!",
+                "speaker": "SPEAKER_00",
+                "timestamp_precision": "coarse",
+                "asr_recovery_status": "accepted_coarse",
+                "tts_placement_start": 43.2,
+                "tts_placement_end": 45.4,
+            },
+        ]
+        merged = merge_adjacent_speaker_turns(segments)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[1]["tts_placement_start"], 43.2)
+
     @staticmethod
     def _entity_segment(text="Aurora, wake up!"):
         stamps = [

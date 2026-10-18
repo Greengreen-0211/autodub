@@ -740,6 +740,9 @@ def _implementation_binding(main_path: Path) -> str:
         "runtime": FrozenBOCRPipeline(FROZEN_B_PROMPT).binding,
         "pipeline": hashlib.sha256(main_path.read_bytes()).hexdigest(),
         "integration": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "speech_activity": hashlib.sha256(
+            Path(__file__).with_name("speech_activity.py").read_bytes()
+        ).hexdigest(),
         "prompt": FROZEN_B_PROMPT_SHA256,
     })
 
@@ -811,6 +814,8 @@ def _recover_deferred_from_ocr(
                 "ocr_recovery_frame_count": event.get("frame_count", 0),
                 "ocr_recovery_parent_id": region_id,
                 "ocr_recovery_event_index": event_index,
+                "ocr_subtitle_first_seen": round(float(event["first_seen"]), 3),
+                "ocr_subtitle_last_seen": round(float(event["last_seen"]), 3),
             }
             segment = coarse_segment(
                 seed,
@@ -1112,6 +1117,38 @@ def run_step_1b_optimized(
                 "多帧稳定的人名拼写修复。"
             )
 
+    from speech_activity import attach_coarse_tts_placement, detect_speech_regions
+
+    recovery_timing_audit: List[Dict[str, Any]] = []
+    vocals_path = str(state.get("vocals_path") or "")
+    if vocals_path and os.path.isfile(vocals_path):
+        try:
+            speech_ranges, timing_diagnostics = detect_speech_regions(
+                vocals_path,
+                min_silence_ms=160,
+                keep_ms=20,
+                merge_gap_ms=100,
+                min_region_ms=140,
+            )
+            segments, recovery_timing_audit = attach_coarse_tts_placement(
+                segments, speech_ranges
+            )
+            accepted_timing = sum(
+                bool(item.get("accepted")) for item in recovery_timing_audit
+            )
+            if recovery_timing_audit:
+                print(
+                    f"✅ 粗恢复句声学落点: {accepted_timing}/"
+                    f"{len(recovery_timing_audit)} 个句子获得独立 TTS 放置窗口。"
+                )
+            for item in recovery_timing_audit:
+                item["detector"] = timing_diagnostics
+        except Exception as exc:
+            print(
+                "⚠️ 粗恢复句声学落点分析失败，保留原始粗边界: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
     state_mgr.delete_keys(downstream_state_keys)
     combined_recovery_report = [
         *deepcopy(initial_recovery_report),
@@ -1136,13 +1173,14 @@ def run_step_1b_optimized(
         "asr_ocr_recovery_report": ocr_recovery_audit,
         "asr_boundary_repair_report": boundary_repair_audit,
         "asr_ocr_entity_correction_report": entity_correction_audit,
+        "asr_recovery_timing_report": recovery_timing_audit,
         "asr_recovery_report": combined_recovery_report,
         "asr_unresolved_dialogue_regions": blocking_regions,
         "asr_acoustic_uncertain_regions": acoustic_uncertain,
         "asr_non_dialogue_audited_regions": non_dialogue_audited,
         "ocr_optimized_manifest": {
             "version": OCR_OPTIMIZED_VERSION,
-            "recovery_version": "grouped-dense-context-v6-bilingual-entity",
+            "recovery_version": "grouped-dense-context-v7-acoustic-placement",
             "binding": _implementation_binding(main_path),
             "mode": _mode() if enabled else "off",
             "input_scope": config.ocr_scope,

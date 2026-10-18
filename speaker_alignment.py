@@ -620,11 +620,24 @@ def merge_adjacent_speaker_turns(
         left = merged[-1]
         gap = float(segment["start"]) - float(left["end"])
         combined_duration = float(segment["end"]) - float(left["start"])
+        left_is_coarse = (
+            left.get("asr_recovery_status") == "accepted_coarse"
+            and left.get("timestamp_precision") == "coarse"
+        )
+        right_is_coarse = (
+            segment.get("asr_recovery_status") == "accepted_coarse"
+            and segment.get("timestamp_precision") == "coarse"
+        )
         if (
             normalize_speaker(left.get("speaker"))
             == normalize_speaker(segment.get("speaker"))
             and gap <= max_gap_seconds
             and combined_duration <= maximum_turn_seconds
+            # A coarse recovered sentence owns an independent acoustic TTS
+            # placement window. Merging it with a neighbour would retain only
+            # one window and make the combined text start too early or late.
+            and not left_is_coarse
+            and not right_is_coarse
             and not left.get("speaker_boundary_ambiguous")
             and not segment.get("speaker_boundary_ambiguous")
         ):

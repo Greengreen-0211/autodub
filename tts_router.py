@@ -156,6 +156,26 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _tts_timing(segment: Dict[str, Any]) -> tuple[float, float]:
+    """Return TTS placement and duration without mutating public boundaries."""
+    start = float(segment["start"])
+    end = float(segment["end"])
+    legacy = (start, max(0.0, end - start))
+    if not (
+        str(segment.get("asr_recovery_status") or "") == "accepted_coarse"
+        and str(segment.get("timestamp_precision") or "") == "coarse"
+    ):
+        return legacy
+    try:
+        placement_start = float(segment.get("tts_placement_start"))
+        placement_end = float(segment.get("tts_placement_end"))
+    except (TypeError, ValueError):
+        return legacy
+    if not (start <= placement_start < placement_end <= end + 0.001):
+        return legacy
+    return placement_start, placement_end - placement_start
+
+
 def _file_sha256(path: Path) -> str:
     digest=hashlib.sha256()
     with path.open("rb") as handle:
@@ -382,7 +402,7 @@ class TTSRouter:
                 raise ValueError(f"invalid/duplicate TTS segment: {segment_id}")
             seen.add(segment_id)
             speaker = str(segment.get("speaker", "SPEAKER_00"))
-            duration = float(segment["end"]) - float(segment["start"])
+            placement_start, duration = _tts_timing(segment)
             raw_emotion = segment.get("raw_emotion", segment.get("emotion_raw", segment.get("emotion")))
             if "emotion_reliable" in segment:
                 emotion = normalize_emotion(segment.get("emotion")) if segment["emotion_reliable"] else "neutral"
@@ -404,7 +424,12 @@ class TTSRouter:
                 "emotion": emotion, "emotion_score": segment.get("emotion_score"),
                 "speaker": speaker, "ref_audio": references[speaker]["audio"],
                 "ref_text": references[speaker]["text"], "target_duration": duration,
-                "start": float(segment["start"]), "model": model, "tts_engine": model,
+                "start": placement_start, "model": model, "tts_engine": model,
+                "placement_source": (
+                    segment.get("recovery_timing_method")
+                    if placement_start != float(segment["start"])
+                    else "segment_start"
+                ),
                 "planned_engine": model, "fallback_count": 0, "fallback_reason": "",
                 "translations_candidates": segment.get("translations_candidates", []),
                 "attempted_engines": [model], "attempted_texts": [text],
@@ -518,7 +543,9 @@ class TTSRouter:
                             planned_request_fingerprint=item["planned_request_fingerprint"],
                             request_fingerprint=item["request_fingerprint"], target_duration=item["target_duration"],
                             generation_request={k:item[k] for k in ("text","language","target_language","emotion",
-                                               "speaker","ref_audio","ref_text","target_duration","model")},
+                                               "speaker","ref_audio","ref_text","target_duration","start","model")},
+                            placement_start=item["start"],
+                            placement_source=item.get("placement_source", "segment_start"),
                             speaker=item["speaker"], emotion=item["emotion"],
                             source_language=item["source_language"], target_language=item["target_language"],
                             target_language_raw=item["target_language_raw"])
