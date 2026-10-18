@@ -469,9 +469,12 @@ class LightTTSSelector:
         target_language: Any,
         force: bool = False,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        from translation_quality import require_translated
+        from translation_quality import is_skipped, require_translated
         segments = list(segments)
         require_translated(segments, str(target_language))
+        segments = [segment for segment in segments if not is_skipped(segment)]
+        if not segments:
+            return [], []
         if hasattr(self.backend, "preflight"):
             self.backend.preflight(str(target_language))
         state = self._load()
@@ -625,6 +628,9 @@ class LightTTSSelector:
         failures = sum(r["status"] == "fallback" for r in selection_rows)
         fraction = float(os.getenv("AUTODUB_LIGHT_TTS_MAX_FALLBACK_FRACTION", "0.5"))
         if failures >= 2 and failures / max(1, len(selection_rows)) > fraction:
-            raise RuntimeError(f"LightTTS widespread failure: {failures}/{len(selection_rows)}; see {self.results_path}")
+            print(
+                f"⚠️ LightTTS 大面积测量失败: {failures}/{len(selection_rows)}；"
+                f"已使用文本时长估算继续，详见 {self.results_path}"
+            )
         print(f"LightTTS: measured={len(selection_rows)-failures} fallback={failures}")
         return output, selection_rows

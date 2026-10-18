@@ -24,14 +24,14 @@ OCR_HARD_CONFLICTS = {
     "corrupt_text",
 }
 
-# Translation is fail-closed by default: one segment that cannot be validated
-# stops the stage instead of letting an untranslated line reach the mixer.
-# AUTODUB_TRANSLATION_FAILURE_POLICY=skip_failed is the explicit opt-out for
-# long videos -- blocking segments are marked as skipped, left undubbed, and
-# their original vocals are restored in Step 5.
-TRANSLATION_POLICIES = ("fail_fast", "skip_failed")
-DEFAULT_TRANSLATION_POLICY = "fail_fast"
+# Production runs are best-effort by default. A malformed API response may be
+# retried, while an imperfect response keeps its best safe target-language
+# candidate. Segments with no usable target text stay undubbed and never fall
+# back to source-language vocals.
+TRANSLATION_POLICIES = ("best_available", "fail_fast", "skip_failed")
+DEFAULT_TRANSLATION_POLICY = "best_available"
 SKIPPED_STATUS = "skipped"
+USABLE_TRANSLATION_STATUSES = {"success", "degraded_best_available"}
 
 
 def resolve_translation_policy(explicit: Any = None) -> str:
@@ -44,6 +44,17 @@ def resolve_translation_policy(explicit: Any = None) -> str:
         print(f"⚠️ 未知的翻译失败策略 {value!r}，回退到 {DEFAULT_TRANSLATION_POLICY}")
         return DEFAULT_TRANSLATION_POLICY
     return value
+
+
+def _translation_request_error(reason: Any) -> bool:
+    """Return True only when another LLM request can plausibly help."""
+    value = str(reason or "")
+    return value in {
+        "missing_api_key", "missing_or_duplicate_id", "translations_not_list"
+    } or value.startswith((
+        "APIError:", "APIConnectionError:", "APITimeoutError:",
+        "RateLimitError:", "TimeoutError:",
+    ))
 
 
 def language_code(value: Any) -> str:
@@ -396,7 +407,12 @@ def prepare_tts_punctuation(
         value, source_text, target
     )
     if not ready:
-        return value, False, status
+        # Preserve every lexical token. Lack of reliable internal-boundary
+        # evidence is handled by deterministic terminal normalization instead
+        # of causing another expensive LLM request.
+        if not re.search(r"(?:[。．！？.!?]|…+)[\"'”’）\]】》]*$", value):
+            value += _target_terminal(source_text, target)
+        status = f"deterministic_preserve_words:{status}"
     if not re.search(r"(?:[。．！？.!?]|…+)[\"'”’）\]】》]*$", value):
         value += _target_terminal(source_text, target)
         status = (
@@ -407,6 +423,66 @@ def prepare_tts_punctuation(
     if _punctuation_lexical_signature(value) != _punctuation_lexical_signature(raw):
         return raw, False, "punctuation_signature_mismatch"
     return value, True, status
+
+
+def best_available_translation(row: Any, original: dict, source: str, target: str) -> dict | None:
+    """Keep the safest candidate from one imperfect model response.
+
+    Candidate order is used as the model's relative ranking. Text must still
+    pass the target-script check; punctuation is normalized deterministically.
+    """
+    if not isinstance(row, dict):
+        return None
+    values: list[str] = []
+    primary = str(row.get("text", "") or "").strip()
+    if primary:
+        values.append(primary)
+    raw_candidates = row.get("translations_candidates")
+    if isinstance(raw_candidates, list):
+        for candidate in raw_candidates:
+            text = str(
+                candidate.get("text", "") if isinstance(candidate, dict) else candidate
+            ).strip()
+            if text and text not in values:
+                values.append(text)
+    safe: list[dict] = []
+    for rank, text in enumerate(values[:5]):
+        try:
+            validated = validate_target_text(
+                text,
+                target,
+                original.get("text", ""),
+                source,
+                allow_identity=bool(original.get("translation_allow_identity", False)),
+            )
+        except ValueError:
+            continue
+        punctuated, punctuation_ready, punctuation_status = prepare_tts_punctuation(
+            validated, original.get("text", ""), target
+        )
+        if not punctuation_ready:
+            # Last deterministic fallback: preserve all lexical content and
+            # only guarantee a terminal boundary for TTS.
+            punctuated = validated.rstrip()
+            if not re.search(r"(?:[。．！？.!?]|…+)[\"'”’）\]\u3011》]*$", punctuated):
+                punctuated += _target_terminal(original.get("text", ""), target)
+            punctuation_status = "deterministic_terminal_best_available"
+        safe.append({
+            "text": punctuated,
+            "_selection_priority": "standard",
+            "_best_available_rank": rank,
+            "_punctuation_status": punctuation_status,
+        })
+    if not safe:
+        return None
+    return {
+        "text": safe[0]["text"],
+        "translations_candidates": safe,
+        "translation_status": "degraded_best_available",
+        "translation_error": "",
+        "translation_warnings": ["selected_best_available_without_content_retry"],
+        "translation_retryable": False,
+    }
 
 
 def _punctuation_ready_text(
@@ -1025,8 +1101,29 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         f"entity={'consistent' if required_entities else 'not_applicable'}"
                     )
             except ValueError as exc:
-                rows[i]["translation_error"] = str(exc)
-                print(f"⚠️ translation segment={ids[i]} attempt={rows[i]['translation_attempts']} failed: {exc}")
+                reason = str(exc)
+                fallback = best_available_translation(
+                    response.get(ids[i]), segments[i], source, target
+                )
+                if fallback:
+                    try:
+                        required_entities = inputs[i]["entity_glossary"]
+                        validate_entity_glossary(fallback["text"], required_entities)
+                        for candidate in fallback["translations_candidates"]:
+                            validate_entity_glossary(candidate["text"], required_entities)
+                    except ValueError:
+                        fallback = None
+                if fallback:
+                    rows[i].update(fallback)
+                    rows[i]["translation_original_validation_error"] = reason
+                    print(
+                        f"⚠️ translation segment={ids[i]} content validation={reason}; "
+                        "selected best safe candidate without another LLM call"
+                    )
+                else:
+                    rows[i]["translation_error"] = reason
+                    rows[i]["translation_retryable"] = _translation_request_error(reason)
+                    print(f"⚠️ translation segment={ids[i]} attempt={rows[i]['translation_attempts']} failed: {exc}")
         save()
 
     if language_code(source) == language_code(target):
@@ -1046,12 +1143,18 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         attempt(pending[offset:offset+max(1, batch_size)])
     if request is not None:
         for i in pending:
-            for _ in range(max(0, min(3, retries))):
-                if rows[i]["translation_status"] == "success":
+            # Initial batch request plus at most two request-level retries =
+            # three total calls. Content-quality failures are not retried.
+            for _ in range(max(0, min(2, retries))):
+                if rows[i]["translation_status"] in USABLE_TRANSLATION_STATUSES:
+                    break
+                if not rows[i].get("translation_retryable", True):
                     break
                 attempt([i])
     save()
-    print(f"Translation: {sum(r['translation_status']=='success' for r in rows)}/{len(rows)} success")
+    usable_count = sum(r.get("translation_status") in USABLE_TRANSLATION_STATUSES for r in rows)
+    degraded_count = sum(r.get("translation_status") == "degraded_best_available" for r in rows)
+    print(f"Translation: {usable_count}/{len(rows)} usable (degraded={degraded_count})")
     return rows
 
 
@@ -1117,20 +1220,21 @@ def skip_failed_segments(segments, failures) -> list[dict]:
 def require_translated(segments, target: str, source: str = "", *, policy: Any = None) -> list[dict]:
     """Gate the run on validated translations, with an explicit degradation path.
 
-    ``fail_fast`` (the default) raises on the first blocking segment, exactly as
-    before.  ``skip_failed`` marks those segments as skipped and returns them so
-    the caller can continue; the caller is then responsible for reporting them.
+    ``best_available`` is the default and marks a segment without any safe
+    target-language candidate as skipped so the pipeline can continue.
+    ``fail_fast`` remains available as an explicit diagnostic option.
     """
     segments = list(segments)
     failures = collect_translation_failures(segments, target, source)
     if not failures:
         return []
     detail = describe_translation_failures(failures)
-    if resolve_translation_policy(policy) != "skip_failed":
+    resolved_policy = resolve_translation_policy(policy)
+    if resolved_policy == "fail_fast":
         raise RuntimeError("Translation blocked; segment IDs/reasons: " + detail)
     skipped = skip_failed_segments(segments, failures)
     print(
-        f"⚠️ 翻译降级(skip_failed)：{len(skipped)}/{len(segments)} 句未通过校验，"
-        f"这些句子本轮不配音，Step 5 将保留其原声 -> {detail}"
+        f"⚠️ 翻译降级({resolved_policy})：{len(skipped)}/{len(segments)} 句没有可安全使用的目标语言文本，"
+        f"这些句子本轮不配音且不恢复原声 -> {detail}"
     )
     return skipped

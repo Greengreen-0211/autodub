@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple, Type
@@ -170,12 +171,20 @@ class OCRV211Client:
 
     def check_health(self) -> Dict[str, Any]:
         health_url = self._health_url()
-        try:
-            response = self.session.get(health_url, timeout=self.config.ocr_health_timeout)
-            response.raise_for_status()
-            data = response.json()
-        except Exception as exc:
-            raise RuntimeError(f"OCR 健康检查失败 ({health_url}): {exc}") from exc
+        last_error = None
+        for attempt in range(1, 3):
+            try:
+                response = self.session.get(health_url, timeout=self.config.ocr_health_timeout)
+                response.raise_for_status()
+                data = response.json()
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    print(f"⚠️ OCR 健康检查失败，快速重试 {attempt}/2: {exc}")
+                    time.sleep(0.5)
+        else:
+            raise RuntimeError(f"OCR 健康检查失败 ({health_url}): {last_error}") from last_error
         if not data.get("model_loaded"):
             raise RuntimeError(f"OCR 模型尚未加载完成: {data}")
         if data.get("busy"):
@@ -197,11 +206,22 @@ class OCRV211Client:
             "frame_index": self.config.ocr_frame_index,
             "request_id": f"seg-{segment.get('id', 'unknown')}",
         }
-        response = self.session.post(
-            self.config.ocr_url,
-            json=payload,
-            timeout=(self.config.ocr_connect_timeout, self.config.ocr_read_timeout),
-        )
+        response = None
+        last_error = None
+        for attempt in range(1, 3):
+            try:
+                response = self.session.post(
+                    self.config.ocr_url,
+                    json=payload,
+                    timeout=(self.config.ocr_connect_timeout, self.config.ocr_read_timeout),
+                )
+                break
+            except self.requests.exceptions.RequestException as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.5)
+        if response is None:
+            raise RuntimeError(f"OCR 请求两次失败: {last_error}") from last_error
         if response.status_code != 200:
             raise RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
         data = response.json()
@@ -269,7 +289,8 @@ class OCRV211Client:
         self.frame_texts_by_segment = {}
         self.frame_records_by_segment = {}
         health_checked = False
-        stopped = False
+        consecutive_service_failures = 0
+        service_circuit_open = False
         for index, segment in enumerate(selected, start=1):
             segment_id = str(segment.get("id", index - 1))
             start, end = float(segment["start"]), float(segment["end"])
@@ -310,7 +331,7 @@ class OCRV211Client:
                 cached = cache.get(key)
                 if cached and cached.get("status") == "ok":
                     text = str(cached["text"])
-                elif stopped:
+                elif service_circuit_open:
                     continue
                 else:
                     print(
@@ -324,6 +345,7 @@ class OCRV211Client:
                             health_checked = True
                         point = dict(segment, id=f"{segment_id}-f{frame_number}", start=timestamp, end=timestamp)
                         text = self._extract_one(str(path), point)
+                        consecutive_service_failures = 0
                         cache[key] = {
                             "status": "ok",
                             "timestamp": timestamp,
@@ -338,10 +360,19 @@ class OCRV211Client:
                             "segment_id": segment_id,
                         }
                         _ocr_atomic_json(cache_path, cache)
-                        print(f"⚠️ OCR 服务失败，本轮停止请求并回退到纯 Qwen3-ASR: {exc}")
-                        stopped = True
+                        consecutive_service_failures += 1
+                        print(
+                            f"⚠️ OCR 帧失败，已记录并继续其他帧 "
+                            f"(连续失败 {consecutive_service_failures}): {exc}"
+                        )
                         if self.config.ocr_required:
                             raise
+                        if consecutive_service_failures >= 2:
+                            service_circuit_open = True
+                            print(
+                                "⚠️ OCR 服务连续两帧失败，本轮停止新增请求；"
+                                "保留此前成功帧并继续主流程。"
+                            )
                         continue
                     _ocr_atomic_json(cache_path, cache)
                 if text and text not in texts:
@@ -1187,7 +1218,7 @@ def run_step_1b_optimized(
             "segments_sha256": _ocr_digest(segments),
         },
     })
-    if blocking_regions and getattr(config, "asr_require_complete_dialogue", True):
+    if blocking_regions and getattr(config, "asr_require_complete_dialogue", False):
         summary = ", ".join(
             f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
             for item in blocking_regions[:8]
@@ -1196,6 +1227,15 @@ def run_step_1b_optimized(
             "多源 ASR/OCR 仍有确认对白未恢复，严格覆盖模式拒绝继续："
             f"{summary}。详细证据已保存到 project_state.json 的 "
             "asr_unresolved_dialogue_regions。"
+        )
+    if blocking_regions:
+        summary = ", ".join(
+            f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
+            for item in blocking_regions[:8]
+        )
+        print(
+            "⚠️ 多源 ASR/OCR 仍有确认对白未恢复；"
+            f"已记入降级报告并继续流程: {summary}"
         )
     if non_dialogue_audited:
         print(

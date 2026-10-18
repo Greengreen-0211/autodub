@@ -88,13 +88,13 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(restored, "史密斯博士来了。")
         self.assertEqual(reason, "deterministic_terminal")
 
-    def test_missing_boundary_evidence_fails_closed(self):
+    def test_missing_boundary_evidence_uses_deterministic_terminal(self):
         restored, ready, reason = prepare_tts_punctuation(
             "我睡不着天还没睡我们来玩", "I can't. The sky is awake. We play.", "zh"
         )
-        self.assertFalse(ready)
-        self.assertEqual(restored, "我睡不着天还没睡我们来玩")
-        self.assertEqual(reason, "missing_strong_boundary_evidence")
+        self.assertTrue(ready)
+        self.assertEqual(restored, "我睡不着天还没睡我们来玩。")
+        self.assertEqual(reason, "deterministic_preserve_words:missing_strong_boundary_evidence")
 
     def test_chinese_ellipsis_preserves_source_pause_boundary(self):
         text = "准备好了吗？嗯……太神奇了！"
@@ -183,26 +183,28 @@ class TranslationTests(unittest.TestCase):
         self.assertTrue(all(r["translation_status"]=="success" for r in rows))
         self.assertEqual(checkpoints[0][0]["translation_status"],"success")
 
-    def test_wrong_language_candidate_retried_and_blocked(self):
+    def test_invalid_sibling_candidate_uses_best_valid_without_retry(self):
         def request(items):
             t=translation(0); t["translations_candidates"][1]["text"]="Any"
             return {"translations":[t]}
         rows=translate_segments([source()],"en","zh","test",request,retries=2)
-        self.assertEqual(rows[0]["translation_attempts"],3)
-        self.assertEqual(rows[0]["text"],"")
-        with self.assertRaisesRegex(RuntimeError,"0:"):
-            require_translated(rows,"zh","en")
+        self.assertEqual(rows[0]["translation_attempts"],1)
+        self.assertEqual(rows[0]["translation_status"],"degraded_best_available")
+        self.assertTrue(rows[0]["text"])
+        self.assertEqual(require_translated(rows,"zh","en"), [])
 
     def test_no_key_no_silent_source_fallback(self):
         rows=translate_segments([source()],"en","zh","test",None)
         self.assertEqual(rows[0]["translation_status"],"failed")
-        with self.assertRaises(RuntimeError): require_translated(rows,"zh","en")
+        with self.assertRaises(RuntimeError):
+            require_translated(rows,"zh","en",policy="fail_fast")
 
     def test_primary_wrong_language_even_good_candidates(self):
         def request(items):
             t=translation(0); t["text"]="Any"; return {"translations":[t]}
         rows=translate_segments([source()],"en","zh","test",request,retries=0)
-        self.assertEqual(rows[0]["translation_status"],"failed")
+        self.assertEqual(rows[0]["translation_status"],"degraded_best_available")
+        self.assertEqual(rows[0]["text"],"这是完整的一句话。")
 
     def test_tiny_and_equal_length_candidates(self):
         rows=translate_segments([source(text="Wait.")],"en","zh","test",
@@ -244,7 +246,10 @@ class TranslationTests(unittest.TestCase):
         def request(items):
             return {"translations":[translation(0),{"id":"1","text":"缺失候选"}]}
         rows=translate_segments([source(0),source(1)],"en","zh","test",request,retries=0)
-        self.assertEqual([r["translation_status"] for r in rows],["success","failed"])
+        self.assertEqual(
+            [r["translation_status"] for r in rows],
+            ["success", "degraded_best_available"],
+        )
 
     def test_skip_failed_policy_marks_and_unblocks_later_stages(self):
         rows=translate_segments([source(0),source(1)],"en","zh","test",None)
@@ -264,13 +269,19 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(rows[0]["translation_status"],"success")
         self.assertNotIn("dubbing_enabled",rows[0])
 
-    def test_fail_fast_stays_the_default_and_unknown_values_are_safe(self):
+    def test_best_available_is_default_and_fail_fast_is_explicit(self):
         rows=translate_segments([source()],"en","zh","test",None)
         with patch.dict(os.environ,{},clear=False):
             os.environ.pop("AUTODUB_TRANSLATION_FAILURE_POLICY",None)
+            skipped=require_translated(rows,"zh","en")
+            self.assertEqual([str(row["id"]) for row in skipped],["0"])
+        rows=translate_segments([source()],"en","zh","test",None)
+        with patch.dict(os.environ,{"AUTODUB_TRANSLATION_FAILURE_POLICY":"fail_fast"}):
             with self.assertRaises(RuntimeError):require_translated(rows,"zh","en")
+        rows=translate_segments([source()],"en","zh","test",None)
         with patch.dict(os.environ,{"AUTODUB_TRANSLATION_FAILURE_POLICY":"nonsense"}):
-            with self.assertRaises(RuntimeError):require_translated(rows,"zh","en")
+            skipped=require_translated(rows,"zh","en")
+            self.assertEqual([str(row["id"]) for row in skipped],["0"])
 
 
 class LightTests(unittest.TestCase):
@@ -305,8 +316,11 @@ class LightTests(unittest.TestCase):
             name="fake";extension=".wav";signature="test"
             def synthesize(self,*args): raise AssertionError("should not synthesize")
         with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(RuntimeError):
-                LightTTSSelector(tmp,backend=Backend()).select([source(text="Any")],target_language="zh")
+            rows, results = LightTTSSelector(tmp,backend=Backend()).select(
+                [source(text="Any")],target_language="zh"
+            )
+            self.assertEqual(rows, [])
+            self.assertEqual(results, [])
 
 
 class EmotionTests(unittest.TestCase):
@@ -429,8 +443,9 @@ class RouterTests(unittest.TestCase):
 
     def test_preflight_precedes_any_worker(self):
         with tempfile.TemporaryDirectory() as tmp, patch("tts_router.preflight_models",side_effect=RuntimeError("missing Vocos")),patch("tts_router._run_worker") as worker:
-            with self.assertRaisesRegex(RuntimeError,"Vocos"):
-                self.setup_router(tmp).run([dict(source(),tts_engine="f5tts")],"unused")
+            clips, rows = self.setup_router(tmp).run([dict(source(),tts_engine="f5tts")],"unused")
+            self.assertEqual(clips, [])
+            self.assertEqual(rows[0]["status"], "failed")
             worker.assert_not_called()
 
     def test_missing_first_fallback_can_try_next(self):
@@ -445,7 +460,7 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(rows[0]["actual_engine"],"indextts2")
             self.assertIn("missing Vocos",rows[0]["fallback_reason"])
 
-    def test_duration_violation_reselects_candidate(self):
+    def test_duration_violation_keeps_upstream_best_candidate(self):
         calls=[]
         def worker(model,plan,result,force=False):
             calls.append(model)
@@ -460,8 +475,9 @@ class RouterTests(unittest.TestCase):
             router=self.setup_router(tmp)
             clips,results=router.run([dict(source(text="short"),tts_engine="f5tts",translations_candidates=[{"text":"short"},{"text":"a longer candidate"}])],"unused")
             self.assertEqual(results[0]["status"],"success")
-            self.assertEqual(results[0]["tts_text"],"a longer candidate")
-            self.assertEqual(len(calls),2)
+            self.assertEqual(results[0]["duration_quality"],"degraded")
+            self.assertEqual(results[0]["tts_text"],"short")
+            self.assertEqual(len(calls),1)
 
 
 class QualityTests(unittest.TestCase):
@@ -484,8 +500,8 @@ class QualityTests(unittest.TestCase):
             state,config=self.mix(tmp);validate_mix_state(state,config)
             with self.assertRaises(RuntimeError):validate_mix_state(state,SimpleNamespace(target_lang="zh"))
             Path(state["audio_clips"][0]["file"]).unlink()
-            with self.assertRaises(RuntimeError):validate_mix_state(state,config)
-            validate_mix_state(state,config,allow_missing=True)
+            issues=validate_mix_state(state,config)
+            self.assertTrue(issues)
             self.assertEqual(state["audio_clips"],[])
 
     def test_duration_gate(self):
@@ -566,7 +582,7 @@ class PipelineTests(unittest.TestCase):
         exec(compile(ast.Module(body=nodes,type_ignores=[]),"pipeline","exec"),globals)
         return globals
 
-    def test_step3_failure_checkpoint_blocks_stale_tts(self):
+    def test_step3_failure_checkpoint_degrades_without_stale_tts(self):
         state={"segments_step2":[source()],"src_lang":"en", "segments_step3":[source()],"audio_clips":[{}]}
         class Manager:
             def __init__(self,c):pass
@@ -578,12 +594,20 @@ class PipelineTests(unittest.TestCase):
             def __init__(self,c):pass
             def translate(self,segments,src,target,**kwargs):
                 return translate_segments(segments,src,target,"test",None,checkpoint=kwargs["checkpoint"])
-        config=SimpleNamespace(target_lang="zh",model_name="test",openai_api_key="",retranslate_ids=set())
-        globals=self.functions({"run_step_3","_translation_candidates_fingerprint"},{"StateManager":Manager,"AdvancedTranslator":Translator})
-        with self.assertRaises(RuntimeError):globals["run_step_3"](config)
-        self.assertNotIn("audio_clips",state)
-        self.assertNotIn("segments_step3",state)
-        self.assertEqual(state["segments_translation_candidates"][0]["translation_status"],"failed")
+        with tempfile.TemporaryDirectory() as tmp:
+            config=SimpleNamespace(
+                target_lang="zh",model_name="test",openai_api_key="",
+                retranslate_ids=set(),temp_dir=tmp,output_dir=tmp,
+                project_name="test",light_tts_enabled=False,
+            )
+            globals=self.functions({
+                "run_step_3", "_translation_candidates_fingerprint",
+                "_routing_report_rows", "summarize_routing", "print_routing_report",
+            },{"StateManager":Manager,"AdvancedTranslator":Translator})
+            globals["run_step_3"](config)
+            self.assertNotIn("audio_clips",state)
+            self.assertEqual(state["segments_step3"][0]["translation_status"],"skipped")
+            self.assertFalse(state["segments_step3"][0]["dubbing_enabled"])
 
     def test_step4_manifest_and_step5_work_together(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -610,8 +634,7 @@ class PipelineTests(unittest.TestCase):
                 globals["run_step_5"](config,"unused.mp4")
             self.assertEqual(len(mixed),1)
 
-    def test_skipped_segment_gets_no_tts_and_keeps_its_original_vocal(self):
-        from pydub import AudioSegment
+    def test_skipped_segment_gets_no_tts_and_does_not_restore_original_vocal(self):
         with tempfile.TemporaryDirectory() as tmp:
             # Long enough that the skipped span (1.0s-2.0s) is actually overlaid.
             ref=Path(tmp)/"reference.wav";wav(ref,3.0)
@@ -627,10 +650,13 @@ class PipelineTests(unittest.TestCase):
             class Mixer:
                 def __init__(self,c):pass
                 def run(self,*args):mixed.append(args)
-            config=SimpleNamespace(temp_dir=tmp,target_lang="en",disable_tts_fallback=False)
+            config=SimpleNamespace(
+                temp_dir=tmp,target_lang="en",disable_tts_fallback=False,
+                tts_backend="scheme3",
+            )
             globals=self.functions({"run_step_4","run_step_5","restore_skipped_vocals"},
-                                   {"StateManager":Manager,"Mixer":Mixer,"AudioSegment":AudioSegment})
-            with patch("tts_router.preflight_models"),patch("tts_router._run_worker",side_effect=RouterTests().worker([],{})),patch.object(tts_router.TTSRouter,"_speaker_references",return_value={"A":{"audio":str(ref),"text":"source"}}),patch("scheme3_policy.write_segments_json"),patch.object(sys.modules["tts_quality"],"validate_mix_state"):
+                                   {"StateManager":Manager,"Mixer":Mixer})
+            with patch("tts_router.preflight_models"),patch("tts_router._run_worker",side_effect=RouterTests().worker([],{})),patch.object(tts_router.TTSRouter,"_speaker_references",return_value={"A":{"audio":str(ref),"text":"source"}}),patch("scheme3_policy.write_segments_json"),patch.object(sys.modules["tts_quality"],"validate_mix_state",return_value=[]):
                 config.output_dir=tmp;config.project_name="test"
                 globals["run_step_4"](config,backend="scheme3")
                 self.assertEqual(state["segments_step3"][1]["tts_status"],"skipped")
@@ -640,12 +666,8 @@ class PipelineTests(unittest.TestCase):
                 with redirect_stdout(captured):
                     globals["run_step_5"](config,"unused.mp4")
             self.assertEqual(len(mixed),1)
-            restored=Path(mixed[0][1])
-            self.assertEqual(restored.name,"accomp_with_skipped_vocals.wav")
-            self.assertTrue(restored.is_file())
-            # The skipped span was really overlaid, not silently dropped.
-            self.assertIn("已为 1/1 句跳过的翻译恢复原始人声",captured.getvalue())
-            self.assertAlmostEqual(len(AudioSegment.from_wav(restored))/1000.0,3.0,places=2)
+            self.assertEqual(Path(mixed[0][1]), ref)
+            self.assertIn("只保留伴奏/静音",captured.getvalue())
 
     def test_routing_report_summarizes_emotion_coverage(self):
         neutral=dict(source(0),text="hello",emotion="neutral",emotion_reliable=False,

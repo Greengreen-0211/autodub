@@ -175,7 +175,7 @@ class DurationTests(unittest.TestCase):
             self.assertEqual(ref["text"], "Clean precise reference.")
             self.assertAlmostEqual(tts_worker.wav_duration(Path(ref["audio"])), 4)
 
-    def test_reference_rejects_speaker_with_only_coarse_recovery(self):
+    def test_reference_skips_speaker_with_only_coarse_recovery(self):
         from pydub import AudioSegment
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp, "vocals.wav")
@@ -187,8 +187,7 @@ class DurationTests(unittest.TestCase):
                 "timestamp_precision": "coarse",
                 "asr_recovery_status": "accepted_coarse",
             }]
-            with self.assertRaisesRegex(RuntimeError, "精确边界参考音频"):
-                router._speaker_references(segments, str(source))
+            self.assertEqual(router._speaker_references(segments, str(source)), {})
 
     def test_worker_still_loads_once_for_two_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:

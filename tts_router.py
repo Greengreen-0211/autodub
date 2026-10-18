@@ -347,10 +347,11 @@ class TTSRouter:
                     continue
                 candidates.append((self._reference_score(segment, clip), index, segment, clip))
             if not candidates:
-                raise RuntimeError(
-                    f"{speaker} 没有可用的精确边界参考音频；"
-                    "粗边界恢复句不会用于声纹参考"
+                print(
+                    f"⚠️ {speaker} 没有可用的精确边界参考音频；"
+                    "粗边界恢复句仍不会用于声纹参考，该说话人将单独降级"
                 )
+                continue
             candidates.sort(key=lambda item: (item[0], len(item[3])), reverse=True)
             chosen = []
             total_ms = 0
@@ -384,9 +385,9 @@ class TTSRouter:
 
     def run(self, segments: Iterable[Dict[str, Any]], vocal_path: str, *, force: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         from translation_quality import is_skipped, require_translated
-        # Segments degraded by the translation policy keep their original audio
-        # and must never reach a TTS engine: by construction they carry no
-        # validated text.
+        # Segments without any safe target-language text never reach a TTS
+        # engine. Step 5 leaves their position silent instead of restoring the
+        # source vocal, so the final mix cannot leak the source language.
         segment_list = [dict(segment) for segment in segments if not is_skipped(segment)]
         require_translated(segment_list, self.config.target_lang, getattr(self.config, "source_lang", ""))
         self.raw_dir.mkdir(parents=True, exist_ok=True)
@@ -394,6 +395,7 @@ class TTSRouter:
         references = self._speaker_references(segment_list, vocal_path)
         previous = _load_results(self.result_path)
         items = []
+        unreferenced_results = []
         seen = set()
         for index, segment in enumerate(segment_list):
             text = str(segment.get("text", "")).strip()
@@ -402,6 +404,18 @@ class TTSRouter:
                 raise ValueError(f"invalid/duplicate TTS segment: {segment_id}")
             seen.add(segment_id)
             speaker = str(segment.get("speaker", "SPEAKER_00"))
+            if speaker not in references:
+                failure = {
+                    "segment_id": segment_id,
+                    "status": "failed",
+                    "error": "no_safe_precise_reference_audio",
+                    "planned_engine": segment.get("tts_engine"),
+                    "actual_engine": None,
+                    "fallback_count": 0,
+                }
+                previous[segment_id] = failure
+                unreferenced_results.append(failure)
+                continue
             placement_start, duration = _tts_timing(segment)
             raw_emotion = segment.get("raw_emotion", segment.get("emotion_raw", segment.get("emotion")))
             if "emotion_reliable" in segment:
@@ -439,7 +453,6 @@ class TTSRouter:
             job["planned_request_fingerprint"] = job["request_fingerprint"]
             items.append(job)
 
-        preflight_models({item["model"] for item in items})
         active = []
         for item in items:
             known = previous.get(item["segment_id"], {})
@@ -455,8 +468,10 @@ class TTSRouter:
                 try:
                     valid = known.get("request_fingerprint")==resumed["request_fingerprint"]
                     actual = _wav_duration(Path(known["file"])) if valid else 0
+                    measured_quality = duration_quality(actual, item["target_duration"])["duration_quality"]
+                    saved_quality = str(known.get("duration_quality", ""))
                     if (valid and known.get("audio_sha256")==_file_sha256(Path(known["file"])) and
-                            duration_quality(actual,item["target_duration"])["duration_quality"]=="passed"):
+                            (measured_quality == "passed" or saved_quality == "degraded")):
                         item.update(resumed, fallback_count=known.get("fallback_count",0),
                                     fallback_reason=known.get("fallback_reason",""))
                         previous[item["segment_id"]] = dict(known)
@@ -471,32 +486,10 @@ class TTSRouter:
             self._execute(active, force=force)
             previous = _load_results(self.result_path)
 
-        # Retry duration violations using another validated translation candidate.
-        retries = max(0, min(3, int(os.getenv("AUTODUB_TTS_DURATION_RETRIES", "1"))))
-        for _ in range(retries):
-            retry = []
-            for item in items:
-                result = previous.get(item["segment_id"], {})
-                if result.get("status")=="success" or result.get("duration_quality")!="failed":
-                    continue
-                alternatives = [str(c.get("text","")).strip() for c in item["translations_candidates"]
-                                if str(c.get("text","")).strip() not in item["attempted_texts"]]
-                if not alternatives:
-                    continue
-                generated = float(result.get("generated_duration") or result.get("actual_duration") or 0.1)
-                desired = len(item["text"]) * item["target_duration"] / max(0.1, generated)
-                item["text"] = min(alternatives, key=lambda text: abs(len(text)-desired))
-                item["attempted_texts"].append(item["text"])
-                item["request_fingerprint"] = _request_fingerprint(item)
-                item["force_regenerate"] = True
-                retry.append(item)
-            if not retry:
-                break
-            self._execute(retry, force=True)
-            previous = _load_results(self.result_path)
-
         if not getattr(self.config, "disable_tts_fallback", False):
-            for _ in range(4):
+            # Planned engine plus at most two fallback engines. Duration
+            # mismatch is not an engine failure and never enters this loop.
+            for _ in range(2):
                 retry = []
                 for item in items:
                     result = previous.get(item["segment_id"], {})
@@ -516,12 +509,7 @@ class TTSRouter:
                     self._job_paths(item)
                     item["request_fingerprint"] = _request_fingerprint(item)
                     item["force_regenerate"] = True
-                    try:
-                        preflight_models([model])
-                        retry.append(item)
-                    except RuntimeError as exc:
-                        previous[item["segment_id"]] = dict(result, status="failed", error=str(exc))
-                        _atomic_json(self.result_path, previous)
+                    retry.append(item)
                 if not retry:
                     if any(previous.get(i["segment_id"],{}).get("status")!="success" and
                            any(m not in i["attempted_engines"] for m in self._fallback_chain(i["planned_engine"],i["target_language"])) for i in items):
@@ -559,6 +547,7 @@ class TTSRouter:
                   f"status={metadata.get('status','failed')} fallback={item['fallback_count']}")
         _atomic_json(self.result_path, previous)
         _atomic_json(self.plan_path, {"items":items})
+        output_rows.extend(unreferenced_results)
         print("TTS quality failures:", [{"id":r["segment_id"], "error":r.get("error")} for r in output_rows if r.get("status")!="success"])
         return clips, output_rows
 
@@ -579,7 +568,9 @@ class TTSRouter:
             raise ValueError(f"invalid fallback chain for {model}: {chain}")
         if language not in {"zh","en"} and any(m!="omnivoice" for m in chain):
             raise ValueError("non-Chinese/English fallback must stay on OmniVoice")
-        return chain
+        # Planned engine plus at most two distinct fallbacks: three engines in
+        # total, with no repeated execution of a deterministically failed one.
+        return chain[:2]
 
     def _execute(self, items, *, force):
         # Each worker receives ONLY its pending jobs; raw reuse must match fingerprints.
@@ -587,6 +578,18 @@ class TTSRouter:
         for model in MODEL_ORDER:
             pending = [item for item in items if item["model"]==model]
             if not pending:
+                continue
+            try:
+                preflight_models([model])
+            except RuntimeError as exc:
+                for item in pending:
+                    results[item["segment_id"]] = {
+                        "segment_id": item["segment_id"],
+                        "status": "failed",
+                        "error": str(exc),
+                        "request_fingerprint": item["request_fingerprint"],
+                    }
+                _atomic_json(self.result_path, results)
                 continue
             _atomic_json(self.plan_path, {"items":pending})
             for item in pending:
@@ -610,7 +613,16 @@ class TTSRouter:
                                         audio_sha256=_file_sha256(Path(item["final_path"])),
                                         **duration_quality(actual,item["target_duration"]))
                         if metadata["duration_quality"]=="failed":
-                            metadata.update(status="failed",error=f"duration quality failed: {actual:.3f}/{item['target_duration']:.3f}")
+                            # Keep the generated clip selected by the upstream
+                            # candidate ranking. Duration mismatch is degraded
+                            # quality, not a reason to silence the sentence.
+                            metadata.update(
+                                status="success",
+                                duration_quality="degraded",
+                                duration_degraded_reason=(
+                                    f"best_available_duration: {actual:.3f}/{item['target_duration']:.3f}"
+                                ),
+                            )
                     except Exception as exc:
                         metadata.update(status="failed",error=f"duration adaptation failed: {exc}")
                 results[sid] = metadata

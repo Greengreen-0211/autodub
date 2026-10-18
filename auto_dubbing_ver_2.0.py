@@ -148,7 +148,7 @@ class DubbingConfig:
             "ASR_RECOVERY_TEXT_CONSENSUS", 0.78
         )
         self.asr_require_complete_dialogue = _env_bool(
-            "ASR_REQUIRE_COMPLETE_DIALOGUE", True
+            "ASR_REQUIRE_COMPLETE_DIALOGUE", False
         )
         self.asr_acoustic_candidate_threshold = _env_float(
             "ASR_ACOUSTIC_CANDIDATE_THRESHOLD", 0.40
@@ -3364,7 +3364,17 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
     print("=== [Step 1a] Demucs + Qwen3-ASR ===")
     subprocess.run(["ffmpeg", "-y", "-i", input_file, "-vn", "-ac", "1", source_wav], check=True)
     separator = AudioSeparator(config)
-    vocals, accomp = separator.separate(source_wav)
+    separation_error = None
+    for attempt in range(1, 3):
+        try:
+            vocals, accomp = separator.separate(source_wav)
+            break
+        except Exception as exc:
+            separation_error = exc
+            if attempt < 2:
+                print(f"⚠️ Demucs 第 {attempt}/2 次执行失败，将重试: {exc}")
+    else:
+        raise RuntimeError("Demucs 两次执行后仍未生成有效音轨") from separation_error
     asr = Qwen3ASRProcessor(config)
     segments, src_lang = asr.transcribe(vocals, source_audio_path=source_wav)
     segments_qwen3_raw = [seg.copy() for seg in segments]
@@ -3449,12 +3459,14 @@ def run_step_2(config: DubbingConfig) -> None:
         print("❌ 请先运行 Step 1")
         return
     unresolved = state.get("asr_unresolved_dialogue_regions") or []
-    if unresolved and config.asr_require_complete_dialogue:
+    if unresolved:
         spans = ", ".join(
             f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
             for item in unresolved[:8]
         )
-        raise RuntimeError(f"仍有确认对白未恢复，拒绝执行 Step 2: {spans}")
+        print(
+            f"⚠️ 仍有确认对白未恢复，将保留降级审计并继续 Step 2: {spans}"
+        )
     backend = os.getenv("AUTODUB_DIAR_BACKEND", "speechbrain").lower()
     if backend == "wespeaker":
         work_dir = os.path.join(config.temp_dir, "wespeaker_diar")
@@ -3510,20 +3522,50 @@ def run_step_2(config: DubbingConfig) -> None:
             for s, e in detect_speech_regions(state["vocals_path"]):
                 seg_id = f"{utt_id}-{int(s * 1000):08d}-{int(e * 1000):08d}"
                 f.write(f"{seg_id} {utt_id} {s:.3f} {e:.3f}\n")
-        print("\n⚠️ WeSpeaker 输入文件已生成，但需要在 wespeaker_diar 环境中执行 Step 2。\n")
-        print("请执行以下命令：\n")
-        print("    conda activate wespeaker_diar")
-        print(f"    cd {os.path.dirname(os.path.abspath(__file__))}")
-        print("    export AUTODUB_WORKDIR=" + os.getenv("AUTODUB_WORKDIR", os.path.dirname(os.path.abspath(__file__))))
-        print("    export AUTODUB_VIDEO=" + os.getenv("AUTODUB_VIDEO", ""))
-        print("    export WESPEAKER_ROOT=" + os.getenv("WESPEAKER_ROOT", "/data0/goldenseed/chy/wespeaker_voxconverse_v2"))
-        print("    export SIMAM_MODEL_PATH=" + os.getenv("SIMAM_MODEL_PATH", "/data0/goldenseed/models/wespeaker_simamresnet100/speaker-embedding.onnx"))
-        print("    python run_step2_wespeaker.py")
-        print("\n执行完成后，切回 autodub_server 环境继续：")
-        print("    conda activate autodub_server")
-        print("    python -u auto_dubbing_ver_2.0.py \"$AUTODUB_VIDEO\" --lang en --step 2")
-        print("\n或直接继续 Step 3：")
-        print("    python -u auto_dubbing_ver_2.0.py \"$AUTODUB_VIDEO\" --lang en --step 3")
+        # Keep the orchestration process in autodub_server, but execute the
+        # WeSpeaker-only bridge in its own conda environment.  This makes
+        # ``--step all`` a real end-to-end run instead of pausing for a manual
+        # environment switch between Step 1 and Step 2.
+        repository_root = os.path.dirname(os.path.abspath(__file__))
+        conda_executable = os.getenv("AUTODUB_CONDA_EXE", "/opt/anaconda3/bin/conda")
+        if not os.path.isfile(conda_executable):
+            conda_executable = shutil.which("conda") or conda_executable
+        wespeaker_environment = os.getenv("WESPEAKER_ENV_NAME", "wespeaker_diar")
+        bridge_environment = os.environ.copy()
+        bridge_environment.update({
+            "PYTHONNOUSERSITE": "1",
+            "AUTODUB_WORKDIR": os.getenv("AUTODUB_WORKDIR", repository_root),
+            "AUTODUB_VIDEO": str(state.get("input_file") or os.getenv("AUTODUB_VIDEO", "")),
+            "WESPEAKER_ROOT": os.getenv(
+                "WESPEAKER_ROOT", "/data0/goldenseed/chy/wespeaker_voxconverse_v2"
+            ),
+            "SIMAM_MODEL_PATH": os.getenv(
+                "SIMAM_MODEL_PATH",
+                "/data0/goldenseed/models/wespeaker_simamresnet100/speaker-embedding.onnx",
+            ),
+        })
+        print(
+            f"--- [Step 2-W] 自动进入 {wespeaker_environment} 环境执行 WeSpeaker ---"
+        )
+        subprocess.run(
+            [
+                conda_executable,
+                "run",
+                "--no-capture-output",
+                "-n",
+                wespeaker_environment,
+                "python",
+                "-u",
+                os.path.join(repository_root, "run_step2_wespeaker.py"),
+            ],
+            cwd=repository_root,
+            env=bridge_environment,
+            check=True,
+        )
+        completed_state = state_mgr.load()
+        if not completed_state or not completed_state.get("segments_step2"):
+            raise RuntimeError("WeSpeaker 子流程结束但没有生成 segments_step2")
+        print("✅ WeSpeaker 子流程完成，自动返回主流水线。")
         return
     diar = SpeakerDiarization(config)
     aligned = diar.run(state["vocals_path"], state["segments_step1"])
@@ -3688,12 +3730,15 @@ def run_step_3(config: DubbingConfig) -> None:
         print("❌ 请先运行 Step 2")
         return
     unresolved = state.get("asr_unresolved_dialogue_regions") or []
-    if unresolved and config.asr_require_complete_dialogue:
+    if unresolved:
         spans = ", ".join(
             f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
             for item in unresolved[:8]
         )
-        raise RuntimeError(f"仍有确认对白未恢复，拒绝翻译和配音: {spans}")
+        print(
+            f"⚠️ 仍有确认对白未恢复，已记入降级报告；"
+            f"其他句子继续翻译和配音: {spans}"
+        )
     src_lang = state.get("src_lang", "unknown")
     requested_ids = getattr(config, "retranslate_ids", set())
     source_ids = {str(s.get("id", i)) for i, s in enumerate(state["segments_step2"])}
@@ -3761,7 +3806,9 @@ def run_step_3(config: DubbingConfig) -> None:
     )
     from translation_quality import is_skipped, require_translated
 
-    # fail_fast (default) still raises here; skip_failed marks and continues.
+    # The default best-available policy keeps valid candidates and marks only
+    # segments with no safe target-language text as skipped. fail_fast remains
+    # an explicit diagnostic override.
     skipped_segments = require_translated(final_segments, config.target_lang, src_lang)
     if skipped_segments:
         print("   ↳ 降级句子清单: " + ", ".join(
@@ -3776,17 +3823,27 @@ def run_step_3(config: DubbingConfig) -> None:
             classify_coarse_recovery_duration,
         )
 
-        selector = LightTTSSelector(
-            config.temp_dir,
-            backend_name=config.light_tts_backend,
-        )
         # Skipped segments have neither translation text nor candidates, so they
         # must never reach the selector.  They are merged back in place after.
         active_segments = [s for s in final_segments if not is_skipped(s)]
-        selected_segments, light_tts_results = selector.select(
-            active_segments,
-            target_language=config.target_lang,
-        )
+        selector = None
+        try:
+            selector = LightTTSSelector(
+                config.temp_dir,
+                backend_name=config.light_tts_backend,
+            )
+            selected_segments, light_tts_results = selector.select(
+                active_segments,
+                target_language=config.target_lang,
+            )
+        except Exception as exc:
+            # Light TTS is a ranking aid, never a pipeline prerequisite.
+            print(
+                f"⚠️ 轻量 TTS 不可用，保留已有最佳翻译候选并继续: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            selected_segments = active_segments
+            light_tts_results = []
         if len(selected_segments) != len(active_segments):
             raise RuntimeError("LightTTS 输出的句子数与输入不一致，拒绝继续")
         if skipped_segments:
@@ -3835,20 +3892,18 @@ def run_step_3(config: DubbingConfig) -> None:
                 # silence.  It is not a reason to reintroduce the source voice.
                 segment["asr_recovery_tts_duration_status"] = "shorter_than_window"
             elif duration_decision["status"] == "too_long_blocking":
-                segment["asr_recovery_tts_duration_status"] = "too_long_blocking"
-                segment["translation_status"] = "duration_blocked"
-                segment["dubbing_enabled"] = False
+                # The selector has already chosen the closest candidate. Keep
+                # it and let formal TTS apply its safe duration adaptation.
+                segment["asr_recovery_tts_duration_status"] = "too_long_best_available"
+                segment["translation_warnings"] = list(
+                    segment.get("translation_warnings") or []
+                ) + ["coarse_recovery_duration_best_available"]
                 duration_blocked.append(str(segment.get("id")))
             else:
                 segment["asr_recovery_tts_duration_status"] = "suitable"
         if duration_blocked:
-            state_mgr.save({
-                "segments_translation_candidates": final_segments,
-                "light_tts_selector_results": light_tts_results,
-                "asr_tts_duration_blocked_ids": duration_blocked,
-            })
-            raise RuntimeError(
-                "粗边界恢复句的 TTS 明显长于可用时间，拒绝回退原声并停止："
+            print(
+                "⚠️ 粗边界恢复句超出理想时长，已保留当前最接近的候选继续: "
                 + ", ".join(duration_blocked)
             )
         shorter = [
@@ -3861,7 +3916,7 @@ def run_step_3(config: DubbingConfig) -> None:
                 "ℹ️ 粗边界恢复句 TTS 短于外层语音窗口，将保留剩余静音而非原声: "
                 + ", ".join(shorter)
             )
-        light_tts_results_path = str(selector.results_path)
+        light_tts_results_path = str(selector.results_path) if selector else None
     else:
         print("⚠️ 轻量 TTS 候选筛选已通过 AUTODUB_LIGHT_TTS_ENABLED=0 关闭。")
     from scheme3_policy import build_scheme3_segments, write_segments_json
@@ -3909,12 +3964,12 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
         scheme = "baseline" if backend == "indextts" else ("scheme3" if backend == "scheme3" else "scheme2")
         print(f"--- [Step 4] 语音合成 (TTS Router: {scheme}) ---")
         config.source_lang = state.get("src_lang", "unknown")
-        # Segments skipped by the translation policy keep their original audio;
-        # synthesizing them is exactly what the policy is avoiding.
+        # Segments skipped by the translation policy have no safe target text.
+        # They do not reach TTS and Step 5 does not restore source vocals.
         dubbing_segments = [s for s in state["segments_step3"] if not is_skipped(s)]
         undubbed = len(state["segments_step3"]) - len(dubbing_segments)
         if undubbed:
-            print(f"⚠️ {undubbed} 句翻译已降级跳过，本轮不配音（Step 5 将保留其原声）。")
+            print(f"⚠️ {undubbed} 句翻译已降级跳过，本轮不配音且 Step 5 不恢复原声。")
         clips, router_results = TTSRouter(config, scheme=scheme).run(
             dubbing_segments, state["vocals_path"], force=force
         )
@@ -3969,15 +4024,7 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
 
 
 def restore_skipped_vocals(state: Dict[str, Any], config: DubbingConfig) -> str:
-    """Restore only explicitly skipped translations, never unresolved ASR gaps.
-
-    ASR coverage gaps are hard blockers and are never restored from the source
-    vocal track.  The only remaining restoration path is the older, explicit
-    ``translation_status=skipped`` policy; the default translation policy is
-    fail-fast and therefore never reaches that compatibility path.
-    """
-    from speech_activity import merge_ranges
-
+    """Return pure accompaniment; degraded dialogue never restores source vocals."""
     accomp_path = str(state.get("accomp_path") or "")
     skipped = [s for s in state.get("segments_step3", []) if s.get("translation_status") == "skipped"]
     unresolved = state.get("asr_unresolved_dialogue_regions") or []
@@ -3986,44 +4033,14 @@ def restore_skipped_vocals(state: Dict[str, Any], config: DubbingConfig) -> str:
             f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
             for item in unresolved[:8]
         )
-        raise RuntimeError(f"仍有未恢复对白，拒绝用原声混音并输出成片: {spans}")
-    if not skipped:
-        return accomp_path
-    vocals_path = str(state.get("vocals_path") or "")
-    if not os.path.isfile(accomp_path) or not os.path.isfile(vocals_path):
         print(
-            f"⚠️ 缺少伴奏/人声文件，{len(skipped)} 句跳过翻译，无法恢复。"
+            f"⚠️ 将带着未恢复对白降级成片，相应区间只保留伴奏/静音: {spans}"
         )
-        return accomp_path
-    try:
-        vocals = AudioSegment.from_wav(vocals_path)
-        restored = AudioSegment.from_wav(accomp_path)
-        skipped_ranges = [
-            (float(segment["start"]), float(segment["end"])) for segment in skipped
-        ]
-        restore_ranges = merge_ranges(skipped_ranges, max_gap=0.04)
-        applied = 0
-        fade_ms = max(0, int(config.asr_restore_fade_ms))
-        for start_seconds, end_seconds in restore_ranges:
-            start = max(0, int(start_seconds * 1000))
-            end = min(len(vocals), int(end_seconds * 1000))
-            if end <= start:
-                continue
-            clip = vocals[start:end]
-            safe_fade = min(fade_ms, max(0, len(clip) // 2))
-            if safe_fade:
-                clip = clip.fade_in(safe_fade).fade_out(safe_fade)
-            restored = restored.overlay(clip, position=start)
-            applied += 1
-        path = os.path.join(config.temp_dir, "accomp_with_restored_vocals.wav")
-        restored.export(path, format="wav")
+    if skipped:
         print(
-            f"↩️ 已恢复 {applied} 个显式跳过翻译区间（未用于 ASR 漏段）: {path}"
+            f"⚠️ {len(skipped)} 句无安全译文，相应区间只保留伴奏/静音。"
         )
-        return path
-    except Exception as exc:
-        print(f"⚠️ 恢复显式跳过翻译句失败，改用纯伴奏: {exc}")
-        return accomp_path
+    return accomp_path
 
 
 def run_step_5(config: DubbingConfig, input_file: str) -> None:
@@ -4035,7 +4052,19 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
     if state.get("input_file") and Path(state["input_file"]).resolve() != Path(input_file).resolve():
         raise RuntimeError("Step5 blocked: input video differs from checkpoint")
     from tts_quality import validate_mix_state
-    validate_mix_state(state, config, allow_missing=getattr(config, "allow_missing_tts", False))
+    quality_issues = validate_mix_state(
+        state, config, allow_missing=True, filter_missing=False
+    )
+    if quality_issues:
+        print("↩️ Step 5 将返回 Step 4 定向补生成失败句（已成功句会命中缓存）。")
+        run_step_4(config, backend=config.tts_backend, force=False)
+        state = state_mgr.load() or state
+        quality_issues = validate_mix_state(
+            state, config, allow_missing=True, filter_missing=True
+        )
+        if quality_issues:
+            state_mgr.save({"tts_degraded_issues": quality_issues})
+            print("⚠️ TTS 补生成后仍有失败句，将使用伴奏/静音完成成片。")
     mixer = Mixer(config)
     mixer.run(state["audio_clips"], restore_skipped_vocals(state, config), input_file, state["duration"])
 
@@ -4073,9 +4102,9 @@ def main() -> None:
     parser.add_argument("--allow-missing-tts", action="store_true", help="显式允许不完整 TTS 混音")
     parser.add_argument(
         "--translation-failure-policy",
-        choices=["fail_fast", "skip_failed"],
+        choices=["best_available", "fail_fast", "skip_failed"],
         default=None,
-        help="单句翻译失败时：fail_fast=整阶段失败(默认)，skip_failed=该句不配音并保留原声",
+        help="单句翻译失败时：best_available=选最佳安全候选(默认)，fail_fast=停止，skip_failed=该句不配音",
     )
     parser.add_argument(
         "--emotion-precedence",

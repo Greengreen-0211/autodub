@@ -1824,13 +1824,19 @@ def main():
         print("❌ state 中缺少 segments_step1，请先运行 Step 1a/1b")
         sys.exit(1)
     unresolved = state.get("asr_unresolved_dialogue_regions") or []
-    if unresolved and _env_bool("ASR_REQUIRE_COMPLETE_DIALOGUE", True):
+    if unresolved and _env_bool("ASR_REQUIRE_COMPLETE_DIALOGUE", False):
         spans = ", ".join(
             f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
             for item in unresolved[:8]
         )
         print(f"❌ 仍有确认对白未恢复，拒绝执行说话人聚类: {spans}")
         sys.exit(2)
+    if unresolved:
+        spans = ", ".join(
+            f"{float(item['start']):.2f}-{float(item['end']):.2f}s"
+            for item in unresolved[:8]
+        )
+        print(f"⚠️ 未恢复对白已记入降级报告，继续说话人聚类: {spans}")
 
     prepare_inputs(state)
     rttm_path = run_wespeaker_pipeline(state["segments_step1"])
