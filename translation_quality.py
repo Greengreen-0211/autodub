@@ -219,6 +219,8 @@ def _target_terminal(source_text: Any, target: Any) -> str:
         return "？" if lang in {"zh", "ja"} else "?"
     if source.endswith(("!", "！")):
         return "！" if lang in {"zh", "ja"} else "!"
+    if re.search(r"(?:…+|[.．]{2,})$", source):
+        return "……" if lang in {"zh", "ja"} else "..."
     return "。" if lang in {"zh", "ja"} else "."
 
 
@@ -230,33 +232,45 @@ def _strong_sentence_marks(text: Any) -> list[tuple[int, str]]:
         "dr", "mr", "mrs", "ms", "prof", "sr", "jr", "st",
         "vs", "etc", "e.g", "i.e", "a.m", "p.m",
     }
-    for match in re.finditer(r"[.!?。！？]+", value):
-        mark = match.group(0)[-1]
-        if set(match.group(0)) <= {"."}:
+    # Treat both ASCII dots (including ``...``) and the Unicode ellipsis used
+    # by Chinese subtitles as strong sentence boundaries.  OCR/LLM output
+    # commonly normalizes English ``...`` to ``……``; overlooking that form
+    # made an otherwise complete translation fail the punctuation audit.
+    for match in re.finditer(r"(?:[.…．]+|[!?。！？]+)", value):
+        raw_mark = match.group(0)
+        mark = raw_mark[-1]
+        if set(raw_mark) <= {".", "．", "…"}:
             start, end = match.span()
             previous = value[start - 1] if start else ""
             following = value[end] if end < len(value) else ""
-            # Decimal/version points and the inner dots of an acronym are not
-            # sentence boundaries.
-            if previous.isalnum() and following.isalnum():
-                continue
-            remainder = value[end:].lstrip()
-            if remainder:
-                token_match = re.search(r"([A-Za-z](?:[A-Za-z.]*)?)\.$", value[:end])
-                token = token_match.group(1).casefold().rstrip(".") if token_match else ""
-                token_starts_word = bool(
-                    token_match
-                    and (
-                        token_match.start(1) == 0
-                        or value[token_match.start(1) - 1].isspace()
-                    )
-                )
-                if token in abbreviations or (
-                    len(token) == 1
-                    and token_starts_word
-                    and remainder[0].isalpha()
-                ):
+            is_ellipsis = "…" in raw_mark or len(raw_mark) >= 2
+            if not is_ellipsis:
+                # Decimal/version points and the inner dots of an acronym are
+                # not sentence boundaries.  This protection applies only to
+                # a single dot: ``Wait...What`` is still a real pause.
+                if previous.isalnum() and following.isalnum():
                     continue
+                remainder = value[end:].lstrip()
+                if remainder:
+                    token_match = re.search(r"([A-Za-z](?:[A-Za-z.]*)?)\.$", value[:end])
+                    token = token_match.group(1).casefold().rstrip(".") if token_match else ""
+                    token_starts_word = bool(
+                        token_match
+                        and (
+                            token_match.start(1) == 0
+                            or value[token_match.start(1) - 1].isspace()
+                        )
+                    )
+                    if token in abbreviations or (
+                        len(token) == 1
+                        and token_starts_word
+                        and remainder[0].isalpha()
+                    ):
+                        continue
+            if is_ellipsis:
+                mark = "…"
+            elif mark == "．":
+                mark = "."
         marks.append((match.end(), mark))
     return marks
 
@@ -267,6 +281,8 @@ def _localized_terminal(mark: str, target: Any) -> str:
         return "？" if lang in {"zh", "ja"} else "?"
     if mark in {"!", "！"}:
         return "！" if lang in {"zh", "ja"} else "!"
+    if mark == "…":
+        return "……" if lang in {"zh", "ja"} else "..."
     return "。" if lang in {"zh", "ja"} else "."
 
 
@@ -374,14 +390,14 @@ def prepare_tts_punctuation(
 ) -> tuple[str, bool, str]:
     """Normalize terminal and strong sentence punctuation for TTS."""
     raw = str(text or "").strip()
-    value = re.sub(r"\s+([，。！？；：、,.!?;:])", r"\1", raw)
+    value = re.sub(r"\s+([，。！？；：、,.!?;:…．])", r"\1", raw)
     value = re.sub(r"[ \t]{2,}", " ", value).strip()
     value, ready, status = _restore_source_sentence_boundaries(
         value, source_text, target
     )
     if not ready:
         return value, False, status
-    if not re.search(r"[。！？.!?][\"'”’）\]】》]*$", value):
+    if not re.search(r"(?:[。．！？.!?]|…+)[\"'”’）\]】》]*$", value):
         value += _target_terminal(source_text, target)
         status = (
             "deterministic_terminal"

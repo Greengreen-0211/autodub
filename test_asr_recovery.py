@@ -160,6 +160,26 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertEqual(decision["slot_ratio"], 0.55)
         self.assertGreater(decision["target_ratio"], 6.0)
 
+    def test_coarse_duration_allows_moderate_step4_compression(self):
+        decision = classify_coarse_recovery_duration(
+            actual=3.501,
+            target=2.48,
+            available=2.48,
+            measured=True,
+        )
+        self.assertEqual(decision["status"], "suitable")
+        self.assertEqual(decision["slot_ratio"], 1.4117)
+
+    def test_coarse_duration_still_blocks_excessive_compression(self):
+        decision = classify_coarse_recovery_duration(
+            actual=3.8,
+            target=2.48,
+            available=2.48,
+            measured=True,
+        )
+        self.assertEqual(decision["status"], "too_long_blocking")
+        self.assertGreater(decision["slot_ratio"], 1.5)
+
     def test_wespeaker_step2_invalidates_dependent_results(self):
         state = {
             "segments_step1": [{"id": 0, "text": "hello"}],

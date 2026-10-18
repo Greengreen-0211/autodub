@@ -70,7 +70,7 @@ def classify_coarse_recovery_duration(
     available: float,
     measured: bool,
     minimum_slot_ratio: float = 0.65,
-    maximum_slot_ratio: float = 1.35,
+    maximum_slot_ratio: float = 1.50,
 ) -> Dict[str, Any]:
     """Classify recovered TTS against its physical slot, not word timing.
 

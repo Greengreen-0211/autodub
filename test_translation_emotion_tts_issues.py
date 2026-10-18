@@ -96,6 +96,52 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(restored, "我睡不着天还没睡我们来玩")
         self.assertEqual(reason, "missing_strong_boundary_evidence")
 
+    def test_chinese_ellipsis_preserves_source_pause_boundary(self):
+        text = "准备好了吗？嗯……太神奇了！"
+        restored, ready, reason = prepare_tts_punctuation(
+            text, "Ready? Uhhm... This is amazing!", "zh"
+        )
+        self.assertTrue(ready)
+        self.assertEqual(restored, text)
+        self.assertEqual(reason, "source_boundaries_preserved")
+
+    def test_chinese_ellipsis_is_a_valid_terminal(self):
+        text = "我想想……"
+        restored, ready, _ = prepare_tts_punctuation(
+            text, "Let me think...", "zh"
+        )
+        self.assertTrue(ready)
+        self.assertEqual(restored, text)
+
+    def test_variable_length_ellipsis_forms_are_boundaries(self):
+        source_text = "Wait...What now."
+        for punctuation in ("..", "...", ".....", "…", "……", "………", "．．", "．．．．"):
+            with self.subTest(punctuation=punctuation):
+                text = f"等等{punctuation}现在怎么办。"
+                restored, ready, reason = prepare_tts_punctuation(
+                    text, source_text, "zh"
+                )
+                self.assertTrue(ready)
+                self.assertEqual(restored, text)
+                self.assertEqual(reason, "source_boundaries_preserved")
+
+    def test_ellipsis_without_surrounding_spaces_is_not_a_decimal(self):
+        text = "等等……现在怎么办。"
+        restored, ready, reason = prepare_tts_punctuation(
+            text, "Wait...What now.", "zh"
+        )
+        self.assertTrue(ready)
+        self.assertEqual(restored, text)
+        self.assertEqual(reason, "source_boundaries_preserved")
+
+    def test_missing_terminal_inherits_source_ellipsis(self):
+        restored, ready, reason = prepare_tts_punctuation(
+            "我想想", "Let me think...", "zh"
+        )
+        self.assertTrue(ready)
+        self.assertEqual(restored, "我想想……")
+        self.assertEqual(reason, "deterministic_terminal")
+
     def test_translation_candidates_are_punctuated_before_light_tts(self):
         source_segment = source(
             text=(

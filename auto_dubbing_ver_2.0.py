@@ -3796,7 +3796,10 @@ def run_step_3(config: DubbingConfig) -> None:
         else:
             final_segments = selected_segments
         recovery_min_ratio = _env_float("ASR_RECOVERY_TTS_MIN_RATIO", 0.65)
-        recovery_max_ratio = _env_float("ASR_RECOVERY_TTS_MAX_RATIO", 1.35)
+        # Step 4 can safely apply moderate tempo compression.  Keep this below
+        # the engine's absolute limit, but do not reject recoverable dialogue
+        # merely because it needs about 1.4x compression.
+        recovery_max_ratio = _env_float("ASR_RECOVERY_TTS_MAX_RATIO", 1.50)
         duration_blocked = []
         for segment in final_segments:
             if (
