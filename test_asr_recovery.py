@@ -23,10 +23,121 @@ from ocr_v211_integration import (
     _load_initial_recovery_state,
     _partition_deferred_regions,
     _recover_deferred_from_ocr,
+    apply_stable_bilingual_entity_corrections,
 )
 
 
 class OCRTimelineTests(unittest.TestCase):
+    @staticmethod
+    def _entity_segment(text="Aurora, wake up!"):
+        stamps = [
+            {"text": "Aurora", "start": 13.09, "end": 13.40},
+            {"text": "wake", "start": 13.50, "end": 13.82},
+            {"text": "up", "start": 13.84, "end": 14.05},
+        ]
+        return {
+            "id": 1,
+            "start": 13.09,
+            "end": 17.29,
+            "text": text,
+            "qwen3_time_stamps": [dict(item) for item in stamps],
+            "qwen3_time_stamps_raw": [dict(item) for item in stamps],
+            "timestamp_precision": "word",
+        }
+
+    def test_stable_bilingual_entity_repairs_one_timed_name(self):
+        segment = self._entity_segment()
+        frames = [
+            {"timestamp": 13.40, "text": "Elsa!\n艾莎！"},
+            {"timestamp": 13.90, "text": "Elsa!\n艾莎！"},
+        ]
+        corrected, audit = apply_stable_bilingual_entity_corrections(
+            [segment], frames, "en", "zh"
+        )
+        self.assertEqual(corrected[0]["text"], "Elsa, wake up!")
+        self.assertEqual(corrected[0]["start"], segment["start"])
+        self.assertEqual(corrected[0]["end"], segment["end"])
+        self.assertEqual(corrected[0]["qwen3_time_stamps"][0]["text"], "Elsa")
+        self.assertEqual(corrected[0]["qwen3_time_stamps_raw"][0]["text"], "Elsa")
+        self.assertEqual(
+            corrected[0]["qwen3_timestamp_status"],
+            "ocr_entity_token_substitution_preserved",
+        )
+        self.assertTrue(audit[0]["accepted"])
+        self.assertEqual(audit[0]["original_name"], "Aurora")
+        self.assertEqual(audit[0]["corrected_name"], "Elsa")
+        self.assertEqual(audit[0]["target_evidence"], "艾莎！")
+
+    def test_raw_timestamp_entity_is_matched_by_word_and_time_not_list_index(self):
+        segment = self._entity_segment()
+        segment["qwen3_time_stamps_raw"] = [
+            {"text": "noise", "start": 9.0, "end": 9.1},
+            *segment["qwen3_time_stamps_raw"],
+        ]
+        frames = [
+            {"timestamp": 13.40, "text": "Elsa!\n艾莎！"},
+            {"timestamp": 13.90, "text": "Elsa!\n艾莎！"},
+        ]
+
+        corrected, audit = apply_stable_bilingual_entity_corrections(
+            [segment], frames, "en", "zh"
+        )
+
+        self.assertEqual(corrected[0]["qwen3_time_stamps_raw"][0]["text"], "noise")
+        self.assertEqual(corrected[0]["qwen3_time_stamps_raw"][1]["text"], "Elsa")
+        self.assertTrue(audit[0]["accepted"])
+
+    def test_true_name_supported_by_ocr_is_never_replaced(self):
+        segment = self._entity_segment()
+        frames = [
+            {"timestamp": 13.40, "text": "Aurora!\n奥罗拉！"},
+            {"timestamp": 13.90, "text": "Aurora!\n奥罗拉！"},
+            {"timestamp": 13.50, "text": "Elsa!\n艾莎！"},
+            {"timestamp": 13.95, "text": "Elsa!\n艾莎！"},
+        ]
+        corrected, audit = apply_stable_bilingual_entity_corrections(
+            [segment], frames, "en", "zh"
+        )
+        self.assertEqual(corrected[0]["text"], segment["text"])
+        self.assertEqual(audit, [])
+
+    def test_single_frame_entity_is_not_authoritative(self):
+        segment = self._entity_segment()
+        corrected, audit = apply_stable_bilingual_entity_corrections(
+            [segment],
+            [{"timestamp": 13.40, "text": "Elsa!\n艾莎！"}],
+            "en",
+            "zh",
+        )
+        self.assertEqual(corrected[0]["text"], segment["text"])
+        self.assertEqual(audit, [])
+
+    def test_conflicting_bilingual_targets_do_not_repair(self):
+        segment = self._entity_segment()
+        frames = [
+            {"timestamp": 13.30, "text": "Elsa!\n艾莎！"},
+            {"timestamp": 13.60, "text": "Elsa!\n艾莎！"},
+            {"timestamp": 13.90, "text": "Elsa!\n埃尔莎！"},
+            {"timestamp": 14.10, "text": "Elsa!\n埃尔莎！"},
+        ]
+        corrected, audit = apply_stable_bilingual_entity_corrections(
+            [segment], frames, "en", "zh"
+        )
+        self.assertEqual(corrected[0]["text"], segment["text"])
+        self.assertEqual(audit, [])
+
+    def test_distant_entity_subtitle_does_not_repair(self):
+        segment = self._entity_segment()
+        frames = [
+            {"timestamp": 16.00, "text": "Elsa!\n艾莎！"},
+            {"timestamp": 16.40, "text": "Elsa!\n艾莎！"},
+        ]
+        corrected, audit = apply_stable_bilingual_entity_corrections(
+            [segment], frames, "en", "zh"
+        )
+        self.assertEqual(corrected[0]["text"], segment["text"])
+        self.assertEqual(audit, [])
+
     def test_repeated_clause_boundary_moves_only_missing_suffix(self):
         segments = [
             {

@@ -7,9 +7,10 @@ import hashlib
 import json
 import math
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Type
+from typing import Any, Dict, List, Mapping, Sequence, Tuple, Type
 from urllib.parse import urlsplit, urlunsplit
 
 from autodub_ocr_runtime import VERSION as OCR_OPTIMIZED_VERSION
@@ -436,10 +437,309 @@ class OCRV211Corrector:
         return corrected
 
 
+_ENTITY_WORD = re.compile(r"[A-Za-z][A-Za-z'’\-]{1,23}")
+_NON_ENTITY_UTTERANCES = {
+    "ah", "come", "go", "goodbye", "hello", "hey", "hi", "hmm",
+    "how", "look", "no", "oh", "okay", "ok", "please", "psst",
+    "ready", "sorry", "thanks", "thank", "uh", "uhhm", "um", "wait",
+    "what", "when", "where", "who", "why", "yes",
+}
+
+
+def _entity_token(value: Any) -> str:
+    match = _ENTITY_WORD.fullmatch(str(value or "").strip(" \t\r\n,.:;!?，。！？：；\"'“”‘’()[]{}"))
+    return match.group(0) if match else ""
+
+
+def _looks_like_entity_token(value: Any) -> bool:
+    token = _entity_token(value)
+    if not token or token.casefold() in _NON_ENTITY_UTTERANCES:
+        return False
+    return token.isupper() or (token[:1].isupper() and token[1:].islower())
+
+
+def _stable_bilingual_entity_evidence(
+    frame_records: Sequence[Mapping[str, Any]],
+    source_language: Any,
+    target_language: Any,
+) -> List[Dict[str, Any]]:
+    """Extract conservative, repeated source-name/target-name OCR pairs.
+
+    The target text is corroboration only.  No target translation is ever
+    copied into ASR.  Exact source/target pairs must occur in at least two
+    different sampled frames, and ambiguous target variants are rejected.
+    """
+    from ocr_translation_reference import (
+        _line_matches_script,
+        _normalize,
+        _parse_lines,
+        _script_family,
+        _spatial_score,
+    )
+
+    source_family = _script_family(source_language)
+    target_family = _script_family(target_language)
+    if source_family != "latin" or target_family not in {"han", "japanese"}:
+        return []
+
+    grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        lines = _parse_lines(record.get("text"))
+        sources = []
+        targets = []
+        for line in lines:
+            text = str(line.get("text") or "")
+            source_match = _line_matches_script(text, source_family)
+            target_match = _line_matches_script(text, target_family)
+            if source_match and not target_match:
+                sources.append(line)
+            elif target_match:
+                targets.append(line)
+        for source in sources:
+            words = _ENTITY_WORD.findall(str(source["text"]))
+            possible = [word for word in words if _looks_like_entity_token(word)]
+            # Entity-only subtitle cards may contain a short filler beside the
+            # name (for example "Elsa! Psst").  More complex lines are not
+            # deterministic enough for automatic spelling correction.
+            if len(words) > 3 or len(possible) != 1:
+                continue
+            source_name = possible[0]
+            for target in targets:
+                target_text = str(target["text"])
+                han = re.findall(r"[\u3400-\u9fff]", target_text)
+                if not 2 <= len(han) <= 6:
+                    continue
+                spatial = _spatial_score(source.get("bbox"), target.get("bbox"))
+                if source.get("bbox") and target.get("bbox") and spatial < 0.28:
+                    continue
+                key = (source_name.casefold(), _normalize(target_text))
+                entry = grouped.setdefault(key, {
+                    "source_name": source_name,
+                    "target_text": target_text,
+                    "timestamps": set(),
+                    "spatial_scores": [],
+                })
+                entry["timestamps"].add(round(timestamp, 3))
+                entry["spatial_scores"].append(float(spatial))
+
+    by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for (source_key, _), entry in grouped.items():
+        support = len(entry["timestamps"])
+        if support < 2:
+            continue
+        timestamps = sorted(entry["timestamps"])
+        # Text visible throughout a long scene is much more likely to be UI or
+        # a watermark than a spoken subtitle card.
+        if timestamps[-1] - timestamps[0] > 3.5:
+            continue
+        candidate = {
+            "source_name": entry["source_name"],
+            "target_text": entry["target_text"],
+            "timestamps": timestamps,
+            "frame_support": support,
+            "first_seen": timestamps[0],
+            "last_seen": timestamps[-1],
+            "spatial_score": round(max(entry["spatial_scores"]), 4),
+        }
+        by_source.setdefault(source_key, []).append(candidate)
+
+    stable: List[Dict[str, Any]] = []
+    for candidates in by_source.values():
+        candidates.sort(key=lambda item: item["frame_support"], reverse=True)
+        best = candidates[0]
+        # Two similarly supported target renderings mean the bilingual pairing
+        # is ambiguous.  Preserve ASR rather than choosing one.
+        if len(candidates) > 1 and (
+            candidates[1]["frame_support"] >= best["frame_support"] - 1
+        ):
+            continue
+        stable.append(best)
+    return stable
+
+
+def _timestamp_entity_words(segment: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    for index, item in enumerate(segment.get("qwen3_time_stamps") or []):
+        token = _entity_token(item.get("text")) if isinstance(item, Mapping) else ""
+        if not _looks_like_entity_token(token):
+            continue
+        try:
+            start = float(item.get("start"))
+            end = float(item.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            continue
+        output.append({"index": index, "token": token, "start": start, "end": end})
+    return output
+
+
+def _entity_time_distance(word: Mapping[str, Any], evidence: Mapping[str, Any]) -> float:
+    if float(evidence["last_seen"]) < float(word["start"]):
+        return float(word["start"]) - float(evidence["last_seen"])
+    if float(evidence["first_seen"]) > float(word["end"]):
+        return float(evidence["first_seen"]) - float(word["end"])
+    return 0.0
+
+
+def apply_stable_bilingual_entity_corrections(
+    segments: Sequence[Dict[str, Any]],
+    frame_records: Sequence[Mapping[str, Any]],
+    source_language: Any,
+    target_language: Any,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Correct a mistyped ASR name only under repeated bilingual OCR evidence.
+
+    This deliberately edits one token at a time and preserves its original
+    word timestamps.  It does not merge/split segments or alter any boundary.
+    """
+    evidence = _stable_bilingual_entity_evidence(
+        frame_records, source_language, target_language
+    )
+    corrected: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    for original in segments:
+        segment = deepcopy(original)
+        text = str(segment.get("text") or "")
+        timed_words = _timestamp_entity_words(segment)
+        proposals: List[Dict[str, Any]] = []
+        for word in timed_words:
+            nearby = []
+            for item in evidence:
+                distance = _entity_time_distance(word, item)
+                if distance <= 1.6:
+                    nearby.append((distance, -int(item["frame_support"]), item))
+            if not nearby:
+                continue
+            nearby.sort(key=lambda row: (row[0], row[1], str(row[2]["source_name"])))
+            exact = [
+                row for row in nearby
+                if str(row[2]["source_name"]).casefold() == str(word["token"]).casefold()
+            ]
+            if exact:
+                # OCR independently supports the existing name; never replace it.
+                continue
+            best = nearby[0]
+            competing_names = {
+                str(row[2]["source_name"]).casefold()
+                for row in nearby
+                if row[0] <= best[0] + 0.35
+                and int(row[2]["frame_support"]) >= int(best[2]["frame_support"]) - 1
+            }
+            if len(competing_names) != 1:
+                continue
+            source_name = str(best[2]["source_name"])
+            if re.search(
+                rf"(?<![A-Za-z]){re.escape(source_name)}(?![A-Za-z])",
+                text,
+                flags=re.IGNORECASE,
+            ):
+                # Both names already occur in the utterance; identity is not
+                # resolvable by this local evidence.
+                continue
+            occurrences = list(re.finditer(
+                rf"(?<![A-Za-z]){re.escape(str(word['token']))}(?![A-Za-z])",
+                text,
+                flags=re.IGNORECASE,
+            ))
+            if len(occurrences) != 1:
+                continue
+            occurrence = occurrences[0]
+            before = text[:occurrence.start()].rstrip()
+            after = text[occurrence.end():].lstrip()
+            at_clause_start = not before or before[-1:] in ".!?。！？"
+            address_punctuation = bool(after[:1] in ",，:：!?！")
+            if not (at_clause_start and address_punctuation):
+                continue
+            proposals.append({
+                "word": word,
+                "evidence": best[2],
+                "distance": round(float(best[0]), 4),
+                "span": (occurrence.start(), occurrence.end()),
+            })
+
+        # Multiple simultaneous edits are intentionally unsupported.  A
+        # single auditable name repair is safe; a compound rewrite belongs to
+        # the existing frozen classifier.
+        if len(proposals) != 1:
+            corrected.append(segment)
+            if proposals:
+                audit.append({
+                    "segment_id": str(segment.get("id")),
+                    "accepted": False,
+                    "reason": "multiple_entity_repairs_not_allowed",
+                    "proposal_count": len(proposals),
+                })
+            continue
+
+        proposal = proposals[0]
+        start, end = proposal["span"]
+        old_name = text[start:end]
+        new_name = str(proposal["evidence"]["source_name"])
+        segment["text"] = text[:start] + new_name + text[end:]
+        segment.setdefault("ocr_original_asr", text)
+        normalized_items = segment.get("qwen3_time_stamps")
+        target_index = int(proposal["word"]["index"])
+        if (
+            isinstance(normalized_items, list)
+            and target_index < len(normalized_items)
+            and isinstance(normalized_items[target_index], dict)
+            and _entity_token(normalized_items[target_index].get("text")).casefold()
+            == old_name.casefold()
+        ):
+            normalized_items[target_index]["text"] = new_name
+        raw_items = segment.get("qwen3_time_stamps_raw")
+        if isinstance(raw_items, list):
+            raw_matches = []
+            for raw_index, item in enumerate(raw_items):
+                if not isinstance(item, Mapping):
+                    continue
+                if _entity_token(item.get("text")).casefold() != old_name.casefold():
+                    continue
+                try:
+                    delta = abs(float(item.get("start")) - float(proposal["word"]["start"]))
+                    delta += abs(float(item.get("end")) - float(proposal["word"]["end"]))
+                except (TypeError, ValueError):
+                    continue
+                raw_matches.append((delta, raw_index))
+            raw_matches.sort()
+            if raw_matches and raw_matches[0][0] <= 0.4 and (
+                len(raw_matches) == 1 or raw_matches[1][0] > raw_matches[0][0] + 0.05
+            ):
+                raw_items[raw_matches[0][1]]["text"] = new_name
+        segment["qwen3_timestamp_status"] = "ocr_entity_token_substitution_preserved"
+        decision = {
+            "accepted": True,
+            "reason": "stable_bilingual_entity_timeline",
+            "original_name": old_name,
+            "corrected_name": new_name,
+            "target_evidence": proposal["evidence"]["target_text"],
+            "frame_support": proposal["evidence"]["frame_support"],
+            "evidence_timestamps": proposal["evidence"]["timestamps"],
+            "time_distance": proposal["distance"],
+        }
+        segment["ocr_entity_correction"] = decision
+        previous_optimized = deepcopy(segment.get("ocr_optimized") or {})
+        segment["ocr_optimized"] = {
+            "version": OCR_OPTIMIZED_VERSION,
+            "accepted": True,
+            "reason": decision["reason"],
+            "base_decision": previous_optimized,
+        }
+        audit.append({"segment_id": str(segment.get("id")), **decision})
+        corrected.append(segment)
+    return corrected, audit
+
+
 def _implementation_binding(main_path: Path) -> str:
     return _ocr_digest({
         "runtime": FrozenBOCRPipeline(FROZEN_B_PROMPT).binding,
         "pipeline": hashlib.sha256(main_path.read_bytes()).hexdigest(),
+        "integration": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "prompt": FROZEN_B_PROMPT_SHA256,
     })
 
@@ -666,6 +966,7 @@ def run_step_1b_optimized(
         media_duration=float(state.get("duration") or 0.0) or None,
     )
     deferred_frame_records: Dict[str, List[Dict[str, Any]]] = {}
+    all_frame_records: List[Dict[str, Any]] = []
     if enabled:
         try:
             client = OCRV211Client(config)
@@ -685,6 +986,11 @@ def run_step_1b_optimized(
                     )
                     for region in recovery_groups
                 }
+                all_frame_records = [
+                    dict(record, segment_id=str(segment_id))
+                    for segment_id, records in client.frame_records_by_segment.items()
+                    for record in records
+                ]
             finally:
                 client.session.close()
         except Exception as exc:
@@ -787,6 +1093,25 @@ def run_step_1b_optimized(
             "被重复短语截断的相邻边界。"
         )
 
+    entity_correction_audit: List[Dict[str, Any]] = []
+    if enabled and all_frame_records:
+        segments, entity_correction_audit = (
+            apply_stable_bilingual_entity_corrections(
+                segments,
+                all_frame_records,
+                str(config.ocr_source_language or state.get("src_lang", "")),
+                str(getattr(config, "target_lang", "")),
+            )
+        )
+        accepted_entities = sum(
+            bool(item.get("accepted")) for item in entity_correction_audit
+        )
+        if accepted_entities:
+            print(
+                f"✅ OCR 双语实体纠错: 采纳 {accepted_entities} 个"
+                "多帧稳定的人名拼写修复。"
+            )
+
     state_mgr.delete_keys(downstream_state_keys)
     combined_recovery_report = [
         *deepcopy(initial_recovery_report),
@@ -810,13 +1135,14 @@ def run_step_1b_optimized(
         "asr_recovery_report_initial": deepcopy(initial_recovery_report),
         "asr_ocr_recovery_report": ocr_recovery_audit,
         "asr_boundary_repair_report": boundary_repair_audit,
+        "asr_ocr_entity_correction_report": entity_correction_audit,
         "asr_recovery_report": combined_recovery_report,
         "asr_unresolved_dialogue_regions": blocking_regions,
         "asr_acoustic_uncertain_regions": acoustic_uncertain,
         "asr_non_dialogue_audited_regions": non_dialogue_audited,
         "ocr_optimized_manifest": {
             "version": OCR_OPTIMIZED_VERSION,
-            "recovery_version": "grouped-dense-context-v5-boundary-reconcile",
+            "recovery_version": "grouped-dense-context-v6-bilingual-entity",
             "binding": _implementation_binding(main_path),
             "mode": _mode() if enabled else "off",
             "input_scope": config.ocr_scope,
