@@ -3478,6 +3478,7 @@ def run_step_2(config: DubbingConfig) -> None:
             from run_step2_wespeaker import (
                 attach_speaker_confidence,
                 load_clustering_diagnostics,
+                reassemble_final_speaker_segments,
             )
 
             clustering_diagnostics = load_clustering_diagnostics()
@@ -3485,6 +3486,7 @@ def run_step_2(config: DubbingConfig) -> None:
                 aligned = attach_speaker_confidence(
                     aligned, clustering_diagnostics
                 )
+                aligned = reassemble_final_speaker_segments(aligned)
             unique = sorted(set(s["speaker"] for s in aligned))
             print(f"🔍 WeSpeaker 识别出 {len(unique)} 个说话人: {unique}")
             state_mgr.delete_keys([

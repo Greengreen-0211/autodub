@@ -27,8 +27,8 @@ class AlignmentConfig:
     target_sentence_seconds: float = 8.0
     maximum_sentence_seconds: float = 12.0
     speaker_snap_radius_seconds: float = 0.80
-    minimum_speaker_turn_seconds: float = 0.75
-    island_max_seconds: float = 0.50
+    minimum_speaker_turn_seconds: float = 0.45
+    island_max_seconds: float = 0.30
     island_max_gap_seconds: float = 0.15
 
 
@@ -334,7 +334,7 @@ def smooth_rttm_spans(
     *,
     config: AlignmentConfig = AlignmentConfig(),
 ) -> List[Dict[str, Any]]:
-    """Merge adjacent labels and remove only local, short A-B-A islands."""
+    """Merge adjacent equal labels without deleting a distinct short voice."""
     ordered = sorted(
         (
             {
@@ -357,25 +357,10 @@ def smooth_rttm_spans(
             merged[-1]["end"] = max(merged[-1]["end"], span["end"])
         else:
             merged.append(dict(span))
-    index = 1
-    while index < len(merged) - 1:
-        left, middle, right = merged[index - 1:index + 2]
-        duration = middle["end"] - middle["start"]
-        if (
-            left["speaker"] == right["speaker"] != middle["speaker"]
-            and duration <= config.island_max_seconds
-            and middle["start"] - left["end"] <= config.island_max_gap_seconds
-            and right["start"] - middle["end"] <= config.island_max_gap_seconds
-        ):
-            merged[index - 1] = {
-                "start": left["start"],
-                "end": right["end"],
-                "speaker": left["speaker"],
-            }
-            del merged[index:index + 2]
-            index = max(1, index - 1)
-        else:
-            index += 1
+    # A-B-A removal used to rely only on the duration of B.  That can erase a
+    # real short reply or interjection.  Acoustic identity reconciliation now
+    # handles jitter upstream; this text-alignment layer therefore performs no
+    # destructive label-only island smoothing.
     return merged
 
 
@@ -512,8 +497,41 @@ def align_segments_with_rttm(
         ]
         if not items or status in {"unusable", "coarse"}:
             segment["speaker"] = normalize_speaker(fallback)
-            if len(overlaps) > 1:
+            overlap_total = sum(overlaps.values())
+            dominant_overlap = max(overlaps.values(), default=0.0)
+            dominance = (
+                dominant_overlap / overlap_total if overlap_total > 0.0 else 0.0
+            )
+            segment["speaker_overlap_dominance"] = round(dominance, 4)
+            segment["speaker_overlap_candidates"] = [
+                {
+                    "speaker": normalize_speaker(speaker),
+                    "seconds": round(seconds, 3),
+                    "ratio": round(
+                        seconds / overlap_total if overlap_total > 0.0 else 0.0,
+                        4,
+                    ),
+                }
+                for speaker, seconds in sorted(
+                    overlaps.items(), key=lambda item: item[1], reverse=True
+                )
+            ]
+            segment["speaker_assignment_confidence"] = round(
+                dominance * (0.70 if status == "coarse" else 0.80), 4
+            )
+            if len(overlaps) > 1 and dominance < 0.80:
                 segment["speaker_boundary_ambiguous"] = True
+                segment["speaker_assignment_status"] = (
+                    "ambiguous_coarse_overlap"
+                    if status == "coarse"
+                    else "ambiguous_unusable_timestamps"
+                )
+            else:
+                segment["speaker_assignment_status"] = (
+                    "coarse_dominant_overlap"
+                    if status == "coarse"
+                    else "dominant_overlap_fallback"
+                )
             output.append(segment)
             continue
 
