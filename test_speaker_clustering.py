@@ -152,6 +152,26 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         selected, _ = _select_change_boundaries([candidate], windows)
         self.assertEqual(selected[0]["constraint"], "hard")
 
+    def test_single_acoustic_peak_is_identity_only_not_text_split(self):
+        region = ("input", 0.0, 8.0)
+        windows = [
+            {"region": region, "center": value}
+            for value in (1.0, 2.0, 3.0, 5.0, 6.0, 7.0)
+        ]
+        candidate = {
+            "time": 4.0, "score": 0.82, "similarity": 0.18,
+            "gap": 0.0, "left_count": 3, "right_count": 3,
+            "left_cohesion": 0.9, "right_cohesion": 0.9,
+            "left_text": "<acoustic>", "right_text": "<acoustic>",
+            "punctuation": "none", "same_asr_segment": True,
+            "timestamp_reliable": False, "candidate_source": "acoustic_scan",
+            "persistent_acoustic_change": False,
+        }
+        selected, _ = _select_change_boundaries([candidate], windows)
+        self.assertEqual(len(selected), 1)
+        self.assertFalse(selected[0]["text_split_allowed"])
+        self.assertEqual(selected[0]["boundary_role"], "identity_diagnostic_only")
+
     def test_strong_punctuation_soft_boundary_remains_reconcilable(self):
         threshold = _soft_continuity_threshold([{
             "same_asr_segment": True,
@@ -317,7 +337,7 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertLess(len(identities), 5)
         self.assertEqual(
             diagnostics["algorithm"],
-            "global_identity_model_selection_v6",
+            "stable_core_identity_consensus_v7",
         )
         self.assertGreater(
             diagnostics["global_partition_candidate_count"], 1
@@ -566,6 +586,59 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
 
 
 class SpeakerAlignmentFallbackTests(unittest.TestCase):
+    def test_diagnostic_only_rttm_change_does_not_cut_text(self):
+        segments = [{
+            "id": 0, "start": 0.0, "end": 3.0,
+            "text": "Step up onto the rail.",
+            "qwen3_time_stamps": [
+                {"text": "Step", "start": 0.1, "end": 0.5},
+                {"text": "up", "start": 0.55, "end": 0.8},
+                {"text": "onto", "start": 1.4, "end": 1.8},
+                {"text": "the", "start": 1.85, "end": 2.1},
+                {"text": "rail", "start": 2.2, "end": 2.8},
+            ],
+        }]
+        spans = [
+            {"start": 0.0, "end": 1.5, "speaker": "SPEAKER_00"},
+            {"start": 1.5, "end": 3.0, "speaker": "SPEAKER_01"},
+        ]
+        result = align_segments_with_rttm(
+            segments,
+            spans,
+            speaker_boundary_evidence=[{
+                "time": 1.5, "text_split_allowed": False,
+                "boundary_role": "identity_diagnostic_only",
+            }],
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "Step up onto the rail.")
+
+    def test_acoustic_change_without_word_gap_does_not_cut_phrase(self):
+        segments = [{
+            "id": 0, "start": 0.0, "end": 2.0,
+            "text": "Wait, please continue.",
+            "qwen3_time_stamps": [
+                {"text": "Wait,", "start": 0.1, "end": 0.8},
+                {"text": "please", "start": 0.8, "end": 1.2},
+                {"text": "continue", "start": 1.2, "end": 1.8},
+            ],
+        }]
+        spans = [
+            {"start": 0.0, "end": 0.8, "speaker": "SPEAKER_00"},
+            {"start": 0.8, "end": 2.0, "speaker": "SPEAKER_01"},
+        ]
+        result = align_segments_with_rttm(
+            segments,
+            spans,
+            speaker_boundary_evidence=[{
+                "time": 0.8, "text_split_allowed": True,
+                "boundary_role": "speaker_and_text",
+                "candidate_source": "acoustic_scan",
+            }],
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "Wait, please continue.")
+
     def test_corrected_text_splits_using_original_timing_skeleton(self):
         segments = [{
             "id": 0,
@@ -657,6 +730,12 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
         merged = reassemble_final_speaker_segments(mapped)
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["text"], "one two")
+        self.assertTrue(merged[0]["speaker_reference_mixed_raw"])
+        self.assertEqual(len(merged[0]["speaker_reference_components"]), 2)
+        self.assertEqual(
+            [item["text"] for item in merged[0]["speaker_reference_components"]],
+            ["one", "two"],
+        )
 
 
 if __name__ == "__main__":

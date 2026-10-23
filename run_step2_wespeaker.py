@@ -72,6 +72,12 @@ BOUNDARY_MIN_CONTEXT_SECONDS = _env_float(
 BOUNDARY_GUARD_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_GUARD_SECONDS", 0.3)
 BOUNDARY_MIN_TURN_SECONDS = _env_float("AUTODUB_DIAR_MIN_TURN_SECONDS", 0.8)
 BOUNDARY_NMS_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_NMS_SECONDS", 1.15)
+ACOUSTIC_PERSISTENCE_MIN_POINTS = _env_int(
+    "AUTODUB_DIAR_ACOUSTIC_PERSISTENCE_MIN_POINTS", 2
+)
+ACOUSTIC_TEXT_SPLIT_MIN_SCORE = _env_float(
+    "AUTODUB_DIAR_ACOUSTIC_TEXT_SPLIT_MIN_SCORE", 0.72
+)
 BOUNDARY_SCORE_OVERRIDE = os.getenv("AUTODUB_DIAR_BOUNDARY_SCORE")
 STRONG_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_STRONG_SIMILARITY", 0.68)
 WEAK_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_WEAK_SIMILARITY", 0.36)
@@ -608,12 +614,23 @@ def _acoustic_boundary_scores(segments, windows):
                 "timestamp_reliable": False,
                 "candidate_source": "acoustic_scan",
             })
-        # Retain local maxima only.  Final NMS still arbitrates against a
-        # timestamp-derived candidate at the same physical change.
+        # Retain local maxima only. A single sharp window is useful for
+        # identity diagnostics, but it is not enough to split transcript text.
         for index, candidate in enumerate(region_candidates):
-            neighbours = (
-                region_candidates[max(0, index - 1):index]
-                + region_candidates[index + 1:index + 2]
+            neighbourhood = region_candidates[
+                max(0, index - 1):min(len(region_candidates), index + 2)
+            ]
+            neighbours = [item for item in neighbourhood if item is not candidate]
+            support_floor = max(0.50, float(candidate["score"]) - 0.12)
+            persistence_count = sum(
+                float(item["score"]) >= support_floor for item in neighbourhood
+            )
+            candidate["persistence_count"] = int(persistence_count)
+            candidate["persistence_ratio"] = round(
+                persistence_count / max(1, len(neighbourhood)), 4
+            )
+            candidate["persistent_acoustic_change"] = bool(
+                persistence_count >= ACOUSTIC_PERSISTENCE_MIN_POINTS
             )
             if all(candidate["score"] >= item["score"] for item in neighbours):
                 candidates.append(candidate)
@@ -706,6 +723,8 @@ def _select_change_boundaries(candidates, windows):
                 >= max(0.55, threshold + HARD_BOUNDARY_SCORE_MARGIN)
             ) else "soft"
             candidate["hard_evidence"] = multi_source_support
+            candidate["text_split_allowed"] = True
+            candidate["boundary_role"] = "speaker_and_text"
             eligible.append(candidate)
             continue
 
@@ -742,6 +761,19 @@ def _select_change_boundaries(candidates, windows):
             # A non-punctuated acoustic peak can locate a useful split, but is
             # not strong enough to permanently assert two different identities.
             candidate["constraint"] = "soft"
+            persistent = bool(candidate.get("persistent_acoustic_change"))
+            candidate["text_split_allowed"] = bool(
+                not acoustic_scan
+                or (
+                    persistent
+                    and candidate["score"] >= ACOUSTIC_TEXT_SPLIT_MIN_SCORE
+                )
+            )
+            candidate["boundary_role"] = (
+                "speaker_and_text"
+                if candidate["text_split_allowed"]
+                else "identity_diagnostic_only"
+            )
             eligible.append(candidate)
 
     # Non-maximum suppression keeps one acoustic peak for one real change.
@@ -804,6 +836,8 @@ def _add_structural_sentence_boundaries(
             "candidate_source": "sentence_partition",
             "hard_evidence": False,
             "structural_partition": True,
+            "text_split_allowed": True,
+            "boundary_role": "sentence_partition",
         })
         combined.append(structural)
     combined.sort(key=lambda item: item["time"])
@@ -1638,12 +1672,23 @@ def _score_identity_partition(
     soft_violation_ratio = _partition_soft_boundary_ratio(
         turn_groups, soft_cannot_links
     )
-    cross_atom_support = []
+    # Judge a merged identity by directional prototype coverage: every raw
+    # atom needs one convincing peer. Penalising every cross-pair fragmented
+    # legitimate voices that have several supported acoustic states.
+    directional_support = []
     established_merge_penalties = []
+    identity_component_counts = []
     for node in partition:
         atoms = sorted(node)
-        for offset, left in enumerate(atoms):
-            for right in atoms[offset + 1:]:
+        if len(atoms) < 2:
+            identity_component_counts.append(1)
+            continue
+        adjacency = {atom: set() for atom in atoms}
+        for left in atoms:
+            peer_support = []
+            for right in atoms:
+                if right == left:
+                    continue
                 pair = (min(left, right), max(left, right))
                 if raw_pair_support is not None:
                     support = raw_pair_support[pair]
@@ -1657,41 +1702,69 @@ def _score_identity_partition(
                             "support_median", evidence["median"]
                         ),
                     )
-                cross_atom_support.append(support)
-                if (
-                    len(raw_clusters[left]) >= 2
-                    and len(raw_clusters[right]) >= 2
-                ):
-                    established_merge_penalties.append(
-                        max(0.0, established_support_floor - support)
-                    )
+                peer_support.append(support)
+                if support >= merge_support_floor:
+                    adjacency[left].add(right)
+            best_support = max(peer_support) if peer_support else -1.0
+            directional_support.append(best_support)
+            if len(raw_clusters[left]) >= 2:
+                established_merge_penalties.append(
+                    max(0.0, established_support_floor - best_support)
+                )
+        visited = set()
+        component_count = 0
+        for atom in atoms:
+            if atom in visited:
+                continue
+            component_count += 1
+            stack = [atom]
+            while stack:
+                current = stack.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                stack.extend(adjacency[current] - visited)
+        identity_component_counts.append(component_count)
+        # Multi-state identities may form A1-A2-A3 chains, but two unrelated
+        # internally coherent subgroups must never be silently unioned.
+        if component_count > 1:
+            return None
     unsupported_merge_penalty = (
         float(np.mean([
             max(0.0, merge_support_floor - support)
-            for support in cross_atom_support
+            for support in directional_support
         ]))
-        if cross_atom_support else 0.0
+        if directional_support else 0.0
     )
     established_merge_penalty = (
         float(np.mean(established_merge_penalties))
         if established_merge_penalties else 0.0
     )
+    # Two already-established cores are not short-turn assignment material.
+    # Reject a hypothesis when one of those cores has no sufficiently close
+    # peer in the proposed identity instead of compensating with speaker-count
+    # savings elsewhere in the recording.
+    if established_merge_penalties and max(established_merge_penalties) > 0.04:
+        return None
 
-    # The terms are all normalized and continuous. In particular, there is no
-    # requested speaker count and no threshold cliff that only applies to some
-    # videos. Separation prevents a one-speaker collapse; singleton and
-    # complexity costs prevent one identity per acoustic turn.
+    prototype_coverage = (
+        float(np.mean([
+            support >= merge_support_floor for support in directional_support
+        ])) if directional_support else 0.0
+    )
+    # There is deliberately no ordinary singleton or speaker-count penalty.
+    # Those terms caused opposite failures on different videos. Supported
+    # reuse earns a reward; weak islands and unsupported merges remain costly.
     score = (
-        0.90 * assignment_margin
-        + 0.38 * cohesion
-        + 0.18 * separation
-        + 0.20 * reuse_ratio
-        - 0.48 * low_quality_singleton_ratio
-        - 0.14 * singleton_ratio
-        - 0.12 * complexity
-        - 0.08 * soft_violation_ratio
-        - 1.00 * unsupported_merge_penalty
-        - 0.90 * established_merge_penalty
+        0.72 * assignment_margin
+        + 0.34 * cohesion
+        + 0.22 * separation
+        + 0.18 * reuse_ratio
+        + 0.12 * prototype_coverage
+        - 0.38 * low_quality_singleton_ratio
+        - 0.06 * soft_violation_ratio
+        - 0.90 * unsupported_merge_penalty
+        - 0.78 * established_merge_penalty
     )
     return {
         "score": float(score),
@@ -1706,6 +1779,8 @@ def _score_identity_partition(
         "soft_boundary_violation_ratio": soft_violation_ratio,
         "unsupported_merge_penalty": unsupported_merge_penalty,
         "established_merge_penalty": established_merge_penalty,
+        "prototype_coverage": prototype_coverage,
+        "identity_component_count_max": max(identity_component_counts or [1]),
     }
 
 
@@ -1803,14 +1878,46 @@ def _search_global_identity_partition(
     candidates = sorted(
         seen.values(), key=lambda item: item[1]["score"], reverse=True
     )
-    selected_partition, selected_metrics = candidates[0]
+    # Select a hypothesis that is also stable across near-optimal partitions.
+    # This is deterministic consensus and never assumes a requested K.
+    best_raw_score = candidates[0][1]["score"]
+    near = [item for item in candidates if item[1]["score"] >= best_raw_score - 0.08]
+
+    def coassignment(partition):
+        owner = {}
+        for label, node in enumerate(partition):
+            for raw_index in node:
+                owner[raw_index] = label
+        return {
+            (left, right): owner[left] == owner[right]
+            for left in range(len(raw_clusters))
+            for right in range(left + 1, len(raw_clusters))
+        }
+
+    near_maps = [coassignment(partition) for partition, _ in near]
+    rescored = []
+    for partition, metrics in candidates:
+        mapping = coassignment(partition)
+        if mapping and near_maps:
+            stability = float(np.mean([
+                np.mean([mapping[pair] == other[pair] for pair in mapping])
+                for other in near_maps
+            ]))
+        else:
+            stability = 1.0
+        updated = dict(metrics)
+        updated["partition_stability"] = stability
+        updated["selection_score"] = metrics["score"] + 0.08 * stability
+        rescored.append((partition, updated))
+    rescored.sort(key=lambda item: item[1]["selection_score"], reverse=True)
+    selected_partition, selected_metrics = rescored[0]
     selected_metrics = dict(selected_metrics)
     selected_metrics.update({
         "merge_support_floor": merge_support_floor,
         "established_support_floor": established_support_floor,
     })
     best_by_count = {}
-    for _, metrics in candidates:
+    for _, metrics in rescored:
         count = metrics["speaker_count"]
         if count not in best_by_count:
             best_by_count[count] = metrics
@@ -1824,6 +1931,92 @@ def _search_global_identity_partition(
         )
     ]
     return selected_partition, selected_metrics, audit, len(candidates)
+
+
+def _assign_weak_identity_nodes(
+    partition, raw_clusters, turns, hard_cannot_links, assignment_threshold
+):
+    """Attach short/weak nodes only after stable identities are established."""
+    nodes = [set(node) for node in partition]
+    history = []
+
+    def members(node):
+        return {
+            turn_index
+            for raw_index in node
+            for turn_index in raw_clusters[raw_index]
+        }
+
+    while True:
+        groups = [members(node) for node in nodes]
+        profiles = [_identity_profile(group, turns) for group in groups]
+        weak_indices = [
+            index for index, profile in enumerate(profiles)
+            if not profile["prototype"] or profile["reliable_duration"] < 1.20
+        ]
+        stable_indices = [
+            index for index, profile in enumerate(profiles)
+            if profile["prototype"] and profile["reliable_duration"] >= 1.20
+        ]
+        chosen = None
+        for weak_index in weak_indices:
+            rankings = []
+            for stable_index in stable_indices:
+                if weak_index == stable_index or _clusters_conflict(
+                    groups[weak_index], groups[stable_index], hard_cannot_links
+                ):
+                    continue
+                evidence = _cluster_pair_evidence(
+                    groups[weak_index], groups[stable_index], turns
+                )
+                support = max(
+                    evidence["centroid"],
+                    evidence.get("support_median", evidence["median"]),
+                )
+                context = _temporal_assignment_context(
+                    groups[weak_index], groups[stable_index], turns
+                )
+                rankings.append((support, stable_index, evidence, context))
+            rankings.sort(reverse=True, key=lambda item: item[0])
+            if not rankings:
+                continue
+            best = rankings[0]
+            runner_up = rankings[1][0] if len(rankings) > 1 else -1.0
+            margin = best[0] - runner_up
+            context = best[3]
+            if best[0] < assignment_threshold or margin < LOW_QUALITY_ASSIGN_MARGIN:
+                continue
+            if (
+                context["competing_reliable_neighbors"] > 0
+                and context["target_neighbor_support"] == 0
+                and best[0] < assignment_threshold + 0.08
+            ):
+                continue
+            candidate = (best[0], margin, weak_index, best[1], best[2], context)
+            if chosen is None or (candidate[0], candidate[1]) > (chosen[0], chosen[1]):
+                chosen = candidate
+        if chosen is None:
+            break
+        support, margin, weak_index, stable_index, evidence, context = chosen
+        weak_node = set(nodes[weak_index])
+        stable_node = set(nodes[stable_index])
+        merged = weak_node | stable_node
+        nodes = [
+            node for index, node in enumerate(nodes)
+            if index not in (weak_index, stable_index)
+        ] + [merged]
+        history.append({
+            "raw_speakers": [f"SPEAKER_{index:02d}" for index in sorted(merged)],
+            "similarity": round(support, 4),
+            "margin": round(margin, 4),
+            "reason": "delayed_unique_weak_turn_assignment",
+            "target_neighbor_support": context["target_neighbor_support"],
+            "competing_reliable_neighbors": context["competing_reliable_neighbors"],
+            "prototype_support_median": round(
+                evidence.get("support_median", evidence["median"]), 4
+            ),
+        })
+    return nodes, history
 
 
 def _reconcile_turn_clusters(
@@ -2348,6 +2541,13 @@ def _reconcile_turn_clusters(
             seed_partitions=(identity_nodes,),
         )
     )
+    selected_nodes, delayed_assignments = _assign_weak_identity_nodes(
+        selected_nodes,
+        raw_clusters,
+        turns,
+        hard_cannot_links,
+        assignment_threshold,
+    )
     first_signature = _partition_signature(identity_nodes)
     selected_signature = _partition_signature(selected_nodes)
     global_selection_changed = selected_signature != first_signature
@@ -2451,7 +2651,7 @@ def _reconcile_turn_clusters(
             "consistency_q25": round(consistency["q25"], 4),
         })
     diagnostics = {
-        "algorithm": "global_identity_model_selection_v6",
+        "algorithm": "stable_core_identity_consensus_v7",
         "turn_count": len(turns),
         "raw_speaker_count": len(raw_clusters),
         "speaker_count": len(identity_clusters),
@@ -2466,6 +2666,7 @@ def _reconcile_turn_clusters(
             4,
         ),
         "identity_merges": merge_history,
+        "delayed_weak_assignments": delayed_assignments,
         "seed_similarity_threshold": round(seed_threshold, 4),
         "prototype_similarity_threshold": round(prototype_threshold, 4),
         "short_turn_assignment_threshold": round(assignment_threshold, 4),
@@ -2697,6 +2898,13 @@ def run_temporal_constrained_clustering(segments):
         ),
         "soft": sum(item.get("constraint") == "soft" for item in boundaries),
         "hard": sum(item.get("constraint") == "hard" for item in boundaries),
+        "text_split_allowed": sum(
+            bool(item.get("text_split_allowed", True)) for item in boundaries
+        ),
+        "identity_diagnostic_only": sum(
+            item.get("boundary_role") == "identity_diagnostic_only"
+            for item in boundaries
+        ),
     }
     diagnostics["turn_pair_similarity"] = [
         {
@@ -2728,6 +2936,15 @@ def run_temporal_constrained_clustering(segments):
             "hard_evidence": bool(item.get("hard_evidence", False)),
             "candidate_source": item.get("candidate_source", "word_timestamp"),
             "structural_partition": bool(item.get("structural_partition")),
+            "text_split_allowed": bool(item.get("text_split_allowed", True)),
+            "boundary_role": item.get("boundary_role", "speaker_and_text"),
+            "persistent_acoustic_change": bool(
+                item.get("persistent_acoustic_change", False)
+            ),
+            "persistence_count": int(item.get("persistence_count", 0)),
+            "persistence_ratio": round(
+                float(item.get("persistence_ratio", 0.0)), 4
+            ),
         }
         for item in boundaries
     ]
@@ -3297,10 +3514,14 @@ def merge_adjacent_same_speaker(segments, max_gap=0.5, min_merge_duration=1.5):
     return merged
 
 
-def assign_speakers(segments, rttm_spans):
+def assign_speakers(segments, rttm_spans, diagnostics=None):
     from speaker_alignment import align_segments_with_rttm, merge_adjacent_speaker_turns
 
-    result = align_segments_with_rttm(segments, rttm_spans)
+    result = align_segments_with_rttm(
+        segments,
+        rttm_spans,
+        speaker_boundary_evidence=(diagnostics or {}).get("boundaries"),
+    )
     split_count = max(0, len(result) - len(segments))
     ambiguous_count = sum(
         bool(item.get("speaker_boundary_ambiguous")) for item in result
@@ -3390,8 +3611,10 @@ def main():
     rttm_path = run_wespeaker_pipeline(state["segments_step1"])
     print("\n=== [Step 2-W] 解析 RTTM 回填 AutoDub Segments ===")
     rttm_spans = parse_rttm(rttm_path)
-    aligned = assign_speakers(state["segments_step1"], rttm_spans)
     diagnostics = load_clustering_diagnostics()
+    aligned = assign_speakers(
+        state["segments_step1"], rttm_spans, diagnostics=diagnostics
+    )
     if diagnostics:
         aligned = attach_speaker_confidence(aligned, diagnostics)
         aligned = reassemble_final_speaker_segments(aligned)

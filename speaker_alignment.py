@@ -366,9 +366,12 @@ def smooth_rttm_spans(
 
 
 def _speaker_change_points(
-    spans: Sequence[Mapping[str, Any]], config: AlignmentConfig
+    spans: Sequence[Mapping[str, Any]],
+    config: AlignmentConfig,
+    boundary_evidence: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     changes = []
+    evidence_items = list(boundary_evidence or [])
     for left, right in zip(spans, spans[1:]):
         if normalize_speaker(left.get("speaker")) == normalize_speaker(right.get("speaker")):
             continue
@@ -376,11 +379,42 @@ def _speaker_change_points(
         right_duration = float(right["end"]) - float(right["start"])
         if min(left_duration, right_duration) < config.minimum_speaker_turn_seconds:
             continue
+        change_time = (float(left["end"]) + float(right["start"])) / 2.0
+        matched = None
+        if evidence_items:
+            nearby = [
+                item for item in evidence_items
+                if abs(float(item.get("time", -9999.0)) - change_time)
+                <= max(1.25, config.speaker_snap_radius_seconds)
+            ]
+            if nearby:
+                matched = min(
+                    nearby,
+                    key=lambda item: abs(float(item.get("time")) - change_time),
+                )
         changes.append(
             {
-                "time": (float(left["end"]) + float(right["start"])) / 2.0,
+                "time": change_time,
                 "left_speaker": normalize_speaker(left.get("speaker")),
                 "right_speaker": normalize_speaker(right.get("speaker")),
+                "text_split_allowed": bool(
+                    matched.get("text_split_allowed", True)
+                    if matched is not None else not evidence_items
+                ),
+                "boundary_role": (
+                    matched.get("boundary_role", "speaker_and_text")
+                    if matched is not None else "unmatched_rttm_change"
+                ),
+                "boundary_source": (
+                    matched.get("candidate_source", "word_timestamp")
+                    if matched is not None else "unmatched_rttm_change"
+                ),
+                "boundary_score": (
+                    _number(matched.get("score")) if matched is not None else None
+                ),
+                "boundary_evidence_time": (
+                    _number(matched.get("time")) if matched is not None else None
+                ),
             }
         )
     return changes
@@ -415,11 +449,15 @@ def _snap_change_to_gap(
     change_time: float,
     *,
     config: AlignmentConfig,
+    minimum_score: float = 0.0,
+    minimum_gap_seconds: float = 0.0,
 ) -> Optional[int]:
     candidates = []
     for index in range(1, len(items)):
         left_end = float(items[index - 1].get("end", change_time))
         right_start = float(items[index].get("start", change_time))
+        if _gap_seconds(items, index) < minimum_gap_seconds:
+            continue
         gap_time = (left_end + right_start) / 2.0
         if abs(gap_time - change_time) <= config.speaker_snap_radius_seconds:
             candidates.append(
@@ -431,7 +469,10 @@ def _snap_change_to_gap(
                     index,
                 )
             )
-    return max(candidates)[2] if candidates else None
+    if not candidates:
+        return None
+    best = max(candidates)
+    return best[2] if best[0] >= minimum_score else None
 
 
 def _text_for_group(
@@ -509,10 +550,13 @@ def align_segments_with_rttm(
     rttm_spans: Iterable[Mapping[str, Any]],
     *,
     config: AlignmentConfig = AlignmentConfig(),
+    speaker_boundary_evidence: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Produce final sentence-level, speaker-consistent segments."""
     spans = smooth_rttm_spans(rttm_spans, config=config)
-    changes = _speaker_change_points(spans, config)
+    changes = _speaker_change_points(
+        spans, config, boundary_evidence=speaker_boundary_evidence
+    )
     output: List[Dict[str, Any]] = []
     for source in segments:
         segment = dict(source)
@@ -610,7 +654,21 @@ def align_segments_with_rttm(
         )
         speaker_splits: Dict[int, Dict[str, Any]] = {}
         for change in segment_changes:
-            boundary = _snap_change_to_gap(items, float(change["time"]), config=config)
+            if not change.get("text_split_allowed", True):
+                continue
+            boundary = _snap_change_to_gap(
+                items,
+                float(change["time"]),
+                config=config,
+                # Distance alone scores at most 1.0. Requiring additional
+                # punctuation or silence prevents cuts such as "the / rail".
+                minimum_score=1.10,
+                minimum_gap_seconds=(
+                    0.12
+                    if change.get("boundary_source") == "acoustic_scan"
+                    else 0.0
+                ),
+            )
             if boundary is not None:
                 speaker_splits[boundary] = change
         split_indices = sorted(sentence_splits | set(speaker_splits))
@@ -660,6 +718,19 @@ def align_segments_with_rttm(
             result["speaker_overlap_seconds"] = {
                 key: round(value, 3) for key, value in group_overlaps.items()
             }
+            overlap_total = sum(group_overlaps.values())
+            dominant_overlap = max(group_overlaps.values(), default=0.0)
+            dominance = dominant_overlap / overlap_total if overlap_total > 0 else 0.0
+            result["speaker_overlap_dominance"] = round(dominance, 4)
+            result["speaker_assignment_confidence"] = round(
+                dominance * (1.0 if status == "valid" else 0.85), 4
+            )
+            result["speaker_assignment_status"] = (
+                "word_aligned_dominant_overlap"
+                if dominance >= 0.80 else "ambiguous_word_aligned_overlap"
+            )
+            if len(group_overlaps) > 1 and dominance < 0.80:
+                result["speaker_boundary_ambiguous"] = True
             result["qwen3_time_stamps"] = (
                 [] if use_timing_skeleton else items[left:right]
             )
@@ -705,6 +776,17 @@ def merge_adjacent_speaker_turns(
     maximum_turn_seconds: float = 12.0,
 ) -> List[Dict[str, Any]]:
     """Reassemble transport/sentence fragments belonging to one speaker."""
+    def reference_component(item: Mapping[str, Any]) -> Dict[str, Any]:
+        return {
+            key: item.get(key)
+            for key in (
+                "id", "start", "end", "text", "original_text",
+                "qwen3_raw_text", "timestamp_precision",
+                "asr_recovery_status", "speaker_boundary_ambiguous",
+                "speaker_assignment_confidence", "speaker_raw", "speaker",
+            )
+        }
+
     merged: List[Dict[str, Any]] = []
     for source in segments:
         segment = dict(source)
@@ -750,6 +832,7 @@ def merge_adjacent_speaker_turns(
             and not segment.get("speaker_boundary_ambiguous")
             and not protected_sentence_boundary
         ):
+            left_reference_end = float(left["end"])
             parent_ids = list(left.get("parent_segment_ids") or [])
             if not parent_ids and left.get("parent_segment_id") is not None:
                 parent_ids.append(left.get("parent_segment_id"))
@@ -764,6 +847,30 @@ def merge_adjacent_speaker_turns(
                 float(left.get("alignment_confidence", 0.35)),
                 float(segment.get("alignment_confidence", 0.35)),
             )
+            left["speaker_assignment_confidence"] = min(
+                float(left.get("speaker_assignment_confidence", 1.0)),
+                float(segment.get("speaker_assignment_confidence", 1.0)),
+            )
+            raw_speakers = set(left.get("speaker_raws") or [])
+            raw_speakers.add(str(left.get("speaker_raw", left.get("speaker"))))
+            raw_speakers.update(segment.get("speaker_raws") or [])
+            raw_speakers.add(str(segment.get("speaker_raw", segment.get("speaker"))))
+            left["speaker_raws"] = sorted(raw_speakers)
+            if len(raw_speakers) > 1:
+                # The global identity may be correct, but this joined span is
+                # no longer a pure single-observation cloning reference.
+                left["speaker_reference_mixed_raw"] = True
+                components = list(left.get("speaker_reference_components") or [])
+                if not components:
+                    # Capture the left side before its end/text are extended.
+                    left_component = reference_component(left)
+                    left_component["end"] = left_reference_end
+                    components.append(left_component)
+                components.extend(
+                    segment.get("speaker_reference_components")
+                    or [reference_component(segment)]
+                )
+                left["speaker_reference_components"] = components
             left["text"] = _join_transcript(left.get("text", ""), segment.get("text", ""))
             left["qwen3_time_stamps"] = list(left.get("qwen3_time_stamps") or []) + list(
                 segment.get("qwen3_time_stamps") or []
