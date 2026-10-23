@@ -105,6 +105,9 @@ PROTOTYPE_ANCHOR_MIN_SECONDS = _env_float(
 PROTOTYPE_ANCHOR_MIN_TURNS = _env_int(
     "AUTODUB_DIAR_PROTOTYPE_ANCHOR_MIN_TURNS", 2
 )
+SINGLE_TURN_PROTOTYPE_SIMILARITY = _env_float(
+    "AUTODUB_DIAR_SINGLE_TURN_PROTOTYPE_SIMILARITY", 0.82
+)
 RELIABLE_TURN_MIN_SECONDS = _env_float(
     "AUTODUB_DIAR_RELIABLE_TURN_MIN_SECONDS", 1.8
 )
@@ -333,8 +336,18 @@ def _timestamp_items(segments):
             # receive a speaker by RTTM overlap later, but must never create a
             # word-level speaker-change constraint.
             continue
-        transcript = str(segment.get("text", ""))
-        raw_items = list(segment.get("qwen3_time_stamps") or [])
+        use_timing_skeleton = bool(
+            segment.get("speaker_timing_skeleton_valid")
+            and segment.get("speaker_timing_time_stamps")
+        )
+        transcript = str(
+            segment.get("speaker_timing_text")
+            if use_timing_skeleton else segment.get("text", "")
+        )
+        raw_items = list(
+            segment.get("speaker_timing_time_stamps")
+            if use_timing_skeleton else segment.get("qwen3_time_stamps") or []
+        )
         try:
             chunk_start = float(segment.get("start", 0.0))
             chunk_end = float(segment.get("end", chunk_start))
@@ -361,6 +374,10 @@ def _timestamp_items(segments):
                 "chunk_start": chunk_start,
                 "chunk_end": chunk_end,
                 "timestamp_status": alignment.get("status", "unusable"),
+                "timing_source": (
+                    "pre_ocr_timing_skeleton"
+                    if use_timing_skeleton else "current_segment"
+                ),
             })
     items.sort(key=lambda item: (item["start"], item["end"]))
     deduplicated = []
@@ -462,6 +479,79 @@ def _candidate_boundary_scores(segments, windows):
     return candidates
 
 
+def _acoustic_boundary_scores(segments, windows):
+    """Propose high-contrast boundaries without requiring word timestamps.
+
+    OCR rewrites and failed alignments can remove textual timing even though
+    speaker embeddings still contain a clear local change.  These candidates
+    remain soft evidence and must pass a stricter acoustic gate.
+    """
+    candidates = []
+    by_region = defaultdict(list)
+    for window in windows:
+        by_region[window["region"]].append(window)
+    for region_windows in by_region.values():
+        ordered = sorted(region_windows, key=lambda item: item["center"])
+        region_candidates = []
+        for left_window, right_window in zip(ordered, ordered[1:]):
+            boundary = (
+                float(left_window["center"]) + float(right_window["center"])
+            ) / 2.0
+            left_center, left_count, left_cohesion = _centroid_for_centers(
+                ordered,
+                boundary - BOUNDARY_CONTEXT_SECONDS,
+                boundary - BOUNDARY_GUARD_SECONDS,
+                boundary=boundary,
+                side="left",
+            )
+            right_center, right_count, right_cohesion = _centroid_for_centers(
+                ordered,
+                boundary + BOUNDARY_GUARD_SECONDS,
+                boundary + BOUNDARY_CONTEXT_SECONDS,
+                boundary=boundary,
+                side="right",
+            )
+            if left_center is None or right_center is None:
+                continue
+            containing = [
+                (index, segment)
+                for index, segment in enumerate(segments)
+                if float(segment.get("start", 0.0)) <= boundary
+                <= float(segment.get("end", 0.0))
+            ]
+            segment_index = containing[0][0] if containing else None
+            similarity = float(left_center @ right_center)
+            region_candidates.append({
+                "time": boundary,
+                "score": 1.0 - similarity,
+                "similarity": similarity,
+                "gap": 0.0,
+                "left_count": left_count,
+                "right_count": right_count,
+                "left_cohesion": left_cohesion,
+                "right_cohesion": right_cohesion,
+                "context_seconds": BOUNDARY_CONTEXT_SECONDS,
+                "left_text": "<acoustic>",
+                "right_text": "<acoustic>",
+                "punctuation": "none",
+                "left_segment_index": segment_index,
+                "right_segment_index": segment_index,
+                "same_asr_segment": True,
+                "timestamp_reliable": False,
+                "candidate_source": "acoustic_scan",
+            })
+        # Retain local maxima only.  Final NMS still arbitrates against a
+        # timestamp-derived candidate at the same physical change.
+        for index, candidate in enumerate(region_candidates):
+            neighbours = (
+                region_candidates[max(0, index - 1):index]
+                + region_candidates[index + 1:index + 2]
+            )
+            if all(candidate["score"] >= item["score"] for item in neighbours):
+                candidates.append(candidate)
+    return candidates
+
+
 def _adaptive_boundary_threshold(candidates):
     if BOUNDARY_SCORE_OVERRIDE not in (None, ""):
         try:
@@ -555,8 +645,22 @@ def _select_change_boundaries(candidates, windows):
         # sustained pause, a much stronger acoustic peak, and no nearby
         # punctuated explanation for the same peak.  This prevents cutting
         # ordinary phrases such as "Wake up" or "by yourself".
-        strict_threshold = max(0.58, threshold + 0.12)
-        if candidate["gap"] < 0.25 or candidate["score"] < strict_threshold:
+        acoustic_scan = candidate.get("candidate_source") == "acoustic_scan"
+        strict_threshold = max(
+            0.62 if acoustic_scan else 0.58,
+            threshold + 0.12,
+        )
+        if candidate["score"] < strict_threshold:
+            continue
+        if acoustic_scan:
+            if (
+                min(candidate["left_count"], candidate["right_count"]) < 2
+                or min(
+                    candidate["left_cohesion"], candidate["right_cohesion"]
+                ) < 0.60
+            ):
+                continue
+        elif candidate["gap"] < 0.25:
             continue
         punctuated_neighbor = any(
             other.get("punctuation") == "strong"
@@ -1151,6 +1255,19 @@ def _reconcile_turn_clusters(
             for (left, right), similarity in similarities.items():
                 if not (profiles[left]["anchor"] and profiles[right]["anchor"]):
                     continue
+                # A single long turn is not automatically a clean speaker
+                # prototype.  It may contain several speakers when upstream
+                # timestamps missed internal changes.  Require substantially
+                # stronger evidence before merging such a turn into another
+                # established identity.
+                if (
+                    min(
+                        profiles[left]["turn_count"],
+                        profiles[right]["turn_count"],
+                    ) < 2
+                    and similarity < SINGLE_TURN_PROTOTYPE_SIMILARITY
+                ):
+                    continue
                 if not _robust_identity_match(
                     pair_evidence_by_pair[(left, right)],
                     prototype_threshold,
@@ -1194,6 +1311,19 @@ def _reconcile_turn_clusters(
                     continue
                 similarity, target = ranked[0]
                 source_profile = profiles[source]
+                single_reliable_turn = bool(
+                    source_profile["turn_count"] == 1
+                    and source_profile["reliable_turn_count"] == 1
+                    and source_profile["duration"] >= RELIABLE_TURN_MIN_SECONDS
+                )
+                if (
+                    single_reliable_turn
+                    and similarity < SINGLE_TURN_PROTOTYPE_SIMILARITY
+                ):
+                    # This is an established acoustic turn whose only defect
+                    # is having no repeated sample.  Treat it as unresolved,
+                    # not as a disposable short fragment.
+                    continue
                 quality_penalty = max(
                     0.0, 0.60 - float(source_profile.get("quality", 0.0))
                 ) * 0.15
@@ -1348,7 +1478,9 @@ def run_temporal_constrained_clustering(segments):
     windows = _read_embedding_windows(emb_scp)
     if len(windows) < 4:
         return False
-    candidates = _candidate_boundary_scores(segments, windows)
+    timestamp_candidates = _candidate_boundary_scores(segments, windows)
+    acoustic_candidates = _acoustic_boundary_scores(segments, windows)
+    candidates = timestamp_candidates + acoustic_candidates
     boundaries, thresholds = _select_change_boundaries(candidates, windows)
     if not boundaries:
         return False
@@ -1364,7 +1496,8 @@ def run_temporal_constrained_clustering(segments):
         threshold_text = "n/a"
     print(
         f"✅ 分区自适应换人阈值: {threshold_text}; "
-        f"{len(candidates)} 个词间候选中保留 {len(boundaries)} 个。"
+        f"{len(timestamp_candidates)} 个词间候选 + "
+        f"{len(acoustic_candidates)} 个纯声学候选中保留 {len(boundaries)} 个。"
     )
     for item in boundaries:
         print(
@@ -1372,6 +1505,7 @@ def run_temporal_constrained_clustering(segments):
             f"change={item['score']:.3f}, gap={item['gap']:.3f}s, "
             f"punctuation={item.get('punctuation', 'none')}, "
             f"constraint={item.get('constraint', 'soft')}, "
+            f"source={item.get('candidate_source', 'word_timestamp')}, "
             f"{item['left_text']!r} -> {item['right_text']!r}"
         )
 
@@ -1461,6 +1595,7 @@ def run_temporal_constrained_clustering(segments):
             "right_cohesion": round(float(item.get("right_cohesion", 0.0)), 4),
             "context_seconds": round(float(item.get("context_seconds", 0.0)), 3),
             "hard_evidence": bool(item.get("hard_evidence", False)),
+            "candidate_source": item.get("candidate_source", "word_timestamp"),
         }
         for item in boundaries
     ]

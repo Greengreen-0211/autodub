@@ -8,6 +8,7 @@ It has no model, GPU, or audio-library dependencies.
 
 from __future__ import annotations
 
+import difflib
 import math
 import re
 from dataclasses import dataclass
@@ -454,6 +455,55 @@ def _text_for_group(
     return transcript[char_start:char_end].strip()
 
 
+def _map_text_offset(source: str, target: str, offset: int) -> int:
+    """Map a character boundary through a conservative OCR text rewrite."""
+    offset = max(0, min(len(source), int(offset)))
+    matcher = difflib.SequenceMatcher(None, source, target, autojunk=False)
+    blocks = matcher.get_matching_blocks()
+    previous_a = previous_b = 0
+    for block in blocks:
+        if block.a <= offset <= block.a + block.size:
+            return max(0, min(len(target), block.b + offset - block.a))
+        if offset < block.a:
+            source_span = max(1, block.a - previous_a)
+            ratio = (offset - previous_a) / source_span
+            mapped = previous_b + ratio * (block.b - previous_b)
+            return max(0, min(len(target), int(round(mapped))))
+        previous_a = block.a + block.size
+        previous_b = block.b + block.size
+    return len(target)
+
+
+def _text_parts_from_timing_skeleton(
+    corrected_text: str,
+    timing_text: str,
+    items: Sequence[Mapping[str, Any]],
+    boundaries: Sequence[int],
+) -> Optional[List[str]]:
+    """Transfer only clause boundaries, never old token labels, to OCR text."""
+    if difflib.SequenceMatcher(
+        None, timing_text, corrected_text, autojunk=False
+    ).ratio() < 0.55:
+        return None
+    old_offsets = [0]
+    for index in boundaries[1:-1]:
+        if index >= len(items) or "char_start" not in items[index]:
+            return None
+        old_offsets.append(int(items[index]["char_start"]))
+    old_offsets.append(len(timing_text))
+    new_offsets = [
+        _map_text_offset(timing_text, corrected_text, offset)
+        for offset in old_offsets
+    ]
+    for index in range(1, len(new_offsets)):
+        new_offsets[index] = max(new_offsets[index], new_offsets[index - 1])
+    parts = [
+        corrected_text[left:right].strip()
+        for left, right in zip(new_offsets, new_offsets[1:])
+    ]
+    return parts if all(parts) else None
+
+
 def align_segments_with_rttm(
     segments: Iterable[Mapping[str, Any]],
     rttm_spans: Iterable[Mapping[str, Any]],
@@ -469,7 +519,19 @@ def align_segments_with_rttm(
         segment_start = float(segment["start"])
         segment_end = float(segment["end"])
         transcript = str(segment.get("text", ""))
-        saved_items = list(segment.get("qwen3_time_stamps") or [])
+        use_timing_skeleton = bool(
+            segment.get("speaker_timing_skeleton_valid")
+            and segment.get("speaker_timing_time_stamps")
+            and segment.get("speaker_timing_text") is not None
+        )
+        timing_transcript = str(
+            segment.get("speaker_timing_text")
+            if use_timing_skeleton else transcript
+        )
+        saved_items = list(
+            segment.get("speaker_timing_time_stamps")
+            if use_timing_skeleton else segment.get("qwen3_time_stamps") or []
+        )
         if segment.get("speaker_boundary_eligible") is False:
             items = []
             alignment = {
@@ -480,11 +542,14 @@ def align_segments_with_rttm(
         else:
             items, alignment = normalize_timestamp_items(
                 saved_items,
-                transcript=transcript,
+                transcript=timing_transcript,
                 chunk_start=segment_start,
                 chunk_end=segment_end,
             )
-        segment["qwen3_time_stamps"] = items
+        segment["qwen3_time_stamps"] = [] if use_timing_skeleton else items
+        if use_timing_skeleton:
+            segment["speaker_timing_time_stamps"] = items
+            segment["speaker_timing_alignment_status"] = alignment["status"]
         segment["timestamp_alignment_status"] = alignment["status"]
         segment["timestamp_coverage_ratio"] = alignment["coverage_ratio"]
         segment["timestamp_warning_codes"] = alignment["warning_codes"]
@@ -553,11 +618,18 @@ def align_segments_with_rttm(
         # Exact transcript spans are mandatory for splitting.  A partial or
         # mismatched alignment is retained for audit, never used to guess text.
         boundaries = [0, *split_indices, len(items)]
-        text_parts = [
-            _text_for_group(transcript, items, left, right)
-            for left, right in zip(boundaries, boundaries[1:])
-        ]
-        if any(part is None or not part for part in text_parts):
+        if use_timing_skeleton:
+            text_parts = _text_parts_from_timing_skeleton(
+                transcript, timing_transcript, items, boundaries
+            )
+            if text_parts is None:
+                text_parts = []
+        else:
+            text_parts = [
+                _text_for_group(transcript, items, left, right)
+                for left, right in zip(boundaries, boundaries[1:])
+            ]
+        if not text_parts or any(part is None or not part for part in text_parts):
             segment["speaker"] = normalize_speaker(fallback)
             segment["speaker_boundary_ambiguous"] = bool(segment_changes)
             output.append(segment)
@@ -588,7 +660,11 @@ def align_segments_with_rttm(
             result["speaker_overlap_seconds"] = {
                 key: round(value, 3) for key, value in group_overlaps.items()
             }
-            result["qwen3_time_stamps"] = items[left:right]
+            result["qwen3_time_stamps"] = (
+                [] if use_timing_skeleton else items[left:right]
+            )
+            if use_timing_skeleton:
+                result["speaker_timing_time_stamps"] = items[left:right]
             group_items = items[left:right]
             if group_items:
                 result["speech_start"] = round(
@@ -646,6 +722,20 @@ def merge_adjacent_speaker_turns(
             segment.get("asr_recovery_status") == "accepted_coarse"
             and segment.get("timestamp_precision") == "coarse"
         )
+        left_text = str(left.get("text") or "").strip()
+        distinct_parent = (
+            left.get("parent_segment_id") is not None
+            and segment.get("parent_segment_id") is not None
+            and left.get("parent_segment_id") != segment.get("parent_segment_id")
+        )
+        protected_sentence_boundary = bool(
+            STRONG_PUNCTUATION.search(left_text)
+            and (
+                distinct_parent
+                or "sentence_boundary"
+                in (left.get("segment_split_reasons") or [])
+            )
+        )
         if (
             normalize_speaker(left.get("speaker"))
             == normalize_speaker(segment.get("speaker"))
@@ -658,6 +748,7 @@ def merge_adjacent_speaker_turns(
             and not right_is_coarse
             and not left.get("speaker_boundary_ambiguous")
             and not segment.get("speaker_boundary_ambiguous")
+            and not protected_sentence_boundary
         ):
             parent_ids = list(left.get("parent_segment_ids") or [])
             if not parent_ids and left.get("parent_segment_id") is not None:

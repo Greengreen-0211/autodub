@@ -6,21 +6,75 @@ except ImportError:  # pragma: no cover - production WeSpeaker env has numpy
     np = None
 
 from run_step2_wespeaker import (
+    _acoustic_boundary_scores,
     _centroid_for_centers,
     _cluster_centroid,
     _cluster_pair_evidence,
     _robust_identity_match,
+    _reconcile_turn_clusters,
     _select_change_boundaries,
     _soft_continuity_threshold,
     _temporal_assignment_context,
     attach_speaker_confidence,
     reassemble_final_speaker_segments,
+    _timestamp_items,
 )
-from speaker_alignment import AlignmentConfig, align_segments_with_rttm, smooth_rttm_spans
+from speaker_alignment import (
+    AlignmentConfig,
+    align_segments_with_rttm,
+    merge_adjacent_speaker_turns,
+    smooth_rttm_spans,
+)
 
 
 @unittest.skipIf(np is None, "numpy is required")
 class SpeakerClusteringEvidenceTests(unittest.TestCase):
+    def test_pre_ocr_timing_skeleton_remains_boundary_evidence(self):
+        segment = {
+            "id": 1,
+            "start": 0.0,
+            "end": 3.0,
+            "text": "right word. Next line.",
+            "qwen3_time_stamps": [],
+            "speaker_timing_skeleton_valid": True,
+            "speaker_timing_text": "wrong word. Next line.",
+            "speaker_timing_time_stamps": [
+                {"text": "wrong", "start": 0.1, "end": 0.5},
+                {"text": "word", "start": 0.6, "end": 1.0},
+                {"text": "Next", "start": 2.0, "end": 2.3},
+                {"text": "line", "start": 2.4, "end": 2.8},
+            ],
+        }
+        items = _timestamp_items([segment])
+        self.assertEqual([item["text"] for item in items], [
+            "wrong", "word", "Next", "line"
+        ])
+        self.assertTrue(all(
+            item["timing_source"] == "pre_ocr_timing_skeleton"
+            for item in items
+        ))
+
+    def test_acoustic_scan_finds_change_without_word_timestamps(self):
+        region = ("input", 0.0, 6.0)
+        windows = []
+        for index, center in enumerate((0.75, 1.5, 2.25, 3.75, 4.5, 5.25)):
+            vector = np.asarray([1.0, 0.0]) if index < 3 else np.asarray([0.0, 1.0])
+            windows.append({
+                "region": region,
+                "start": center - 0.70,
+                "end": center + 0.70,
+                "center": center,
+                "embedding": vector,
+            })
+        candidates = _acoustic_boundary_scores(
+            [{"start": 0.0, "end": 6.0, "text": "rewritten"}], windows
+        )
+        self.assertTrue(candidates)
+        self.assertEqual(
+            max(candidates, key=lambda item: item["score"])["candidate_source"],
+            "acoustic_scan",
+        )
+
     def test_boundary_centroid_excludes_crossing_windows(self):
         windows = [
             {
@@ -127,6 +181,26 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         centroid = _cluster_centroid({0, 1}, turns)
         np.testing.assert_allclose(centroid, [1.0, 0.0])
 
+    def test_single_long_turn_does_not_merge_at_ordinary_prototype_threshold(self):
+        other = np.asarray([0.74, np.sqrt(1.0 - 0.74 ** 2)])
+        turns = [
+            {"start": 0.0, "end": 3.0, "duration": 3.0,
+             "embedding": np.asarray([1.0, 0.0]), "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 6.0, "end": 9.0, "duration": 3.0,
+             "embedding": np.asarray([1.0, 0.0]), "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 3.0, "end": 6.0, "duration": 3.0,
+             "embedding": other, "embedding_reliable": True,
+             "embedding_quality": 0.9},
+        ]
+        identities, mapping, diagnostics = _reconcile_turn_clusters(
+            [{0, 1}, {2}], turns, set(), set(), {}
+        )
+        self.assertEqual(len(identities), 2)
+        self.assertNotEqual(mapping[0], mapping[1])
+        self.assertEqual(diagnostics["identity_merges"], [])
+
     def test_temporal_context_detects_non_neighbor_assignment(self):
         turns = [
             {"start": 0.0, "end": 1.0, "embedding_reliable": True},
@@ -140,6 +214,44 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
 
 
 class SpeakerAlignmentFallbackTests(unittest.TestCase):
+    def test_corrected_text_splits_using_original_timing_skeleton(self):
+        segments = [{
+            "id": 0,
+            "start": 0.0,
+            "end": 3.0,
+            "text": "right word. Next line.",
+            "qwen3_time_stamps": [],
+            "speaker_timing_skeleton_valid": True,
+            "speaker_timing_text": "wrong word. Next line.",
+            "speaker_timing_time_stamps": [
+                {"text": "wrong", "start": 0.1, "end": 0.5},
+                {"text": "word", "start": 0.6, "end": 1.0},
+                {"text": "Next", "start": 2.0, "end": 2.3},
+                {"text": "line", "start": 2.4, "end": 2.8},
+            ],
+        }]
+        spans = [
+            {"start": 0.0, "end": 1.5, "speaker": "SPEAKER_00"},
+            {"start": 1.5, "end": 3.0, "speaker": "SPEAKER_01"},
+        ]
+        result = align_segments_with_rttm(segments, spans)
+        self.assertEqual([item["text"] for item in result], [
+            "right word.", "Next line."
+        ])
+        self.assertEqual([item["speaker"] for item in result], [
+            "SPEAKER_00", "SPEAKER_01"
+        ])
+        self.assertTrue(all(not item["qwen3_time_stamps"] for item in result))
+
+    def test_reassembly_preserves_strong_boundary_between_parent_sentences(self):
+        segments = [
+            {"id": 0, "parent_segment_id": 3, "start": 0.0, "end": 1.0,
+             "text": "First sentence.", "speaker": "SPEAKER_00"},
+            {"id": 1, "parent_segment_id": 4, "start": 1.2, "end": 2.0,
+             "text": "Second sentence.", "speaker": "SPEAKER_00"},
+        ]
+        self.assertEqual(len(merge_adjacent_speaker_turns(segments)), 2)
+
     def test_short_real_island_is_not_erased_at_point_four_seconds(self):
         spans = [
             {"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"},

@@ -27,10 +27,43 @@ from ocr_v211_integration import (
     _partition_deferred_regions,
     _recover_deferred_from_ocr,
     apply_stable_bilingual_entity_corrections,
+    ocr_recovery_timing_plausibility,
+    preserve_speaker_timing_skeleton,
 )
 
 
 class OCRTimelineTests(unittest.TestCase):
+    def test_ocr_text_rewrite_keeps_separate_speaker_timing_skeleton(self):
+        source = {
+            "text": "wrong word. Next line.",
+            "qwen3_time_stamps": [
+                {"text": "wrong", "start": 0.1, "end": 0.5},
+                {"text": "word", "start": 0.6, "end": 1.0},
+                {"text": "Next", "start": 2.0, "end": 2.3},
+                {"text": "line", "start": 2.4, "end": 2.8},
+            ],
+        }
+        result = {"text": "right word. Next line.", "qwen3_time_stamps": []}
+        preserve_speaker_timing_skeleton(source, result)
+        self.assertTrue(result["speaker_timing_skeleton_valid"])
+        self.assertEqual(result["speaker_timing_text"], source["text"])
+        self.assertEqual(
+            result["speaker_timing_time_stamps"], source["qwen3_time_stamps"]
+        )
+        self.assertEqual(result["qwen3_time_stamps"], [])
+        self.assertFalse(result["corrected_token_alignment_valid"])
+
+    def test_impossible_dense_ocr_recovery_timing_is_rejected(self):
+        audit = ocr_recovery_timing_plausibility(
+            "没有毛绒绒", 20.41, 20.70
+        )
+        self.assertFalse(audit["plausible"])
+        self.assertGreater(audit["lexical_rate"], audit["max_lexical_rate"])
+
+    def test_short_ocr_interjection_remains_possible(self):
+        audit = ocr_recovery_timing_plausibility("来吧", 1.0, 1.30)
+        self.assertTrue(audit["plausible"])
+
     def test_coarse_tts_placement_uses_acoustic_onset_without_moving_bounds(self):
         segment = {
             "id": 7,
@@ -567,6 +600,52 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertEqual(recovered, [])
         self.assertEqual(remaining[0]["asr_recovery_status"], "unresolved_blocking")
         self.assertTrue(remaining[0]["dialogue_evidence"])
+
+    def test_dense_but_impossible_ocr_is_not_promoted_to_dialogue(self):
+        regions = [{
+            "id": "deferred-dense",
+            "start": 20.41,
+            "end": 20.70,
+            "candidate_kind": "confirmed_empty_primary_chunk",
+            "dialogue_evidence": True,
+        }]
+        records = {"deferred-dense": [
+            {"timestamp": 20.42, "text": "没有毛绒绒"},
+            {"timestamp": 20.62, "text": "没有毛绒绒"},
+        ]}
+        recovered, remaining, audit = _recover_deferred_from_ocr(
+            regions, records, "zh"
+        )
+        self.assertEqual(recovered, [])
+        self.assertEqual(remaining[0]["asr_recovery_status"], "unresolved_blocking")
+        self.assertTrue(remaining[0]["requires_contextual_asr_retry"])
+        self.assertEqual(audit[0]["status"], "rejected_implausible_timing")
+
+    def test_partial_ocr_acceptance_keeps_rejected_interval_unresolved(self):
+        regions = [{
+            "id": "deferred-partial",
+            "start": 0.0,
+            "end": 2.0,
+            "candidate_kind": "confirmed_empty_primary_chunk",
+            "dialogue_evidence": True,
+        }]
+        records = {"deferred-partial": [
+            {"timestamp": 0.02, "text": "没有毛绒绒"},
+            {"timestamp": 0.08, "text": "没有毛绒绒"},
+            {"timestamp": 0.32, "text": "来吧"},
+            {"timestamp": 0.50, "text": "来吧"},
+        ]}
+        recovered, remaining, audit = _recover_deferred_from_ocr(
+            regions, records, "zh"
+        )
+        self.assertEqual([item["text"] for item in recovered], ["来吧"])
+        self.assertEqual(len(remaining), 1)
+        self.assertTrue(remaining[0]["requires_contextual_asr_retry"])
+        self.assertEqual(
+            recovered[0]["asr_recovered_parent_start"], recovered[0]["start"]
+        )
+        self.assertEqual(audit[0]["status"], "accepted_coarse")
+        self.assertEqual(len(audit[0]["rejected_events"]), 1)
 
 
 class AcousticConsensusTests(unittest.TestCase):

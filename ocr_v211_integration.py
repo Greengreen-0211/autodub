@@ -393,6 +393,23 @@ class OCRV211Client:
         return outputs
 
 
+def preserve_speaker_timing_skeleton(
+    source: Mapping[str, Any], result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Keep pre-OCR timing as boundary evidence, not corrected token timing."""
+    if str(source.get("text") or "") == str(result.get("text") or ""):
+        return result
+    stamps = source.get("qwen3_time_stamps") or []
+    if not stamps:
+        return result
+    result["speaker_timing_text"] = str(source.get("text") or "")
+    result["speaker_timing_time_stamps"] = deepcopy(stamps)
+    result["speaker_timing_skeleton_valid"] = True
+    result["speaker_timing_skeleton_source"] = "pre_ocr_qwen3_asr"
+    result["corrected_token_alignment_valid"] = False
+    return result
+
+
 class OCRV211Corrector:
     """Frozen B candidate inventory, classifier, and complete gate chain."""
 
@@ -412,7 +429,7 @@ class OCRV211Corrector:
             legacy = self.legacy_corrector_cls(self.config).correct(
                 [segment.copy() for segment in segments], ocr_texts
             )
-            return [
+            corrected = [
                 _ocr_update_segment(source, {
                     "accepted": changed["text"] != source["text"],
                     "corrected_text": changed["text"],
@@ -420,6 +437,9 @@ class OCRV211Corrector:
                 })
                 for source, changed in zip(segments, legacy)
             ]
+            for source, result in zip(segments, corrected):
+                preserve_speaker_timing_skeleton(source, result)
+            return corrected
         requests = []
         for segment in segments:
             text = str(segment.get("text") or "")
@@ -463,6 +483,15 @@ class OCRV211Corrector:
             _ocr_update_segment(segment, decisions[str(segment["id"])])
             for segment in segments
         ]
+        # OCR may fix a few characters while leaving the utterance and its
+        # acoustic timing unchanged.  The frozen updater correctly removes
+        # token timestamps from the rewritten text because those tokens no
+        # longer have an exact character mapping.  Preserve a separate copy of
+        # the original ASR timing skeleton for speaker-boundary detection.  It
+        # is deliberately not restored as qwen3_time_stamps: downstream code
+        # must not pretend that rewritten OCR tokens have word-level timing.
+        for source, result in zip(segments, corrected):
+            preserve_speaker_timing_skeleton(source, result)
         accepted = sum(before["text"] != after["text"] for before, after in zip(segments, corrected))
         print(f"✅ 冻结 B OCR 纠错完成: 实际采纳 {accepted}/{len(segments)}")
         return corrected
@@ -778,6 +807,32 @@ def _implementation_binding(main_path: Path) -> str:
     })
 
 
+def ocr_recovery_timing_plausibility(
+    text: str, start: float, end: float
+) -> Dict[str, Any]:
+    """Audit whether coarse OCR text can physically fit its speech interval."""
+    duration = max(0.0, float(end) - float(start))
+    han_count = len(re.findall(r"[\u3400-\u9fff]", str(text or "")))
+    word_count = len(
+        re.findall(r"[^\W_]+(?:['’][^\W_]+)?", str(text or ""))
+    )
+    lexical_count = han_count if han_count else word_count
+    max_rate = 12.0 if han_count else 6.0
+    rate = lexical_count / max(duration, 0.001)
+    plausible = bool(
+        lexical_count > 0
+        and duration >= (0.16 if lexical_count <= 3 else 0.35)
+        and rate <= max_rate
+    )
+    return {
+        "plausible": plausible,
+        "duration": round(duration, 3),
+        "lexical_count": lexical_count,
+        "lexical_rate": round(rate, 3),
+        "max_lexical_rate": max_rate,
+    }
+
+
 def _recover_deferred_from_ocr(
     deferred_regions: Sequence[Dict[str, Any]],
     frame_records: Dict[str, List[Dict[str, Any]]],
@@ -835,10 +890,25 @@ def _recover_deferred_from_ocr(
             audit.append(record)
             continue
         event_records = []
+        rejected_events = []
+        region_recovered: List[Dict[str, Any]] = []
         for event_index, event in enumerate(events):
+            text = str(event["text"])
+            timing = ocr_recovery_timing_plausibility(
+                text, float(event["start"]), float(event["end"])
+            )
+            if not timing["plausible"]:
+                rejected_events.append({
+                    "text": text,
+                    "start": event["start"],
+                    "end": event["end"],
+                    **timing,
+                    "reason": "ocr_text_duration_implausible",
+                })
+                continue
             seed = {
                 "id": -1,
-                "text": str(event["text"]),
+                "text": text,
                 "asr_model": "qwen3+ocr",
                 "asr_repair_source": "stable_ocr_timeline",
                 "ocr_recovered": True,
@@ -860,6 +930,7 @@ def _recover_deferred_from_ocr(
             segment["asr_recovered_parent_start"] = round(float(region["start"]), 3)
             segment["asr_recovered_parent_end"] = round(float(region["end"]), 3)
             recovered.append(segment)
+            region_recovered.append(segment)
             event_records.append(
                 {
                     "text": event["text"],
@@ -868,7 +939,37 @@ def _recover_deferred_from_ocr(
                     "frame_count": event.get("frame_count", 0),
                 }
             )
-        record.update({"status": "accepted_coarse", "events": event_records})
+        if rejected_events:
+            record["rejected_events"] = rejected_events
+        if not event_records:
+            remaining.append(dict(
+                region,
+                dialogue_evidence=True,
+                asr_recovery_status="unresolved_blocking",
+                ocr_recovery_rejection="ocr_text_duration_implausible",
+                requires_contextual_asr_retry=True,
+            ))
+            record["status"] = "rejected_implausible_timing"
+        else:
+            if rejected_events:
+                # A partially accepted parent is not fully covered.  Limit
+                # each accepted range to its own event and keep rejected event
+                # intervals in the unresolved inventory for contextual ASR.
+                for segment in region_recovered:
+                    segment["asr_recovered_parent_start"] = segment["start"]
+                    segment["asr_recovered_parent_end"] = segment["end"]
+                for rejected in rejected_events:
+                    remaining.append(dict(
+                        region,
+                        id=f"{region_id}:ocr_rejected:{len(remaining)}",
+                        start=round(float(rejected["start"]), 3),
+                        end=round(float(rejected["end"]), 3),
+                        dialogue_evidence=True,
+                        asr_recovery_status="unresolved_blocking",
+                        ocr_recovery_rejection="ocr_text_duration_implausible",
+                        requires_contextual_asr_retry=True,
+                    ))
+            record.update({"status": "accepted_coarse", "events": event_records})
         audit.append(record)
     return recovered, remaining, audit
 
