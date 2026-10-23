@@ -154,7 +154,8 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
             "punctuation": "strong",
         }])
         self.assertIsNotNone(threshold)
-        self.assertGreaterEqual(threshold, 0.76)
+        self.assertGreater(threshold, 0.60)
+        self.assertLess(threshold, 0.76)
 
     def test_reliable_sentence_end_becomes_partition_without_claiming_hard_change(self):
         candidate = {
@@ -325,6 +326,95 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         ]
         identities, mapping, diagnostics = _reconcile_turn_clusters(
             [{0, 1}, {2}], turns, set(), set(), {}
+        )
+        self.assertEqual(len(identities), 2)
+        self.assertNotEqual(mapping[0], mapping[1])
+        self.assertEqual(diagnostics["identity_merges"], [])
+
+    def test_partitioned_same_voice_turns_reconnect_without_identity_penalty(self):
+        other = np.asarray([0.70, np.sqrt(1.0 - 0.70 ** 2)])
+        turns = [
+            {"start": 0.0, "end": 3.0, "duration": 3.0,
+             "embedding": np.asarray([1.0, 0.0]), "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 3.2, "end": 6.2, "duration": 3.0,
+             "embedding": other, "embedding_reliable": True,
+             "embedding_quality": 0.9},
+        ]
+        identities, mapping, diagnostics = _reconcile_turn_clusters(
+            [{0}, {1}], turns, set(), set(), {
+                (0, 1): {"constraint": "partition", "score": 0.20}
+            }
+        )
+        self.assertEqual(len(identities), 1)
+        self.assertEqual(mapping[0], mapping[1])
+        self.assertEqual(
+            diagnostics["identity_merges"][0]["reason"],
+            "mutual_reliable_prototype_match",
+        )
+
+    def test_strong_soft_boundary_is_penalty_not_unconditional_block(self):
+        other = np.asarray([0.78, np.sqrt(1.0 - 0.78 ** 2)])
+        turns = [
+            {"start": 0.0, "end": 3.0, "duration": 3.0,
+             "embedding": np.asarray([1.0, 0.0]), "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 4.0, "end": 7.0, "duration": 3.0,
+             "embedding": other, "embedding_reliable": True,
+             "embedding_quality": 0.9},
+        ]
+        boundary = {
+            "constraint": "soft", "score": 0.62,
+            "same_asr_segment": False, "punctuation": "strong",
+        }
+        identities, mapping, diagnostics = _reconcile_turn_clusters(
+            [{0}, {1}], turns, set(), {(0, 1)}, {(0, 1): boundary}
+        )
+        self.assertEqual(len(identities), 1)
+        self.assertEqual(mapping[0], mapping[1])
+        self.assertGreater(
+            diagnostics["identity_merges"][0]["threshold"],
+            diagnostics["prototype_similarity_threshold"],
+        )
+
+    def test_hard_boundary_remains_absolute_for_nearly_identical_voices(self):
+        other = np.asarray([0.98, np.sqrt(1.0 - 0.98 ** 2)])
+        turns = [
+            {"start": 0.0, "end": 3.0, "duration": 3.0,
+             "embedding": np.asarray([1.0, 0.0]), "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 3.1, "end": 6.1, "duration": 3.0,
+             "embedding": other, "embedding_reliable": True,
+             "embedding_quality": 0.9},
+        ]
+        identities, mapping, diagnostics = _reconcile_turn_clusters(
+            [{0}, {1}], turns, {(0, 1)}, set(), {
+                (0, 1): {"constraint": "hard", "score": 0.80}
+            }
+        )
+        self.assertEqual(len(identities), 2)
+        self.assertNotEqual(mapping[0], mapping[1])
+        self.assertEqual(diagnostics["identity_merges"], [])
+
+    def test_same_sentence_soft_split_does_not_swallow_a_b_a_interjection(self):
+        voice_b = np.asarray([0.74, np.sqrt(1.0 - 0.74 ** 2)])
+        turns = [
+            {"start": 0.0, "end": 3.0, "duration": 3.0,
+             "embedding": np.asarray([1.0, 0.0]), "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 3.0, "end": 6.0, "duration": 3.0,
+             "embedding": voice_b, "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 6.0, "end": 9.0, "duration": 3.0,
+             "embedding": np.asarray([1.0, 0.0]), "embedding_reliable": True,
+             "embedding_quality": 0.9},
+        ]
+        boundary = {
+            "constraint": "soft", "score": 0.48,
+            "same_asr_segment": True, "punctuation": "strong",
+        }
+        identities, mapping, diagnostics = _reconcile_turn_clusters(
+            [{0, 2}, {1}], turns, set(), {(0, 1)}, {(0, 1): boundary}
         )
         self.assertEqual(len(identities), 2)
         self.assertNotEqual(mapping[0], mapping[1])
