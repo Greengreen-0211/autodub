@@ -17,6 +17,7 @@ from run_step2_wespeaker import (
     _merge_preserves_identity,
     _pair_evidence_diagnostics,
     _robust_identity_match,
+    _robust_embedding_pool,
     _reconcile_turn_clusters,
     _select_change_boundaries,
     _soft_continuity_threshold,
@@ -316,7 +317,10 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertLess(len(identities), 5)
         self.assertEqual(
             diagnostics["algorithm"],
-            "adaptive_multi_prototype_clustering_v5",
+            "global_identity_model_selection_v6",
+        )
+        self.assertGreater(
+            diagnostics["global_partition_candidate_count"], 1
         )
         protected, mapping, protected_diagnostics = _reconcile_turn_clusters(
             [{index} for index in range(5)],
@@ -328,6 +332,17 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertNotEqual(mapping[0], mapping[1])
         self.assertGreaterEqual(len(protected), 2)
         self.assertEqual(protected_diagnostics["hard_constraint_count"], 1)
+
+    def test_robust_turn_pool_rejects_one_window_outlier(self):
+        values = np.asarray([
+            [1.0, 0.0],
+            [0.99, 0.10],
+            [0.98, -0.10],
+            [-1.0, 0.0],
+        ])
+        pooled, retained = _robust_embedding_pool(values)
+        self.assertGreater(float(pooled @ np.asarray([1.0, 0.0])), 0.98)
+        self.assertLess(retained, len(values))
 
     def test_three_voice_sequence_is_not_forced_into_two_labels(self):
         voice_a = np.asarray([1.0, 0.0, 0.0])
