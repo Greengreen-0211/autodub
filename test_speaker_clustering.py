@@ -11,7 +11,10 @@ from run_step2_wespeaker import (
     _centroid_for_centers,
     _cluster_centroid,
     _cluster_pair_evidence,
+    _combined_merge_penalty,
     _constrained_turn_clusters,
+    _adaptive_identity_thresholds,
+    _merge_preserves_identity,
     _robust_identity_match,
     _reconcile_turn_clusters,
     _select_change_boundaries,
@@ -215,6 +218,108 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         clusters = _constrained_turn_clusters(turns, set())
         self.assertEqual(len(clusters), 1)
 
+    def test_soft_boundary_is_a_seed_penalty_then_remains_reconcilable(self):
+        other = np.asarray([0.80, np.sqrt(1.0 - 0.80 ** 2)])
+        turns = [
+            {"start": 0.0, "end": 3.0, "duration": 3.0,
+             "embedding": np.asarray([1.0, 0.0]),
+             "embedding_reliable": True, "embedding_quality": 0.9},
+            {"start": 3.1, "end": 6.1, "duration": 3.0,
+             "embedding": other,
+             "embedding_reliable": True, "embedding_quality": 0.9},
+        ]
+        raw = _constrained_turn_clusters(
+            turns, set(), soft_links={(0, 1)}
+        )
+        self.assertEqual(len(raw), 2)
+        boundary = {
+            "constraint": "soft", "score": 0.45,
+            "same_asr_segment": False, "punctuation": "strong",
+        }
+        identities, _, diagnostics = _reconcile_turn_clusters(
+            raw, turns, set(), {(0, 1)}, {(0, 1): boundary}
+        )
+        self.assertEqual(len(identities), 1)
+        self.assertTrue(diagnostics["identity_merges"])
+
+    def test_adaptive_gates_use_nearest_legal_matches_and_keep_bounds(self):
+        calibration = _adaptive_identity_thresholds({
+            (0, 1): 0.72,
+            (0, 2): 0.10,
+            (0, 3): 0.20,
+            (1, 2): 0.15,
+            (1, 3): 0.10,
+            (2, 3): 0.70,
+        }, 4)
+        self.assertGreaterEqual(calibration["seed"], calibration["reconnect"])
+        self.assertGreaterEqual(calibration["reconnect"], 0.48)
+        self.assertLessEqual(calibration["reconnect"], 0.68)
+        self.assertGreater(calibration["nearest_median"], 0.69)
+        self.assertEqual(
+            _combined_merge_penalty(0.06, 0.08, 0.07), 0.08
+        )
+        self.assertEqual(
+            _combined_merge_penalty(0.20, 0.08), 0.10
+        )
+
+    def test_multi_prototype_identity_accepts_two_supported_voice_states(self):
+        voice_a = np.asarray([1.0, 0.0])
+        voice_b = np.asarray([0.0, 1.0])
+        embeddings = [voice_a, voice_a, voice_b, voice_a, voice_b, voice_b]
+        turns = [
+            {"start": float(index * 2), "end": float(index * 2 + 1.8),
+             "duration": 1.8, "embedding": embedding,
+             "embedding_reliable": True, "embedding_quality": 0.9}
+            for index, embedding in enumerate(embeddings)
+        ]
+        evidence = _cluster_pair_evidence({0, 1, 2}, {3, 4, 5}, turns)
+        self.assertLess(evidence["centroid"], 0.85)
+        self.assertTrue(_robust_identity_match(
+            evidence, 0.85, anchor_pair=True
+        ))
+        accepted, audit = _merge_preserves_identity(
+            {0, 1, 2}, {3, 4, 5}, turns, 0.85
+        )
+        self.assertTrue(accepted)
+        self.assertEqual(audit["left_prototype_coverage"], 1.0)
+
+    def test_fragmentation_review_reconnects_supported_singletons(self):
+        common = np.sqrt(0.74)
+        unique = np.sqrt(0.26)
+        turns = []
+        for index in range(5):
+            embedding = np.zeros(6, dtype=float)
+            embedding[0] = common
+            embedding[index + 1] = unique
+            turns.append({
+                "start": float(index * 3),
+                "end": float(index * 3 + 2.5),
+                "duration": 2.5,
+                "embedding": embedding,
+                "embedding_reliable": True,
+                "embedding_quality": 0.9,
+            })
+        identities, _, diagnostics = _reconcile_turn_clusters(
+            [{index} for index in range(5)], turns, set(), set(), {}
+        )
+        self.assertTrue(diagnostics["fragmentation_retry_triggered"])
+        self.assertGreater(diagnostics["fragmentation_retry_merges"], 0)
+        self.assertLess(len(identities), 5)
+        self.assertEqual(
+            diagnostics["algorithm"],
+            "adaptive_multi_prototype_clustering_v5",
+        )
+        protected, mapping, protected_diagnostics = _reconcile_turn_clusters(
+            [{index} for index in range(5)],
+            turns,
+            {(0, 1)},
+            set(),
+            {(0, 1): {"constraint": "hard", "score": 0.9}},
+        )
+        self.assertNotEqual(mapping[0], mapping[1])
+        self.assertGreaterEqual(len(protected), 2)
+        self.assertEqual(protected_diagnostics["hard_constraint_count"], 1)
+
     def test_three_voice_sequence_is_not_forced_into_two_labels(self):
         voice_a = np.asarray([1.0, 0.0, 0.0])
         voice_b = np.asarray([0.58, np.sqrt(1.0 - 0.58 ** 2), 0.0])
@@ -414,7 +519,11 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
             "same_asr_segment": True, "punctuation": "strong",
         }
         identities, mapping, diagnostics = _reconcile_turn_clusters(
-            [{0, 2}, {1}], turns, set(), {(0, 1)}, {(0, 1): boundary}
+            [{0, 2}, {1}],
+            turns,
+            set(),
+            {(0, 1), (1, 2)},
+            {(0, 1): boundary, (1, 2): dict(boundary)},
         )
         self.assertEqual(len(identities), 2)
         self.assertNotEqual(mapping[0], mapping[1])

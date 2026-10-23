@@ -123,6 +123,39 @@ SANDWICH_SINGLETON_PENALTY = _env_float(
 IDENTITY_CONSISTENCY_MARGIN = _env_float(
     "AUTODUB_DIAR_IDENTITY_CONSISTENCY_MARGIN", 0.13
 )
+ADAPTIVE_SEED_MIN = _env_float(
+    "AUTODUB_DIAR_ADAPTIVE_SEED_MIN", 0.66
+)
+ADAPTIVE_SEED_MAX = _env_float(
+    "AUTODUB_DIAR_ADAPTIVE_SEED_MAX", 0.76
+)
+ADAPTIVE_RECONNECT_MIN = _env_float(
+    "AUTODUB_DIAR_ADAPTIVE_RECONNECT_MIN", 0.48
+)
+ADAPTIVE_RECONNECT_MAX = _env_float(
+    "AUTODUB_DIAR_ADAPTIVE_RECONNECT_MAX", 0.68
+)
+ADAPTIVE_ASSIGNMENT_MIN = _env_float(
+    "AUTODUB_DIAR_ADAPTIVE_ASSIGNMENT_MIN", 0.40
+)
+ADAPTIVE_ASSIGNMENT_MAX = _env_float(
+    "AUTODUB_DIAR_ADAPTIVE_ASSIGNMENT_MAX", 0.56
+)
+MAX_COMBINED_MERGE_PENALTY = _env_float(
+    "AUTODUB_DIAR_MAX_COMBINED_MERGE_PENALTY", 0.10
+)
+MULTI_PROTOTYPE_MAX_COUNT = _env_int(
+    "AUTODUB_DIAR_MULTI_PROTOTYPE_MAX_COUNT", 3
+)
+MULTI_PROTOTYPE_COVERAGE = _env_float(
+    "AUTODUB_DIAR_MULTI_PROTOTYPE_COVERAGE", 0.67
+)
+FRAGMENTATION_SINGLETON_RATIO = _env_float(
+    "AUTODUB_DIAR_FRAGMENTATION_SINGLETON_RATIO", 0.55
+)
+FRAGMENTATION_RELAXATION = _env_float(
+    "AUTODUB_DIAR_FRAGMENTATION_RELAXATION", 0.04
+)
 STRUCTURAL_SOFT_CHANGE_MIN = _env_float(
     "AUTODUB_DIAR_STRUCTURAL_SOFT_CHANGE_MIN", 0.44
 )
@@ -901,6 +934,13 @@ def _cluster_pair_evidence(left, right, turns):
         for a in left_members
         for b in right_members
     ], dtype=float)
+    matrix = np.asarray([
+        [
+            float(turns[a]["embedding"] @ turns[b]["embedding"])
+            for b in right_members
+        ]
+        for a in left_members
+    ], dtype=float)
     centroid = float(
         _cluster_centroid(left, turns) @ _cluster_centroid(right, turns)
     )
@@ -910,27 +950,63 @@ def _cluster_pair_evidence(left, right, turns):
             "median": centroid,
             "q25": centroid,
             "minimum": centroid,
+            "support_median": centroid,
+            "support_q25": centroid,
+            "directional_support": np.asarray([centroid], dtype=float),
             "pair_count": 0,
         }
+    left_support = np.max(matrix, axis=1)
+    right_support = np.max(matrix, axis=0)
+    directional_support = np.concatenate([left_support, right_support])
     return {
         "centroid": centroid,
         "median": float(np.median(values)),
         "q25": float(np.quantile(values, 0.25)),
         "minimum": float(np.min(values)),
+        # Each turn only needs to match one reliable acoustic state of the
+        # opposite identity.  This keeps shouting/whispering variants from
+        # being rejected merely because every cross-pair is not similar.
+        "support_median": float(np.median(directional_support)),
+        "support_q25": float(np.quantile(directional_support, 0.25)),
+        "directional_support": directional_support,
         "pair_count": int(len(values)),
     }
 
 
 def _robust_identity_match(evidence, threshold, *, anchor_pair):
     """Require broad turn-level support before merging established voices."""
-    if evidence["centroid"] < threshold:
+    centroid_ok = evidence["centroid"] >= threshold
+    directional_support = np.asarray(
+        evidence.get("directional_support", []), dtype=float
+    )
+    support_floor = threshold - 0.03
+    support_coverage = (
+        float(np.mean(directional_support >= support_floor))
+        if len(directional_support) else 0.0
+    )
+    multi_prototype_ok = bool(
+        evidence.get("pair_count", 0) >= 4
+        and evidence.get("support_median", evidence["median"])
+        >= threshold - 0.01
+        and evidence.get("support_q25", evidence["q25"]) >= support_floor
+        and support_coverage >= 0.80
+        and evidence["centroid"] >= threshold - 0.06
+    )
+    if not (centroid_ok or multi_prototype_ok):
         return False
     if not anchor_pair:
-        return evidence["median"] >= threshold - 0.04
+        return bool(
+            evidence["median"] >= threshold - 0.04
+            or multi_prototype_ok
+        )
     quantile_floor = max(IDENTITY_CROSS_MIN_QUANTILE, threshold - 0.06)
     return bool(
-        evidence["median"] >= threshold - 0.02
-        and evidence["q25"] >= quantile_floor
+        (
+            centroid_ok
+            and evidence["median"] >= threshold - 0.02
+            and evidence["q25"] >= quantile_floor
+        )
+        or multi_prototype_ok
     )
 
 
@@ -1017,8 +1093,9 @@ def _sandwich_protection_penalty(
     left_profile,
     right_profile,
     turns,
+    boundary_evidence=None,
 ):
-    """Protect a possible rare A-B-A singleton from proximity-driven merge."""
+    """Protect a real A-B-A island only when both local boundaries support it."""
     if left_profile["turn_count"] == 1:
         singleton_group, target_group = left_group, right_group
     elif right_profile["turn_count"] == 1:
@@ -1026,9 +1103,24 @@ def _sandwich_protection_penalty(
     else:
         return 0.0
     context = _temporal_assignment_context(singleton_group, target_group, turns)
+    if context["target_neighbor_support"] < 2:
+        return 0.0
+    boundary_evidence = boundary_evidence or {}
+    singleton = next(iter(singleton_group))
+    target_neighbours = sorted(
+        index for index in target_group
+        if (min(index, singleton), max(index, singleton)) in boundary_evidence
+    )
+    supported_edges = 0
+    for neighbour in target_neighbours:
+        item = boundary_evidence[
+            (min(neighbour, singleton), max(neighbour, singleton))
+        ]
+        if item.get("constraint") in {"soft", "hard"}:
+            supported_edges += 1
     return (
         SANDWICH_SINGLETON_PENALTY
-        if context["target_neighbor_support"] >= 2
+        if supported_edges >= 2
         else 0.0
     )
 
@@ -1099,6 +1191,71 @@ def _identity_profile(cluster, turns):
     }
 
 
+def _cluster_prototypes(cluster, turns, maximum=None):
+    """Choose a few real turns that cover distinct acoustic states."""
+    maximum = max(1, int(maximum or MULTI_PROTOTYPE_MAX_COUNT))
+    members = [
+        index for index in sorted(cluster)
+        if turns[index].get("embedding_reliable")
+    ] or sorted(cluster)
+    if len(members) <= maximum:
+        return members
+
+    def turn_weight(index):
+        duration = max(0.0, float(turns[index].get("duration", 0.0)))
+        quality = max(0.0, float(turns[index].get("embedding_quality", 0.0)))
+        return quality * math.sqrt(max(0.25, duration))
+
+    # Start from the cleanest useful turn, then use farthest-first selection.
+    # The selected items remain actual embeddings rather than an average that
+    # can fall between neutral, shouted and whispered states.
+    chosen = [max(members, key=turn_weight)]
+    while len(chosen) < maximum:
+        candidates = [index for index in members if index not in chosen]
+        if not candidates:
+            break
+        candidate = min(
+            candidates,
+            key=lambda index: max(
+                float(turns[index]["embedding"] @ turns[other]["embedding"])
+                for other in chosen
+            ),
+        )
+        nearest = max(
+            float(turns[candidate]["embedding"] @ turns[other]["embedding"])
+            for other in chosen
+        )
+        # A nearly identical extra prototype adds no coverage information.
+        if nearest >= 0.88:
+            break
+        chosen.append(candidate)
+    return chosen
+
+
+def _prototype_coverage(source, target, turns, threshold):
+    """Measure how much of source is explained by target's acoustic states."""
+    members = [
+        index for index in source if turns[index].get("embedding_reliable")
+    ] or list(source)
+    prototypes = _cluster_prototypes(target, turns)
+    if not members or not prototypes:
+        return {"coverage": 0.0, "median": -1.0, "minimum": -1.0}
+    best = np.asarray([
+        max(
+            float(turns[index]["embedding"] @ turns[prototype]["embedding"])
+            for prototype in prototypes
+        )
+        for index in members
+    ], dtype=float)
+    floor = max(IDENTITY_CROSS_MIN_QUANTILE, threshold - 0.08)
+    return {
+        "coverage": float(np.mean(best >= floor)),
+        "median": float(np.median(best)),
+        "minimum": float(np.min(best)),
+        "prototype_count": len(prototypes),
+    }
+
+
 def _cluster_consistency(cluster, turns):
     """Measure whether one proposed identity remains acoustically coherent."""
     members = [
@@ -1120,31 +1277,110 @@ def _cluster_consistency(cluster, turns):
 
 
 def _merge_preserves_identity(left, right, turns, threshold):
-    """Reject a merge that creates a visibly bimodal/incoherent identity."""
+    """Accept multi-state voices while rejecting unsupported cluster chaining."""
     combined = set(left) | set(right)
     consistency = _cluster_consistency(combined, turns)
+    left_coverage = _prototype_coverage(left, right, turns, threshold)
+    right_coverage = _prototype_coverage(right, left, turns, threshold)
     floor = max(IDENTITY_CROSS_MIN_QUANTILE, threshold - IDENTITY_CONSISTENCY_MARGIN)
+    coverage_required = MULTI_PROTOTYPE_COVERAGE
+    # A singleton has only one observation, so its direct match must clear the
+    # threshold rather than obtaining a free pass from a one-element ratio.
+    if min(len(left), len(right)) == 1:
+        coverage_required = 1.0
     accepted = bool(
-        consistency["median"] >= threshold - 0.08
-        and consistency["q25"] >= floor
+        left_coverage["coverage"] >= coverage_required
+        and right_coverage["coverage"] >= coverage_required
+        and min(left_coverage["median"], right_coverage["median"])
+        >= threshold - 0.06
+        and (
+            consistency["q25"] >= floor
+            or min(left_coverage["coverage"], right_coverage["coverage"])
+            >= 0.80
+        )
     )
+    consistency.update({
+        "left_prototype_coverage": left_coverage["coverage"],
+        "right_prototype_coverage": right_coverage["coverage"],
+        "left_prototype_count": left_coverage.get("prototype_count", 0),
+        "right_prototype_count": right_coverage.get("prototype_count", 0),
+    })
     return accepted, consistency
 
 
-def _adaptive_identity_threshold(similarities):
-    if not similarities:
-        return PROTOTYPE_MERGE_SIMILARITY
-    values = np.asarray(similarities, dtype=float)
-    median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)))
-    # Speaker embeddings are not calibrated equally across clips.  Keep the
-    # threshold conservative, but derive it from this clip instead of applying
-    # the same cutoff to every voice and recording condition.
-    estimate = median + 0.50 * max(0.02, mad)
-    return min(
-        PROTOTYPE_MERGE_SIMILARITY + 0.04,
-        max(PROTOTYPE_MERGE_SIMILARITY - 0.02, estimate),
+def _adaptive_identity_thresholds(similarities, group_count):
+    """Calibrate seed/reconnect/assignment gates from legal nearest matches."""
+    nearest = defaultdict(list)
+    for (left, right), similarity in similarities.items():
+        nearest[left].append(float(similarity))
+        nearest[right].append(float(similarity))
+    nearest_values = np.asarray(
+        [max(values) for values in nearest.values() if values], dtype=float
     )
+    all_values = np.asarray(list(similarities.values()), dtype=float)
+    if not len(nearest_values):
+        reconnect = min(
+            ADAPTIVE_RECONNECT_MAX,
+            max(ADAPTIVE_RECONNECT_MIN, PROTOTYPE_MERGE_SIMILARITY),
+        )
+        confidence = 0.0
+        center = None
+        spread = None
+    else:
+        center = float(np.median(nearest_values))
+        spread = float(np.median(np.abs(nearest_values - center)))
+        if len(nearest_values) >= 4:
+            estimate = center - max(0.05, 0.75 * spread)
+            confidence = min(1.0, len(nearest_values) / max(4.0, group_count))
+        else:
+            # Too few identities cannot reveal two distribution modes. Keep a
+            # conservative prior. A two/three-identity clip does not provide
+            # enough evidence to lower the global gate from one close pair.
+            estimate = PROTOTYPE_MERGE_SIMILARITY
+            confidence = 0.35
+        reconnect = min(
+            ADAPTIVE_RECONNECT_MAX,
+            max(ADAPTIVE_RECONNECT_MIN, estimate),
+        )
+    if len(nearest_values):
+        upper = float(np.quantile(nearest_values, 0.75))
+    else:
+        upper = STRONG_SPEAKER_SIMILARITY
+    seed = min(
+        ADAPTIVE_SEED_MAX,
+        max(ADAPTIVE_SEED_MIN, reconnect + 0.10, upper),
+    )
+    assignment = min(
+        ADAPTIVE_ASSIGNMENT_MAX,
+        max(ADAPTIVE_ASSIGNMENT_MIN, reconnect - 0.10),
+    )
+    return {
+        "seed": float(seed),
+        "reconnect": float(reconnect),
+        "assignment": float(assignment),
+        "confidence": float(confidence),
+        "nearest_values": nearest_values,
+        "all_values": all_values,
+        "nearest_median": center,
+        "nearest_mad": spread,
+    }
+
+
+def _adaptive_identity_threshold(similarities):
+    """Compatibility wrapper for diagnostics/tests using the former helper."""
+    mapping = {
+        (index, index + 1): float(value)
+        for index, value in enumerate(similarities)
+    }
+    return _adaptive_identity_thresholds(
+        mapping, len(similarities) + 1
+    )["reconnect"]
+
+
+def _combined_merge_penalty(*values):
+    """Combine uncertainty without stacking several weak signals to 0.78."""
+    usable = [max(0.0, float(value)) for value in values if value is not None]
+    return min(MAX_COMBINED_MERGE_PENALTY, max(usable, default=0.0))
 
 
 def _merge_clusters(clusters, left_index, right_index):
@@ -1155,7 +1391,12 @@ def _merge_clusters(clusters, left_index, right_index):
     ] + [merged]
 
 
-def _constrained_turn_clusters(turns, cannot_links):
+def _constrained_turn_clusters(
+    turns,
+    cannot_links,
+    soft_links=None,
+    seed_threshold=None,
+):
     """Build conservative speaker cores from pure acoustic turns.
 
     Earlier code greedily merged at a low centroid threshold and then colored
@@ -1166,6 +1407,19 @@ def _constrained_turn_clusters(turns, cannot_links):
     later audited assignment phase instead of being forced into a color.
     """
     clusters = [{index} for index in range(len(turns))]
+    soft_links = soft_links or set()
+    if seed_threshold is None:
+        legal_similarities = {
+            (left, right): float(
+                turns[left]["embedding"] @ turns[right]["embedding"]
+            )
+            for left in range(len(turns))
+            for right in range(left + 1, len(turns))
+            if (left, right) not in cannot_links
+        }
+        seed_threshold = _adaptive_identity_thresholds(
+            legal_similarities, len(turns)
+        )["seed"]
     while True:
         eligible = {}
         rankings = defaultdict(list)
@@ -1181,10 +1435,16 @@ def _constrained_turn_clusters(turns, cannot_links):
                     and any(turns[index].get("embedding_reliable") for index in clusters[right])
                 )
                 threshold = (
-                    STRONG_SPEAKER_SIMILARITY
+                    seed_threshold
                     if reliable_pair
-                    else max(0.74, STRONG_SPEAKER_SIMILARITY)
+                    else min(ADAPTIVE_SEED_MAX, seed_threshold + 0.04)
                 )
+                # A soft boundary must survive long enough to be audited by
+                # reconciliation, but it is never an absolute cannot-link.
+                if _clusters_conflict(
+                    clusters[left], clusters[right], soft_links
+                ):
+                    threshold = min(0.84, threshold + 0.06)
                 if not _robust_identity_match(
                     evidence, threshold, anchor_pair=True
                 ):
@@ -1256,7 +1516,7 @@ def _reconcile_turn_clusters(
     initial_centroids = [
         _cluster_centroid(group, turns) for group in initial_turn_groups
     ]
-    unconstrained_similarities = []
+    unconstrained_similarities = {}
     for left in range(len(initial_turn_groups)):
         for right in range(left + 1, len(initial_turn_groups)):
             if _clusters_conflict(
@@ -1265,15 +1525,15 @@ def _reconcile_turn_clusters(
                 hard_cannot_links,
             ):
                 continue
-            unconstrained_similarities.append(float(
+            unconstrained_similarities[(left, right)] = float(
                 initial_centroids[left] @ initial_centroids[right]
-            ))
-    prototype_threshold = _adaptive_identity_threshold(
-        unconstrained_similarities
+            )
+    calibration = _adaptive_identity_thresholds(
+        unconstrained_similarities, len(initial_turn_groups)
     )
-    assignment_threshold = max(
-        LOW_QUALITY_ASSIGN_SIMILARITY, prototype_threshold - 0.11
-    )
+    seed_threshold = calibration["seed"]
+    prototype_threshold = calibration["reconnect"]
+    assignment_threshold = calibration["assignment"]
 
     identity_candidates = []
     initial_profiles = [
@@ -1328,6 +1588,14 @@ def _reconcile_turn_clusters(
                 "cross_turn_median": round(pair_evidence["median"], 4),
                 "cross_turn_q25": round(pair_evidence["q25"], 4),
                 "cross_turn_minimum": round(pair_evidence["minimum"], 4),
+                "prototype_support_median": round(
+                    pair_evidence.get("support_median", pair_evidence["median"]),
+                    4,
+                ),
+                "prototype_support_q25": round(
+                    pair_evidence.get("support_q25", pair_evidence["q25"]),
+                    4,
+                ),
                 "hard_conflict": hard_conflict,
                 "soft_conflict": soft_conflict,
                 "sentence_continuity": continuity,
@@ -1374,14 +1642,20 @@ def _reconcile_turn_clusters(
                 evidence_by_pair[(left, right)]
             )
             continuity = continuity_threshold is not None
+            sandwich_penalty = 0.0
             if continuity:
-                continuity_threshold += _sandwich_protection_penalty(
+                sandwich_penalty = _sandwich_protection_penalty(
                     turn_groups[left],
                     turn_groups[right],
                     profiles[left],
                     profiles[right],
                     turns,
+                    boundary_evidence,
                 )
+                if sandwich_penalty:
+                    continuity_threshold = max(
+                        continuity_threshold, 0.76
+                    )
             robust = pair_evidence_by_pair[(left, right)]
             if (
                 not continuity
@@ -1409,6 +1683,14 @@ def _reconcile_turn_clusters(
                     "same_sentence_soft_boundary",
                     similarity,
                     consistency,
+                    {
+                        "soft_boundary": round(
+                            _soft_boundary_penalty(
+                                evidence_by_pair[(left, right)]
+                            ), 4
+                        ),
+                        "sandwich_protection": round(sandwich_penalty, 4),
+                    },
                 )
 
         # Phase 2: reconnect reliable prototypes. Mutual-nearest is strong
@@ -1448,6 +1730,10 @@ def _reconcile_turn_clusters(
                     ) < 2
                     else 0.0
                 )
+                structural_partition = any(
+                    item.get("constraint") == "partition"
+                    for item in evidence_by_pair[(left, right)]
+                )
                 mutual = bool(
                     anchor_rankings[left]
                     and anchor_rankings[left][0][1] == right
@@ -1466,15 +1752,25 @@ def _reconcile_turn_clusters(
                     profiles[left],
                     profiles[right],
                     turns,
+                    boundary_evidence,
+                )
+                combined_penalty = _combined_merge_penalty(
+                    boundary_penalty,
+                    single_turn_penalty,
+                    non_mutual_penalty,
                 )
                 required_threshold = min(
-                    0.78,
-                    prototype_threshold
-                    + boundary_penalty
-                    + single_turn_penalty
-                    + non_mutual_penalty
-                    + sandwich_penalty,
+                    ADAPTIVE_SEED_MAX,
+                    prototype_threshold + combined_penalty,
                 )
+                if sandwich_penalty:
+                    required_threshold = max(required_threshold, 0.76)
+                elif single_turn_penalty and not structural_partition:
+                    # One observation is too little to establish a global
+                    # identity. Only an explicit sentence partition may use
+                    # the ordinary reconnect gate; other singleton prototypes
+                    # need exceptional acoustic agreement.
+                    required_threshold = max(required_threshold, 0.76)
                 if not _robust_identity_match(
                     pair_evidence_by_pair[(left, right)],
                     required_threshold,
@@ -1489,12 +1785,7 @@ def _reconcile_turn_clusters(
                 )
                 if not consistent:
                     continue
-                adjusted_score = similarity - (
-                    boundary_penalty
-                    + single_turn_penalty
-                    + non_mutual_penalty
-                    + sandwich_penalty
-                )
+                adjusted_score = similarity - combined_penalty - sandwich_penalty
                 if best is None or adjusted_score > best[0]:
                     best = (
                         adjusted_score,
@@ -1508,6 +1799,16 @@ def _reconcile_turn_clusters(
                         ),
                         similarity,
                         consistency,
+                        {
+                            "soft_boundary": round(boundary_penalty, 4),
+                            "single_turn": round(single_turn_penalty, 4),
+                            "non_mutual": round(non_mutual_penalty, 4),
+                            "sandwich_protection": round(
+                                sandwich_penalty, 4
+                            ),
+                            "combined": round(combined_penalty, 4),
+                            "structural_partition": structural_partition,
+                        },
                     )
 
         # Phase 3: a short or weak identity may join an established prototype
@@ -1555,7 +1856,9 @@ def _reconcile_turn_clusters(
                     evidence_by_pair[pair]
                 )
                 source_threshold = min(
-                    0.76, source_threshold + boundary_penalty
+                    ADAPTIVE_RECONNECT_MAX,
+                    source_threshold
+                    + min(boundary_penalty, MAX_COMBINED_MERGE_PENALTY),
                 )
                 margin = (
                     similarity - ranked[1][0]
@@ -1608,6 +1911,7 @@ def _reconcile_turn_clusters(
                         source_threshold,
                         similarity,
                         consistency,
+                        {"soft_boundary": round(boundary_penalty, 4)},
                     )
                 )
             if assignments:
@@ -1619,6 +1923,7 @@ def _reconcile_turn_clusters(
                     source_threshold,
                     similarity,
                     consistency,
+                    penalty_components,
                 ) = max(assignments)
                 best = (
                     adjusted_score,
@@ -1628,6 +1933,7 @@ def _reconcile_turn_clusters(
                     "unique_short_turn_to_prototype",
                     similarity,
                     consistency,
+                    penalty_components,
                 )
 
         if best is None:
@@ -1637,6 +1943,7 @@ def _reconcile_turn_clusters(
         consistency = audit[1] if len(audit) > 1 else _cluster_consistency(
             turn_groups[left] | turn_groups[right], turns
         )
+        penalty_components = audit[2] if len(audit) > 2 else {}
         if left == right:
             # Defensive guard for future changes to assignment selection.
             break
@@ -1653,12 +1960,167 @@ def _reconcile_turn_clusters(
                 consistency["median"], 4
             ),
             "combined_consistency_q25": round(consistency["q25"], 4),
+            "prototype_coverage": round(min(
+                float(consistency.get("left_prototype_coverage", 1.0)),
+                float(consistency.get("right_prototype_coverage", 1.0)),
+            ), 4),
+            "penalty_components": penalty_components,
         })
         identity_nodes = [
             nodes
             for index, nodes in enumerate(identity_nodes)
             if index not in (left, right)
         ] + [merged]
+
+    # A highly fragmented result (mostly one-turn identities despite few hard
+    # exclusions) is evidence that the conservative first pass did not solve
+    # identity clustering. Revisit only the remaining identity graph: no ASR,
+    # timestamps, boundaries, embeddings, or requested speaker count change.
+    first_pass_speaker_count = len(identity_nodes)
+    first_pass_groups = [turn_members(nodes) for nodes in identity_nodes]
+    first_pass_profiles = [
+        _identity_profile(group, turns) for group in first_pass_groups
+    ]
+    singleton_ratio = (
+        sum(profile["turn_count"] == 1 for profile in first_pass_profiles)
+        / max(1, len(first_pass_profiles))
+    )
+    retention_ratio = len(identity_nodes) / max(1, len(raw_clusters))
+    fragmentation_score = 0.65 * singleton_ratio + 0.35 * retention_ratio
+    fragmentation_retry_triggered = bool(
+        len(identity_nodes) >= 4
+        and singleton_ratio >= FRAGMENTATION_SINGLETON_RATIO
+        and retention_ratio >= 0.65
+        and len(hard_cannot_links) < max(2, len(turns) // 2)
+    )
+    fragmentation_retry_merges = 0
+
+    if fragmentation_retry_triggered:
+        relaxed_base = max(
+            ADAPTIVE_RECONNECT_MIN,
+            prototype_threshold - FRAGMENTATION_RELAXATION,
+        )
+        while len(identity_nodes) > 1:
+            turn_groups = [turn_members(nodes) for nodes in identity_nodes]
+            profiles = [
+                _identity_profile(group, turns) for group in turn_groups
+            ]
+            pairs = {}
+            rankings = defaultdict(list)
+            for left in range(len(identity_nodes)):
+                for right in range(left + 1, len(identity_nodes)):
+                    if _clusters_conflict(
+                        turn_groups[left], turn_groups[right], hard_cannot_links
+                    ):
+                        continue
+                    evidence = _cluster_pair_evidence(
+                        turn_groups[left], turn_groups[right], turns
+                    )
+                    score = max(
+                        evidence["centroid"],
+                        evidence.get("support_median", evidence["median"]),
+                    )
+                    pairs[(left, right)] = (score, evidence)
+                    rankings[left].append((score, right))
+                    rankings[right].append((score, left))
+            for values in rankings.values():
+                values.sort(reverse=True)
+            candidates = []
+            for (left, right), (similarity, evidence) in pairs.items():
+                # The relaxed audit still requires reciprocal top-two acoustic
+                # support. It is not a request to reduce the speaker count.
+                left_top = {item[1] for item in rankings[left][:2]}
+                right_top = {item[1] for item in rankings[right][:2]}
+                if right not in left_top or left not in right_top:
+                    continue
+                local_evidence = edge_evidence(
+                    turn_groups[left], turn_groups[right]
+                )
+                sandwich = _sandwich_protection_penalty(
+                    turn_groups[left],
+                    turn_groups[right],
+                    profiles[left],
+                    profiles[right],
+                    turns,
+                    boundary_evidence,
+                )
+                if sandwich:
+                    continue
+                soft_penalty = 0.5 * _soft_boundary_penalty(local_evidence)
+                quality_penalty = max(
+                    0.0,
+                    0.50 - min(
+                        profiles[left]["quality"], profiles[right]["quality"]
+                    ),
+                ) * 0.10
+                required = min(
+                    ADAPTIVE_RECONNECT_MAX,
+                    relaxed_base
+                    + _combined_merge_penalty(
+                        soft_penalty, quality_penalty
+                    ),
+                )
+                if not _robust_identity_match(
+                    evidence, required, anchor_pair=False
+                ):
+                    continue
+                consistent, consistency = _merge_preserves_identity(
+                    turn_groups[left], turn_groups[right], turns, required
+                )
+                if not consistent:
+                    continue
+                candidates.append((
+                    similarity - soft_penalty - quality_penalty,
+                    left,
+                    right,
+                    similarity,
+                    required,
+                    consistency,
+                    soft_penalty,
+                    quality_penalty,
+                ))
+            if not candidates:
+                break
+            (
+                adjusted_score,
+                left,
+                right,
+                similarity,
+                required,
+                consistency,
+                soft_penalty,
+                quality_penalty,
+            ) = max(candidates)
+            merged = identity_nodes[left] | identity_nodes[right]
+            merge_history.append({
+                "raw_speakers": [
+                    f"SPEAKER_{index:02d}" for index in sorted(merged)
+                ],
+                "similarity": round(similarity, 4),
+                "adjusted_score": round(adjusted_score, 4),
+                "threshold": round(required, 4),
+                "reason": "fragmentation_review_reconnect",
+                "combined_consistency_median": round(
+                    consistency["median"], 4
+                ),
+                "combined_consistency_q25": round(
+                    consistency["q25"], 4
+                ),
+                "prototype_coverage": round(min(
+                    float(consistency.get("left_prototype_coverage", 1.0)),
+                    float(consistency.get("right_prototype_coverage", 1.0)),
+                ), 4),
+                "penalty_components": {
+                    "soft_boundary": round(soft_penalty, 4),
+                    "low_quality": round(quality_penalty, 4),
+                },
+            })
+            fragmentation_retry_merges += 1
+            identity_nodes = [
+                nodes
+                for index, nodes in enumerate(identity_nodes)
+                if index not in (left, right)
+            ] + [merged]
 
     ordered_identity_nodes = sorted(
         identity_nodes,
@@ -1678,7 +2140,8 @@ def _reconcile_turn_clusters(
         identity_clusters.append(combined)
 
     reliable_turns = sum(bool(turn.get("embedding_reliable")) for turn in turns)
-    similarity_values = np.asarray(unconstrained_similarities, dtype=float)
+    similarity_values = calibration["all_values"]
+    nearest_similarity_values = calibration["nearest_values"]
     final_identity_profiles = []
     for final_label, cluster in enumerate(identity_clusters):
         profile = _identity_profile(cluster, turns)
@@ -1691,11 +2154,12 @@ def _reconcile_turn_clusters(
             "embedding_quality": round(profile["quality"], 4),
             "prototype_anchor": bool(profile["anchor"]),
             "prototype_eligible": bool(profile["prototype"]),
+            "prototype_count": len(_cluster_prototypes(cluster, turns)),
             "consistency_median": round(consistency["median"], 4),
             "consistency_q25": round(consistency["q25"], 4),
         })
     diagnostics = {
-        "algorithm": "adaptive_prototype_reconnection_v4",
+        "algorithm": "adaptive_multi_prototype_clustering_v5",
         "turn_count": len(turns),
         "raw_speaker_count": len(raw_clusters),
         "speaker_count": len(identity_clusters),
@@ -1710,14 +2174,21 @@ def _reconcile_turn_clusters(
             4,
         ),
         "identity_merges": merge_history,
+        "seed_similarity_threshold": round(seed_threshold, 4),
         "prototype_similarity_threshold": round(prototype_threshold, 4),
         "short_turn_assignment_threshold": round(assignment_threshold, 4),
         "sentence_continuity_threshold": round(
             SENTENCE_CONTINUITY_SIMILARITY, 4
         ),
         "raw_core_similarity_threshold": round(
-            STRONG_SPEAKER_SIMILARITY, 4
+            seed_threshold, 4
         ),
+        "fragmentation_score": round(fragmentation_score, 4),
+        "fragmentation_singleton_ratio": round(singleton_ratio, 4),
+        "fragmentation_retry_triggered": fragmentation_retry_triggered,
+        "fragmentation_retry_merges": fragmentation_retry_merges,
+        "first_pass_speaker_count": first_pass_speaker_count,
+        "second_pass_speaker_count": len(identity_clusters),
         "identity_candidates": identity_candidates,
         "identity_threshold_calibration": {
             "pair_count": int(len(similarity_values)),
@@ -1728,6 +2199,22 @@ def _reconcile_turn_clusters(
             "q75": round(float(np.quantile(similarity_values, 0.75)), 4)
             if len(similarity_values) else None,
             "adaptive_threshold": round(prototype_threshold, 4),
+            "seed_threshold": round(seed_threshold, 4),
+            "assignment_floor": round(assignment_threshold, 4),
+            "confidence": round(calibration["confidence"], 4),
+            "nearest_pair_count": int(len(nearest_similarity_values)),
+            "nearest_median": (
+                round(float(np.median(nearest_similarity_values)), 4)
+                if len(nearest_similarity_values) else None
+            ),
+            "nearest_q25": (
+                round(float(np.quantile(nearest_similarity_values, 0.25)), 4)
+                if len(nearest_similarity_values) else None
+            ),
+            "nearest_q75": (
+                round(float(np.quantile(nearest_similarity_values, 0.75)), 4)
+                if len(nearest_similarity_values) else None
+            ),
         },
         "final_identity_profiles": final_identity_profiles,
         "raw_speaker_profiles": {
@@ -1807,8 +2294,25 @@ def run_temporal_constrained_clustering(segments):
     ) = _build_acoustic_turns(windows, boundaries)
     if len(turns) < 2:
         return False
+    # Only a hard acoustic boundary is a true cannot-link. A soft boundary is
+    # retained as graded evidence for reconciliation; treating it as absolute
+    # here was the main source of one-speaker-per-sentence fragmentation.
+    legal_seed_similarities = {
+        (left, right): float(
+            turns[left]["embedding"] @ turns[right]["embedding"]
+        )
+        for left in range(len(turns))
+        for right in range(left + 1, len(turns))
+        if (left, right) not in hard_cannot_links
+    }
+    raw_seed_threshold = _adaptive_identity_thresholds(
+        legal_seed_similarities, len(turns)
+    )["seed"]
     raw_clusters = _constrained_turn_clusters(
-        turns, hard_cannot_links | soft_cannot_links
+        turns,
+        hard_cannot_links,
+        soft_links=soft_cannot_links,
+        seed_threshold=raw_seed_threshold,
     )
     raw_clusters.sort(
         key=lambda cluster: min(turns[index]["start"] for index in cluster)
@@ -1938,10 +2442,23 @@ def run_temporal_constrained_clustering(segments):
         f"软约束 {len(soft_cannot_links)}, 可靠话轮 {diagnostics['reliable_turn_count']}）。"
     )
     print(
-        f"   全局身份阈值: prototype={diagnostics['prototype_similarity_threshold']:.3f}, "
-        f"short={diagnostics['short_turn_assignment_threshold']:.3f}, "
+        f"   自适应身份阈值: seed={diagnostics['seed_similarity_threshold']:.3f}, "
+        f"reconnect={diagnostics['prototype_similarity_threshold']:.3f}, "
+        f"assignment={diagnostics['short_turn_assignment_threshold']:.3f}, "
         f"sentence={diagnostics['sentence_continuity_threshold']:.3f}"
     )
+    diagnostics["raw_core_similarity_threshold"] = round(
+        raw_seed_threshold, 4
+    )
+    diagnostics["raw_core_soft_boundary_penalty"] = 0.06
+    if diagnostics["fragmentation_retry_triggered"]:
+        print(
+            "   🔎 碎片化复审已触发: "
+            f"score={diagnostics['fragmentation_score']:.3f}, "
+            f"speaker {diagnostics['first_pass_speaker_count']} -> "
+            f"{diagnostics['second_pass_speaker_count']}, "
+            f"merges={diagnostics['fragmentation_retry_merges']}"
+        )
     if diagnostics["identity_merges"]:
         for item in diagnostics["identity_merges"]:
             print(
