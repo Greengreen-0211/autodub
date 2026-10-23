@@ -699,13 +699,18 @@ def _select_change_boundaries(candidates, windows):
     return selected, thresholds
 
 
-def _add_structural_sentence_boundaries(selected, timestamp_candidates):
+def _add_structural_sentence_boundaries(
+    selected, timestamp_candidates, windows
+):
     """Partition long ASR chunks at reliable sentence ends.
 
     A structural partition creates a cleaner acoustic turn but remains a soft
     constraint: it does not by itself claim that the speaker changed.
     """
     combined = list(selected)
+    regions = sorted(
+        set(item["region"] for item in windows), key=lambda item: item[1]
+    )
     for candidate in timestamp_candidates:
         if (
             candidate.get("punctuation") != "strong"
@@ -718,7 +723,11 @@ def _add_structural_sentence_boundaries(selected, timestamp_candidates):
             for item in combined
         ):
             continue
+        location = _boundary_location(regions, float(candidate["time"]))
+        if location is None:
+            continue
         structural = dict(candidate)
+        structural.update(location)
         structural.update({
             "constraint": "soft",
             "candidate_source": "sentence_partition",
@@ -1531,7 +1540,7 @@ def run_temporal_constrained_clustering(segments):
     candidates = timestamp_candidates + acoustic_candidates
     boundaries, thresholds = _select_change_boundaries(candidates, windows)
     boundaries = _add_structural_sentence_boundaries(
-        boundaries, timestamp_candidates
+        boundaries, timestamp_candidates, windows
     )
     if not boundaries:
         return False

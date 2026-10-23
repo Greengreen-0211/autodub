@@ -162,10 +162,18 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
             "timestamp_reliable": True,
             "score": 0.20,
         }
-        boundaries = _add_structural_sentence_boundaries([], [candidate])
+        windows = [{
+            "region": ("input", 0.0, 8.0),
+            "center": center,
+        } for center in (1.0, 3.0, 5.0, 7.0)]
+        boundaries = _add_structural_sentence_boundaries(
+            [], [candidate], windows
+        )
         self.assertEqual(len(boundaries), 1)
         self.assertEqual(boundaries[0]["constraint"], "soft")
         self.assertEqual(boundaries[0]["candidate_source"], "sentence_partition")
+        self.assertEqual(boundaries[0]["region"], ("input", 0.0, 8.0))
+        self.assertIsNone(boundaries[0]["between_regions"])
 
     def test_moderate_similarity_cannot_erase_soft_acoustic_boundary(self):
         other = np.asarray([0.645, np.sqrt(1.0 - 0.645 ** 2)])
