@@ -874,6 +874,93 @@ def persistent_ocr_overlay_texts(
     return persistent
 
 
+def filter_unsupported_recovered_micro_segments(
+    segments: Sequence[Mapping[str, Any]],
+    frame_records: Sequence[Mapping[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Quarantine unsupported one-character recovery transcripts.
+
+    Coverage retry runs the same ASR model over two audio views. Exact
+    agreement is useful, but for a one-Han-character fragment both views can
+    repeat the same hallucination. Such a fragment is kept only when stable
+    OCR independently supports it inside the same interval.
+
+    Primary ASR is deliberately outside this gate, so genuine short replies
+    and interjections are not removed merely because they are one character.
+    """
+    from asr_recovery import _ocr_lines, normalize_text
+
+    observations: Dict[str, List[float]] = {}
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        for line in _ocr_lines(str(record.get("text") or "")):
+            key = normalize_text(line)
+            if key:
+                observations.setdefault(key, []).append(timestamp)
+
+    kept: List[Dict[str, Any]] = []
+    quarantined: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    recovery_prefixes = ("coverage_retry_", "primary_alignment_repair_")
+    for raw_segment in segments:
+        segment = dict(raw_segment)
+        origin = str(segment.get("asr_origin") or "")
+        text = str(segment.get("text") or "").strip()
+        key = normalize_text(text)
+        is_recovery = origin.startswith(recovery_prefixes)
+        is_single_han = bool(
+            len(key) == 1 and re.fullmatch(r"[\u3400-\u9fff]", key)
+        )
+        if not (is_recovery and is_single_han):
+            kept.append(segment)
+            continue
+
+        start = float(segment.get("start", 0.0))
+        end = float(segment.get("end", start))
+        support = sorted({
+            round(timestamp, 3)
+            for timestamp in observations.get(key, [])
+            if start - 0.35 <= timestamp <= end + 0.35
+        })
+        accepted = len(support) >= 2
+        decision = {
+            "segment_id": segment.get("id"),
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": text,
+            "asr_origin": origin,
+            "accepted": accepted,
+            "ocr_frame_support": len(support),
+            "ocr_timestamps": support,
+            "reason": (
+                "stable_matching_ocr_support"
+                if accepted
+                else "single_character_recovery_without_independent_support"
+            ),
+        }
+        audit.append(decision)
+        if accepted:
+            segment["recovery_micro_fragment_audit"] = decision
+            kept.append(segment)
+            continue
+        quarantined.append({
+            "id": f"recovery-micro-{segment.get('id', len(quarantined))}",
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "original_text": text,
+            "dialogue_evidence": False,
+            "acoustic_candidate": True,
+            "asr_recovery_status": "unresolved_uncertain",
+            "candidate_kind": "unsupported_recovered_micro_fragment",
+            "reason": [decision["reason"]],
+            "preserve_original_vocal": False,
+        })
+    return kept, quarantined, audit
+
+
 def _recover_deferred_from_ocr(
     deferred_regions: Sequence[Dict[str, Any]],
     frame_records: Dict[str, List[Dict[str, Any]]],
@@ -936,24 +1023,6 @@ def _recover_deferred_from_ocr(
         region_recovered: List[Dict[str, Any]] = []
         for event_index, event in enumerate(events):
             text = str(event["text"])
-            # One unpunctuated OCR line over an acoustic-only gap is
-            # indistinguishable from a transient watermark or UI caption.
-            # Dynamic subtitle changes, terminal punctuation, or upstream
-            # textual dialogue evidence are required before OCR may create a
-            # spoken segment on its own.
-            independently_subtitle_like = bool(
-                re.search(r"[.!?。！？]\s*$", text)
-                or len(events) > 1
-                or region.get("dialogue_evidence")
-            )
-            if not independently_subtitle_like:
-                rejected_events.append({
-                    "text": text,
-                    "start": event["start"],
-                    "end": event["end"],
-                    "reason": "single_unpunctuated_ocr_without_text_evidence",
-                })
-                continue
             timing = ocr_recovery_timing_plausibility(
                 text, float(event["start"]), float(event["end"])
             )
@@ -964,6 +1033,32 @@ def _recover_deferred_from_ocr(
                     "end": event["end"],
                     **timing,
                     "reason": "ocr_text_duration_implausible",
+                })
+                continue
+            # OCR punctuation is generated by OCR itself, so it cannot prove
+            # that a visible string is spoken dialogue.  For an acoustic-only
+            # gap, require either changing subtitle events or independently
+            # strong vocal evidence.  Single-character OCR-only text remains
+            # retry evidence but is never promoted directly.
+            upstream_text_evidence = bool(region.get("dialogue_evidence"))
+            dynamic_subtitle_sequence = len(events) > 1
+            strong_vocal_support = bool(
+                region.get("acoustic_candidate")
+                and float(region.get("acoustic_dialogue_score") or 0.0) >= 0.55
+                and int(event.get("frame_count") or 0) >= 2
+                and int(timing.get("lexical_count") or 0) >= 2
+            )
+            if not (
+                upstream_text_evidence
+                or dynamic_subtitle_sequence
+                or strong_vocal_support
+            ):
+                rejected_events.append({
+                    "text": text,
+                    "start": event["start"],
+                    "end": event["end"],
+                    **timing,
+                    "reason": "ocr_only_text_without_independent_vocal_evidence",
                 })
                 continue
             seed = {
@@ -1322,6 +1417,21 @@ def run_step_1b_optimized(
                 "多帧稳定的人名拼写修复。"
             )
 
+    # Run after every text recovery/correction, but before Step 1 becomes the
+    # timing skeleton for diarization. This catches short retry-ASR
+    # hallucinations without changing primary ASR behavior.
+    segments, quarantined_micro_regions, micro_fragment_audit = (
+        filter_unsupported_recovered_micro_segments(segments, all_frame_records)
+    )
+    if quarantined_micro_regions:
+        remaining_deferred = [*remaining_deferred, *quarantined_micro_regions]
+        for index, segment in enumerate(segments):
+            segment["id"] = index
+        print(
+            f"⚠️ 恢复短片段验收: {len(quarantined_micro_regions)} 个"
+            "无独立证据的单字恢复结果已转入不确定审计。"
+        )
+
     from speech_activity import attach_coarse_tts_placement, detect_speech_regions
 
     recovery_timing_audit: List[Dict[str, Any]] = []
@@ -1378,6 +1488,7 @@ def run_step_1b_optimized(
         "asr_ocr_recovery_report": ocr_recovery_audit,
         "asr_boundary_repair_report": boundary_repair_audit,
         "asr_ocr_entity_correction_report": entity_correction_audit,
+        "asr_recovery_micro_fragment_report": micro_fragment_audit,
         "asr_recovery_timing_report": recovery_timing_audit,
         "asr_recovery_report": combined_recovery_report,
         "asr_unresolved_dialogue_regions": blocking_regions,

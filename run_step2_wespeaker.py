@@ -73,10 +73,10 @@ BOUNDARY_GUARD_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_GUARD_SECONDS", 0.3)
 BOUNDARY_MIN_TURN_SECONDS = _env_float("AUTODUB_DIAR_MIN_TURN_SECONDS", 0.8)
 BOUNDARY_NMS_SECONDS = _env_float("AUTODUB_DIAR_BOUNDARY_NMS_SECONDS", 1.15)
 BOUNDARY_SCORE_OVERRIDE = os.getenv("AUTODUB_DIAR_BOUNDARY_SCORE")
-STRONG_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_STRONG_SIMILARITY", 0.52)
+STRONG_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_STRONG_SIMILARITY", 0.68)
 WEAK_SPEAKER_SIMILARITY = _env_float("AUTODUB_DIAR_WEAK_SIMILARITY", 0.36)
 PROTOTYPE_MERGE_SIMILARITY = _env_float(
-    "AUTODUB_DIAR_PROTOTYPE_MERGE_SIMILARITY", 0.48
+    "AUTODUB_DIAR_PROTOTYPE_MERGE_SIMILARITY", 0.60
 )
 LOW_QUALITY_ASSIGN_SIMILARITY = _env_float(
     "AUTODUB_DIAR_LOW_QUALITY_ASSIGN_SIMILARITY", 0.36
@@ -110,6 +110,9 @@ SINGLE_TURN_PROTOTYPE_SIMILARITY = _env_float(
 )
 SOFT_BOUNDARY_MERGE_SIMILARITY = _env_float(
     "AUTODUB_DIAR_SOFT_BOUNDARY_MERGE_SIMILARITY", 0.76
+)
+STRUCTURAL_SOFT_CHANGE_MIN = _env_float(
+    "AUTODUB_DIAR_STRUCTURAL_SOFT_CHANGE_MIN", 0.44
 )
 RELIABLE_TURN_MIN_SECONDS = _env_float(
     "AUTODUB_DIAR_RELIABLE_TURN_MIN_SECONDS", 1.8
@@ -704,8 +707,9 @@ def _add_structural_sentence_boundaries(
 ):
     """Partition long ASR chunks at reliable sentence ends.
 
-    A structural partition creates a cleaner acoustic turn but remains a soft
-    constraint: it does not by itself claim that the speaker changed.
+    A structural partition always creates a cleaner acoustic turn.  It becomes
+    a soft identity constraint only when the local embedding change is also
+    meaningful; otherwise it is partition-only and makes no speaker claim.
     """
     combined = list(selected)
     regions = sorted(
@@ -729,7 +733,12 @@ def _add_structural_sentence_boundaries(
         structural = dict(candidate)
         structural.update(location)
         structural.update({
-            "constraint": "soft",
+            "constraint": (
+                "soft"
+                if float(candidate.get("score", 0.0))
+                >= STRUCTURAL_SOFT_CHANGE_MIN
+                else "partition"
+            ),
             "candidate_source": "sentence_partition",
             "hard_evidence": False,
             "structural_partition": True,
@@ -829,7 +838,7 @@ def _build_acoustic_turns(windows, boundaries):
             edge = (min(left, right), max(left, right))
             if boundary.get("constraint") == "hard":
                 hard_cannot_links.add(edge)
-            else:
+            elif boundary.get("constraint") == "soft":
                 soft_cannot_links.add(edge)
             boundary_evidence[edge] = boundary
         turns_by_region[region] = region_turns
@@ -845,7 +854,7 @@ def _build_acoustic_turns(windows, boundaries):
             edge = (min(left, right), max(left, right))
             if item.get("constraint") == "hard":
                 hard_cannot_links.add(edge)
-            else:
+            elif item.get("constraint") == "soft":
                 soft_cannot_links.add(edge)
             boundary_evidence[edge] = item
     return turns, hard_cannot_links, soft_cannot_links, boundary_evidence
@@ -1045,73 +1054,63 @@ def _merge_clusters(clusters, left_index, right_index):
 
 
 def _constrained_turn_clusters(turns, cannot_links):
-    clusters = [{index} for index in range(len(turns))]
+    """Build conservative speaker cores from pure acoustic turns.
 
-    # First join only high-confidence identities in the original 256-D space.
+    Earlier code greedily merged at a low centroid threshold and then colored
+    the remaining conflict graph.  Graph coloring minimizes label count, so
+    acoustically similar voices could collapse to two alternating identities.
+    Here a merge must be mutual-nearest and supported by the distribution of
+    all cross-turn similarities.  Uncertain turns remain separate for the
+    later audited assignment phase instead of being forced into a color.
+    """
+    clusters = [{index} for index in range(len(turns))]
     while True:
-        centroids = [_cluster_centroid(cluster, turns) for cluster in clusters]
-        best = None
+        eligible = {}
+        rankings = defaultdict(list)
         for left in range(len(clusters)):
             for right in range(left + 1, len(clusters)):
                 if _clusters_conflict(clusters[left], clusters[right], cannot_links):
                     continue
-                similarity = float(centroids[left] @ centroids[right])
-                if similarity < STRONG_SPEAKER_SIMILARITY:
+                evidence = _cluster_pair_evidence(
+                    clusters[left], clusters[right], turns
+                )
+                reliable_pair = bool(
+                    any(turns[index].get("embedding_reliable") for index in clusters[left])
+                    and any(turns[index].get("embedding_reliable") for index in clusters[right])
+                )
+                threshold = (
+                    STRONG_SPEAKER_SIMILARITY
+                    if reliable_pair
+                    else max(0.74, STRONG_SPEAKER_SIMILARITY)
+                )
+                if not _robust_identity_match(
+                    evidence, threshold, anchor_pair=True
+                ):
                     continue
-                if best is None or similarity > best[0]:
-                    best = (similarity, left, right)
-        if best is None:
+                robust_score = min(
+                    evidence["centroid"],
+                    evidence["median"],
+                    evidence["q25"],
+                )
+                eligible[(left, right)] = (robust_score, evidence, threshold)
+                rankings[left].append((robust_score, right))
+                rankings[right].append((robust_score, left))
+        if not eligible:
             break
-        clusters = _merge_clusters(clusters, best[1], best[2])
-
-    # Preserve the existing turn labels for RTTM generation.  These labels
-    # retain every accepted local change so sentence alignment stays stable.
-    centroids = [_cluster_centroid(cluster, turns) for cluster in clusters]
-    conflicts = [set() for _ in clusters]
-    for left in range(len(clusters)):
-        for right in range(left + 1, len(clusters)):
-            similarity = float(centroids[left] @ centroids[right])
+        for values in rankings.values():
+            values.sort(reverse=True)
+        mutual = []
+        for (left, right), (score, evidence, threshold) in eligible.items():
             if (
-                _clusters_conflict(clusters[left], clusters[right], cannot_links)
-                or similarity < WEAK_SPEAKER_SIMILARITY
+                rankings[left][0][1] == right
+                and rankings[right][0][1] == left
             ):
-                conflicts[left].add(right)
-                conflicts[right].add(left)
-
-    colors = {}
-    while len(colors) < len(clusters):
-        uncolored = [index for index in range(len(clusters)) if index not in colors]
-
-        def priority(index):
-            neighbor_colors = {colors[item] for item in conflicts[index] if item in colors}
-            duration = sum(turns[item]["duration"] for item in clusters[index])
-            return (len(neighbor_colors), len(conflicts[index]), duration)
-
-        node = max(uncolored, key=priority)
-        used = sorted(set(colors.values()))
-        available = [
-            color for color in used
-            if all(
-                other not in conflicts[node]
-                for other, other_color in colors.items()
-                if other_color == color
-            )
-        ]
-        if available:
-            def color_similarity(color):
-                members = [index for index, value in colors.items() if value == color]
-                return float(np.mean([
-                    centroids[node] @ centroids[index] for index in members
-                ]))
-
-            colors[node] = max(available, key=color_similarity)
-        else:
-            colors[node] = max(used, default=-1) + 1
-
-    grouped = defaultdict(set)
-    for node, color in colors.items():
-        grouped[color].update(clusters[node])
-    return list(grouped.values())
+                mutual.append((score, left, right, evidence, threshold))
+        if not mutual:
+            break
+        _, left, right, _, _ = max(mutual, key=lambda item: item[0])
+        clusters = _merge_clusters(clusters, left, right)
+    return clusters
 
 
 def _reconcile_turn_clusters(
@@ -1488,7 +1487,7 @@ def _reconcile_turn_clusters(
 
     reliable_turns = sum(bool(turn.get("embedding_reliable")) for turn in turns)
     diagnostics = {
-        "algorithm": "prototype_identity_clustering_v2",
+        "algorithm": "conservative_mutual_core_clustering_v3",
         "turn_count": len(turns),
         "raw_speaker_count": len(raw_clusters),
         "speaker_count": len(identity_clusters),
@@ -1507,6 +1506,9 @@ def _reconcile_turn_clusters(
         "short_turn_assignment_threshold": round(assignment_threshold, 4),
         "sentence_continuity_threshold": round(
             SENTENCE_CONTINUITY_SIMILARITY, 4
+        ),
+        "raw_core_similarity_threshold": round(
+            STRONG_SPEAKER_SIMILARITY, 4
         ),
         "identity_candidates": identity_candidates,
         "raw_speaker_profiles": {
@@ -1647,6 +1649,30 @@ def run_temporal_constrained_clustering(segments):
             "speaker": f"SPEAKER_{final_turn_labels[index]:02d}",
         }
         for index, turn in enumerate(turns)
+    ]
+    diagnostics["boundary_counts"] = {
+        "partition": sum(
+            item.get("constraint") == "partition" for item in boundaries
+        ),
+        "soft": sum(item.get("constraint") == "soft" for item in boundaries),
+        "hard": sum(item.get("constraint") == "hard" for item in boundaries),
+    }
+    diagnostics["turn_pair_similarity"] = [
+        {
+            "left_turn": left,
+            "right_turn": right,
+            **{
+                key: round(float(value), 4)
+                if key != "pair_count" else int(value)
+                for key, value in _cluster_pair_evidence(
+                    {left}, {right}, turns
+                ).items()
+            },
+            "hard_conflict": (left, right) in hard_cannot_links,
+            "soft_conflict": (left, right) in soft_cannot_links,
+        }
+        for left in range(len(turns))
+        for right in range(left + 1, len(turns))
     ]
     diagnostics["boundaries"] = [
         {

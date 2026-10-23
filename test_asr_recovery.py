@@ -27,6 +27,7 @@ from ocr_v211_integration import (
     _partition_deferred_regions,
     _recover_deferred_from_ocr,
     apply_stable_bilingual_entity_corrections,
+    filter_unsupported_recovered_micro_segments,
     ocr_recovery_timing_plausibility,
     persistent_ocr_overlay_texts,
     preserve_speaker_timing_skeleton,
@@ -101,6 +102,79 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertEqual(recovered, [])
         self.assertEqual(remaining[0]["asr_recovery_status"], "unresolved_uncertain")
         self.assertEqual(audit[0]["status"], "rejected_unverified_ocr_text")
+
+    def test_unverified_single_han_retry_is_quarantined_not_spoken(self):
+        segments = [{
+            "id": 6,
+            "start": 20.27,
+            "end": 20.97,
+            "text": "是。",
+            "asr_origin": "coverage_retry_cross_source_consensus",
+            "asr_recovery_status": "accepted_precise",
+        }]
+        kept, uncertain, audit = filter_unsupported_recovered_micro_segments(
+            segments, []
+        )
+        self.assertEqual(kept, [])
+        self.assertEqual(len(uncertain), 1)
+        self.assertEqual(uncertain[0]["asr_recovery_status"], "unresolved_uncertain")
+        self.assertFalse(audit[0]["accepted"])
+
+    def test_primary_single_han_reply_is_never_filtered(self):
+        segments = [{
+            "id": 1,
+            "start": 1.0,
+            "end": 1.5,
+            "text": "好。",
+            "asr_origin": "primary",
+            "asr_recovery_status": "primary",
+        }]
+        kept, uncertain, audit = filter_unsupported_recovered_micro_segments(
+            segments, []
+        )
+        self.assertEqual(kept, segments)
+        self.assertEqual(uncertain, [])
+        self.assertEqual(audit, [])
+
+    def test_stable_matching_ocr_can_confirm_single_han_retry(self):
+        segments = [{
+            "id": 1,
+            "start": 1.0,
+            "end": 1.8,
+            "text": "好。",
+            "asr_origin": "coverage_retry_cross_source_consensus",
+        }]
+        records = [
+            {"timestamp": 1.2, "text": "好。"},
+            {"timestamp": 1.5, "text": "好。"},
+        ]
+        kept, uncertain, audit = filter_unsupported_recovered_micro_segments(
+            segments, records
+        )
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(uncertain, [])
+        self.assertTrue(audit[0]["accepted"])
+
+    def test_ocr_generated_punctuation_does_not_admit_single_character_text(self):
+        regions = [{
+            "id": "punctuated-artifact",
+            "start": 20.27,
+            "end": 20.97,
+            "acoustic_candidate": True,
+            "acoustic_dialogue_score": 0.70,
+            "dialogue_evidence": False,
+        }]
+        records = {"punctuated-artifact": [
+            {"timestamp": 20.30, "text": "是。"},
+            {"timestamp": 20.60, "text": "是。"},
+        ]}
+        recovered, remaining, audit = _recover_deferred_from_ocr(
+            regions, records, "zh"
+        )
+        self.assertEqual(recovered, [])
+        self.assertEqual(remaining[0]["asr_recovery_status"], "unresolved_uncertain")
+        # Single-character OCR is discarded before event admission.
+        self.assertEqual(audit[0]["status"], "deferred")
 
     def test_coarse_tts_placement_uses_acoustic_onset_without_moving_bounds(self):
         segment = {

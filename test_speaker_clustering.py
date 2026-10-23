@@ -11,6 +11,7 @@ from run_step2_wespeaker import (
     _centroid_for_centers,
     _cluster_centroid,
     _cluster_pair_evidence,
+    _constrained_turn_clusters,
     _robust_identity_match,
     _reconcile_turn_clusters,
     _select_change_boundaries,
@@ -170,10 +171,85 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
             [], [candidate], windows
         )
         self.assertEqual(len(boundaries), 1)
-        self.assertEqual(boundaries[0]["constraint"], "soft")
+        self.assertEqual(boundaries[0]["constraint"], "partition")
         self.assertEqual(boundaries[0]["candidate_source"], "sentence_partition")
         self.assertEqual(boundaries[0]["region"], ("input", 0.0, 8.0))
         self.assertIsNone(boundaries[0]["between_regions"])
+
+    def test_structural_boundary_with_clear_change_remains_soft_constraint(self):
+        candidate = {
+            "time": 4.0,
+            "punctuation": "strong",
+            "timestamp_reliable": True,
+            "score": 0.48,
+        }
+        windows = [{
+            "region": ("input", 0.0, 8.0),
+            "center": center,
+        } for center in (1.0, 3.0, 5.0, 7.0)]
+        boundaries = _add_structural_sentence_boundaries(
+            [], [candidate], windows
+        )
+        self.assertEqual(boundaries[0]["constraint"], "soft")
+
+    def test_raw_core_clustering_does_not_merge_moderately_similar_voices(self):
+        other = np.asarray([0.645, np.sqrt(1.0 - 0.645 ** 2)])
+        turns = [
+            {"embedding": np.asarray([1.0, 0.0]), "duration": 3.0,
+             "embedding_reliable": True, "embedding_quality": 0.9},
+            {"embedding": other, "duration": 3.0,
+             "embedding_reliable": True, "embedding_quality": 0.9},
+        ]
+        clusters = _constrained_turn_clusters(turns, set())
+        self.assertEqual(len(clusters), 2)
+
+    def test_raw_core_clustering_merges_strong_mutual_voice_match(self):
+        other = np.asarray([0.95, np.sqrt(1.0 - 0.95 ** 2)])
+        turns = [
+            {"embedding": np.asarray([1.0, 0.0]), "duration": 3.0,
+             "embedding_reliable": True, "embedding_quality": 0.9},
+            {"embedding": other, "duration": 3.0,
+             "embedding_reliable": True, "embedding_quality": 0.9},
+        ]
+        clusters = _constrained_turn_clusters(turns, set())
+        self.assertEqual(len(clusters), 1)
+
+    def test_three_voice_sequence_is_not_forced_into_two_labels(self):
+        voice_a = np.asarray([1.0, 0.0, 0.0])
+        voice_b = np.asarray([0.58, np.sqrt(1.0 - 0.58 ** 2), 0.0])
+        voice_c = np.asarray([0.62, 0.0, np.sqrt(1.0 - 0.62 ** 2)])
+        embeddings = [
+            voice_a, voice_b, voice_a,
+            voice_c, voice_c, voice_c,
+            voice_a, voice_b, voice_a,
+        ]
+        turns = [
+            {
+                "start": float(index * 3),
+                "end": float(index * 3 + 2.5),
+                "duration": 2.5,
+                "embedding": embedding,
+                "embedding_reliable": True,
+                "embedding_quality": 0.9,
+            }
+            for index, embedding in enumerate(embeddings)
+        ]
+        raw = _constrained_turn_clusters(turns, {(2, 3)})
+        raw.sort(key=lambda cluster: min(cluster))
+        identities, _, diagnostics = _reconcile_turn_clusters(
+            raw,
+            turns,
+            set(),
+            {(2, 3)},
+            {(2, 3): {
+                "same_asr_segment": True,
+                "constraint": "soft",
+                "punctuation": "strong",
+            }},
+        )
+        self.assertEqual(len(raw), 3)
+        self.assertEqual(len(identities), 3)
+        self.assertEqual(diagnostics["identity_merges"], [])
 
     def test_moderate_similarity_cannot_erase_soft_acoustic_boundary(self):
         other = np.asarray([0.645, np.sqrt(1.0 - 0.645 ** 2)])
