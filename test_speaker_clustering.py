@@ -15,6 +15,7 @@ from run_step2_wespeaker import (
     _constrained_turn_clusters,
     _adaptive_identity_thresholds,
     _merge_preserves_identity,
+    _pair_evidence_diagnostics,
     _robust_identity_match,
     _reconcile_turn_clusters,
     _select_change_boundaries,
@@ -261,6 +262,14 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertEqual(
             _combined_merge_penalty(0.20, 0.08), 0.10
         )
+
+    def test_pair_evidence_diagnostics_omits_internal_vector_state(self):
+        report = _pair_evidence_diagnostics({
+            "centroid": 0.81234,
+            "pair_count": 2,
+            "_directional_support": np.asarray([0.8, 0.9]),
+        })
+        self.assertEqual(report, {"centroid": 0.8123, "pair_count": 2})
 
     def test_multi_prototype_identity_accepts_two_supported_voice_states(self):
         voice_a = np.asarray([1.0, 0.0])

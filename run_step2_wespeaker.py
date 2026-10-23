@@ -952,7 +952,7 @@ def _cluster_pair_evidence(left, right, turns):
             "minimum": centroid,
             "support_median": centroid,
             "support_q25": centroid,
-            "directional_support": np.asarray([centroid], dtype=float),
+            "_directional_support": np.asarray([centroid], dtype=float),
             "pair_count": 0,
         }
     left_support = np.max(matrix, axis=1)
@@ -968,7 +968,7 @@ def _cluster_pair_evidence(left, right, turns):
         # being rejected merely because every cross-pair is not similar.
         "support_median": float(np.median(directional_support)),
         "support_q25": float(np.quantile(directional_support, 0.25)),
-        "directional_support": directional_support,
+        "_directional_support": directional_support,
         "pair_count": int(len(values)),
     }
 
@@ -977,7 +977,7 @@ def _robust_identity_match(evidence, threshold, *, anchor_pair):
     """Require broad turn-level support before merging established voices."""
     centroid_ok = evidence["centroid"] >= threshold
     directional_support = np.asarray(
-        evidence.get("directional_support", []), dtype=float
+        evidence.get("_directional_support", []), dtype=float
     )
     support_floor = threshold - 0.03
     support_coverage = (
@@ -1381,6 +1381,19 @@ def _combined_merge_penalty(*values):
     """Combine uncertainty without stacking several weak signals to 0.78."""
     usable = [max(0.0, float(value)) for value in values if value is not None]
     return min(MAX_COMBINED_MERGE_PENALTY, max(usable, default=0.0))
+
+
+def _pair_evidence_diagnostics(evidence):
+    """Keep report fields JSON-safe while hiding internal vector evidence."""
+    result = {}
+    for key, value in evidence.items():
+        if key.startswith("_"):
+            continue
+        if key == "pair_count":
+            result[key] = int(value)
+        elif np.isscalar(value):
+            result[key] = round(float(value), 4)
+    return result
 
 
 def _merge_clusters(clusters, left_index, right_index):
@@ -2394,13 +2407,9 @@ def run_temporal_constrained_clustering(segments):
         {
             "left_turn": left,
             "right_turn": right,
-            **{
-                key: round(float(value), 4)
-                if key != "pair_count" else int(value)
-                for key, value in _cluster_pair_evidence(
-                    {left}, {right}, turns
-                ).items()
-            },
+            **_pair_evidence_diagnostics(_cluster_pair_evidence(
+                {left}, {right}, turns
+            )),
             "hard_conflict": (left, right) in hard_cannot_links,
             "soft_conflict": (left, right) in soft_cannot_links,
         }
