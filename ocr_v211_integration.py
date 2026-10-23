@@ -833,11 +833,53 @@ def ocr_recovery_timing_plausibility(
     }
 
 
+def persistent_ocr_overlay_texts(
+    frame_records: Sequence[Mapping[str, Any]],
+) -> List[str]:
+    """Find globally repeated static overlays that are not dialogue subtitles."""
+    from asr_recovery import _ocr_lines, normalize_text
+
+    observations: Dict[str, Dict[str, Any]] = {}
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        segment_id = str(record.get("segment_id") or "")
+        for line in _ocr_lines(str(record.get("text") or "")):
+            key = normalize_text(line)
+            if len(key) < 2:
+                continue
+            item = observations.setdefault(key, {
+                "text": line,
+                "timestamps": set(),
+                "segment_ids": set(),
+            })
+            item["timestamps"].add(round(timestamp, 3))
+            if segment_id:
+                item["segment_ids"].add(segment_id)
+
+    persistent = []
+    for item in observations.values():
+        timestamps = sorted(item["timestamps"])
+        if len(timestamps) < 3:
+            continue
+        span = timestamps[-1] - timestamps[0]
+        independent_regions = len(item["segment_ids"])
+        if (
+            independent_regions >= 3 and span >= 5.0
+            or independent_regions >= 2 and len(timestamps) >= 5 and span >= 8.0
+        ):
+            persistent.append(str(item["text"]))
+    return persistent
+
+
 def _recover_deferred_from_ocr(
     deferred_regions: Sequence[Dict[str, Any]],
     frame_records: Dict[str, List[Dict[str, Any]]],
     source_language: str,
     known_segments: Sequence[Dict[str, Any]] = (),
+    persistent_overlay_texts: Sequence[str] = (),
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Promote stable ordered subtitle events to coarse ASR segments."""
     from asr_recovery import coarse_segment, ocr_source_events
@@ -861,7 +903,7 @@ def _recover_deferred_from_ocr(
             source_language,
             region_start=float(region["start"]),
             region_end=float(region["end"]),
-            exclude_texts=known_neighbor_texts,
+            exclude_texts=[*known_neighbor_texts, *persistent_overlay_texts],
         )
         record = {
             "id": region_id,
@@ -894,6 +936,24 @@ def _recover_deferred_from_ocr(
         region_recovered: List[Dict[str, Any]] = []
         for event_index, event in enumerate(events):
             text = str(event["text"])
+            # One unpunctuated OCR line over an acoustic-only gap is
+            # indistinguishable from a transient watermark or UI caption.
+            # Dynamic subtitle changes, terminal punctuation, or upstream
+            # textual dialogue evidence are required before OCR may create a
+            # spoken segment on its own.
+            independently_subtitle_like = bool(
+                re.search(r"[.!?。！？]\s*$", text)
+                or len(events) > 1
+                or region.get("dialogue_evidence")
+            )
+            if not independently_subtitle_like:
+                rejected_events.append({
+                    "text": text,
+                    "start": event["start"],
+                    "end": event["end"],
+                    "reason": "single_unpunctuated_ocr_without_text_evidence",
+                })
+                continue
             timing = ocr_recovery_timing_plausibility(
                 text, float(event["start"]), float(event["end"])
             )
@@ -942,14 +1002,26 @@ def _recover_deferred_from_ocr(
         if rejected_events:
             record["rejected_events"] = rejected_events
         if not event_records:
+            confirmed_dialogue = bool(region.get("dialogue_evidence"))
+            rejection_reasons = sorted({
+                str(item.get("reason") or "ocr_event_rejected")
+                for item in rejected_events
+            })
             remaining.append(dict(
                 region,
-                dialogue_evidence=True,
-                asr_recovery_status="unresolved_blocking",
-                ocr_recovery_rejection="ocr_text_duration_implausible",
+                dialogue_evidence=confirmed_dialogue,
+                asr_recovery_status=(
+                    "unresolved_blocking"
+                    if confirmed_dialogue else "unresolved_uncertain"
+                ),
+                ocr_recovery_rejection="+".join(rejection_reasons),
                 requires_contextual_asr_retry=True,
             ))
-            record["status"] = "rejected_implausible_timing"
+            record["status"] = (
+                "rejected_implausible_timing"
+                if rejection_reasons == ["ocr_text_duration_implausible"]
+                else "rejected_unverified_ocr_text"
+            )
         else:
             if rejected_events:
                 # A partially accepted parent is not fully covered.  Limit
@@ -1156,6 +1228,7 @@ def run_step_1b_optimized(
                 deferred_frame_records,
                 str(config.ocr_source_language or state.get("src_lang", "")),
                 segments,
+                persistent_ocr_overlay_texts(all_frame_records),
             )
         )
         if recovered_segments:

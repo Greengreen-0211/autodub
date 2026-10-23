@@ -6,6 +6,7 @@ except ImportError:  # pragma: no cover - production WeSpeaker env has numpy
     np = None
 
 from run_step2_wespeaker import (
+    _add_structural_sentence_boundaries,
     _acoustic_boundary_scores,
     _centroid_for_centers,
     _cluster_centroid,
@@ -152,7 +153,51 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
             "punctuation": "strong",
         }])
         self.assertIsNotNone(threshold)
-        self.assertGreaterEqual(threshold, 0.48)
+        self.assertGreaterEqual(threshold, 0.76)
+
+    def test_reliable_sentence_end_becomes_partition_without_claiming_hard_change(self):
+        candidate = {
+            "time": 4.0,
+            "punctuation": "strong",
+            "timestamp_reliable": True,
+            "score": 0.20,
+        }
+        boundaries = _add_structural_sentence_boundaries([], [candidate])
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0]["constraint"], "soft")
+        self.assertEqual(boundaries[0]["candidate_source"], "sentence_partition")
+
+    def test_moderate_similarity_cannot_erase_soft_acoustic_boundary(self):
+        other = np.asarray([0.645, np.sqrt(1.0 - 0.645 ** 2)])
+        turns = [
+            {"start": 0.0, "end": 2.0, "duration": 2.0,
+             "embedding": np.asarray([1.0, 0.0]), "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 2.0, "end": 4.0, "duration": 2.0,
+             "embedding": other, "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 6.0, "end": 8.0, "duration": 2.0,
+             "embedding": np.asarray([1.0, 0.0]), "embedding_reliable": True,
+             "embedding_quality": 0.9},
+            {"start": 8.0, "end": 10.0, "duration": 2.0,
+             "embedding": other, "embedding_reliable": True,
+             "embedding_quality": 0.9},
+        ]
+        boundary = {
+            "same_asr_segment": True,
+            "constraint": "soft",
+            "punctuation": "strong",
+        }
+        identities, mapping, diagnostics = _reconcile_turn_clusters(
+            [{0, 2}, {1, 3}],
+            turns,
+            set(),
+            {(0, 1)},
+            {(0, 1): boundary},
+        )
+        self.assertEqual(len(identities), 2)
+        self.assertNotEqual(mapping[0], mapping[1])
+        self.assertEqual(diagnostics["identity_merges"], [])
 
     def test_centroid_similarity_cannot_hide_cross_turn_disagreement(self):
         turns = [

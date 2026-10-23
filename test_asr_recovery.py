@@ -28,11 +28,30 @@ from ocr_v211_integration import (
     _recover_deferred_from_ocr,
     apply_stable_bilingual_entity_corrections,
     ocr_recovery_timing_plausibility,
+    persistent_ocr_overlay_texts,
     preserve_speaker_timing_skeleton,
 )
 
 
 class OCRTimelineTests(unittest.TestCase):
+    def test_persistent_text_across_distant_regions_is_overlay(self):
+        records = [
+            {"segment_id": "a", "timestamp": 1.0, "text": "没有毛绒绒"},
+            {"segment_id": "b", "timestamp": 8.0, "text": "没有毛绒绒"},
+            {"segment_id": "c", "timestamp": 16.0, "text": "没有毛绒绒"},
+        ]
+        self.assertEqual(
+            persistent_ocr_overlay_texts(records), ["没有毛绒绒"]
+        )
+
+    def test_repeated_local_subtitle_is_not_overlay(self):
+        records = [
+            {"segment_id": "a", "timestamp": 1.0, "text": "来吧"},
+            {"segment_id": "a", "timestamp": 1.2, "text": "来吧"},
+            {"segment_id": "a", "timestamp": 1.4, "text": "来吧"},
+        ]
+        self.assertEqual(persistent_ocr_overlay_texts(records), [])
+
     def test_ocr_text_rewrite_keeps_separate_speaker_timing_skeleton(self):
         source = {
             "text": "wrong word. Next line.",
@@ -63,6 +82,25 @@ class OCRTimelineTests(unittest.TestCase):
     def test_short_ocr_interjection_remains_possible(self):
         audit = ocr_recovery_timing_plausibility("来吧", 1.0, 1.30)
         self.assertTrue(audit["plausible"])
+
+    def test_single_unpunctuated_ocr_line_cannot_create_dialogue_from_energy(self):
+        regions = [{
+            "id": "acoustic-only",
+            "start": 20.27,
+            "end": 21.08,
+            "acoustic_candidate": True,
+            "dialogue_evidence": False,
+        }]
+        records = {"acoustic-only": [
+            {"timestamp": 20.30, "text": "没有毛绒绒"},
+            {"timestamp": 20.60, "text": "没有毛绒绒"},
+        ]}
+        recovered, remaining, audit = _recover_deferred_from_ocr(
+            regions, records, "zh"
+        )
+        self.assertEqual(recovered, [])
+        self.assertEqual(remaining[0]["asr_recovery_status"], "unresolved_uncertain")
+        self.assertEqual(audit[0]["status"], "rejected_unverified_ocr_text")
 
     def test_coarse_tts_placement_uses_acoustic_onset_without_moving_bounds(self):
         segment = {

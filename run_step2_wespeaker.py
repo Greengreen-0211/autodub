@@ -108,6 +108,9 @@ PROTOTYPE_ANCHOR_MIN_TURNS = _env_int(
 SINGLE_TURN_PROTOTYPE_SIMILARITY = _env_float(
     "AUTODUB_DIAR_SINGLE_TURN_PROTOTYPE_SIMILARITY", 0.82
 )
+SOFT_BOUNDARY_MERGE_SIMILARITY = _env_float(
+    "AUTODUB_DIAR_SOFT_BOUNDARY_MERGE_SIMILARITY", 0.76
+)
 RELIABLE_TURN_MIN_SECONDS = _env_float(
     "AUTODUB_DIAR_RELIABLE_TURN_MIN_SECONDS", 1.8
 )
@@ -696,6 +699,37 @@ def _select_change_boundaries(candidates, windows):
     return selected, thresholds
 
 
+def _add_structural_sentence_boundaries(selected, timestamp_candidates):
+    """Partition long ASR chunks at reliable sentence ends.
+
+    A structural partition creates a cleaner acoustic turn but remains a soft
+    constraint: it does not by itself claim that the speaker changed.
+    """
+    combined = list(selected)
+    for candidate in timestamp_candidates:
+        if (
+            candidate.get("punctuation") != "strong"
+            or not candidate.get("timestamp_reliable")
+        ):
+            continue
+        if any(
+            abs(float(item["time"]) - float(candidate["time"]))
+            < BOUNDARY_NMS_SECONDS
+            for item in combined
+        ):
+            continue
+        structural = dict(candidate)
+        structural.update({
+            "constraint": "soft",
+            "candidate_source": "sentence_partition",
+            "hard_evidence": False,
+            "structural_partition": True,
+        })
+        combined.append(structural)
+    combined.sort(key=lambda item: item["time"])
+    return combined
+
+
 def _build_acoustic_turns(windows, boundaries):
     by_region = defaultdict(list)
     for index, window in enumerate(windows):
@@ -880,12 +914,16 @@ def _soft_continuity_threshold(boundary_items):
     if not eligible:
         return None
     if any(item.get("punctuation", "none") != "strong" for item in eligible):
-        return SENTENCE_CONTINUITY_SIMILARITY
+        return max(
+            SENTENCE_CONTINUITY_SIMILARITY,
+            SOFT_BOUNDARY_MERGE_SIMILARITY,
+        )
     # Strong punctuation is a useful turn boundary but not proof of a new
     # identity.  It may be reconciled only with prototype-level similarity.
     return max(
         PROTOTYPE_MERGE_SIMILARITY,
         SENTENCE_CONTINUITY_SIMILARITY + 0.06,
+        SOFT_BOUNDARY_MERGE_SIMILARITY,
     )
 
 
@@ -1169,6 +1207,8 @@ def _reconcile_turn_clusters(
                 )
             else:
                 initial_decision = "no_reliable_prototype"
+            if soft_conflict and similarity < SOFT_BOUNDARY_MERGE_SIMILARITY:
+                initial_decision = "blocked_by_soft_boundary"
             identity_candidates.append({
                 "left_raw_speaker": f"SPEAKER_{left:02d}",
                 "right_raw_speaker": f"SPEAKER_{right:02d}",
@@ -1200,6 +1240,14 @@ def _reconcile_turn_clusters(
                 pair_evidence = _cluster_pair_evidence(
                     turn_groups[left], turn_groups[right], turns
                 )
+                if (
+                    _clusters_conflict(
+                        turn_groups[left], turn_groups[right], soft_cannot_links
+                    )
+                    and pair_evidence["centroid"]
+                    < SOFT_BOUNDARY_MERGE_SIMILARITY
+                ):
+                    continue
                 similarities[(left, right)] = pair_evidence["centroid"]
                 pair_evidence_by_pair[(left, right)] = pair_evidence
                 evidence_by_pair[(left, right)] = edge_evidence(
@@ -1482,8 +1530,14 @@ def run_temporal_constrained_clustering(segments):
     acoustic_candidates = _acoustic_boundary_scores(segments, windows)
     candidates = timestamp_candidates + acoustic_candidates
     boundaries, thresholds = _select_change_boundaries(candidates, windows)
+    boundaries = _add_structural_sentence_boundaries(
+        boundaries, timestamp_candidates
+    )
     if not boundaries:
         return False
+    structural_count = sum(
+        bool(item.get("structural_partition")) for item in boundaries
+    )
 
     threshold_values = list(thresholds.values())
     if threshold_values:
@@ -1497,11 +1551,16 @@ def run_temporal_constrained_clustering(segments):
     print(
         f"✅ 分区自适应换人阈值: {threshold_text}; "
         f"{len(timestamp_candidates)} 个词间候选 + "
-        f"{len(acoustic_candidates)} 个纯声学候选中保留 {len(boundaries)} 个。"
+        f"{len(acoustic_candidates)} 个纯声学候选中保留 "
+        f"{len(boundaries) - structural_count} 个声学换人边界 + "
+        f"{structural_count} 个句末结构分段。"
     )
     for item in boundaries:
+        boundary_label = (
+            "结构分段" if item.get("structural_partition") else "换人候选"
+        )
         print(
-            f"   换人候选 {item['time']:.3f}s: "
+            f"   {boundary_label} {item['time']:.3f}s: "
             f"change={item['score']:.3f}, gap={item['gap']:.3f}s, "
             f"punctuation={item.get('punctuation', 'none')}, "
             f"constraint={item.get('constraint', 'soft')}, "
@@ -1596,6 +1655,7 @@ def run_temporal_constrained_clustering(segments):
             "context_seconds": round(float(item.get("context_seconds", 0.0)), 3),
             "hard_evidence": bool(item.get("hard_evidence", False)),
             "candidate_source": item.get("candidate_source", "word_timestamp"),
+            "structural_partition": bool(item.get("structural_partition")),
         }
         for item in boundaries
     ]
