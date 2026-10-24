@@ -2822,7 +2822,7 @@ def _prepare_translation_glossary(
     if not evidence["candidates"] and not evidence["context"]:
         return []
     fingerprint_payload = {
-        "version": "translation-glossary-v1",
+        "version": "translation-glossary-v2-entity-forms",
         "source": source_language,
         "target": target_language,
         "model": config.model_name,
@@ -2860,15 +2860,28 @@ def _prepare_translation_glossary(
         payload = json.loads(response.choices[0].message.content)
         source_corpus = "\n".join([*evidence["candidates"], *evidence["context"]])
         entries = []
-        from translation_quality import validate_target_text
+        from translation_quality import (
+            plausible_source_entity_form,
+            validate_target_text,
+        )
+        admitted_candidates = {
+            str(candidate).casefold(): str(candidate)
+            for candidate in evidence["candidates"]
+        }
         for raw in payload.get("glossary", []):
             if not isinstance(raw, dict) or str(raw.get("confidence", "")).lower() != "high":
                 continue
             source_forms = []
             for value in raw.get("source_forms", []):
                 value = str(value).strip()
-                if value and _source_entity_occurs(source_corpus, value) and value not in source_forms:
-                    source_forms.append(value)
+                admitted = admitted_candidates.get(value.casefold())
+                if (
+                    admitted
+                    and plausible_source_entity_form(admitted)
+                    and _source_entity_occurs(source_corpus, admitted)
+                    and admitted not in source_forms
+                ):
+                    source_forms.append(admitted)
             if not source_forms:
                 continue
             target_form = validate_target_text(raw.get("target_form"), target_language)
@@ -2876,7 +2889,7 @@ def _prepare_translation_glossary(
                             "basis": str(raw.get("basis", "model"))[:40]})
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = cache_path.with_suffix(cache_path.suffix + ".tmp")
-        temporary.write_text(json.dumps({"version": "translation-glossary-v1",
+        temporary.write_text(json.dumps({"version": "translation-glossary-v2-entity-forms",
                                          "fingerprint": fingerprint, "entries": entries},
                                         ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(cache_path)

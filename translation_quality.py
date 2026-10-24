@@ -110,6 +110,32 @@ def _source_contains_form(text: Any, form: Any) -> bool:
     return _canonical(form) in _canonical(text)
 
 
+_LATIN_ENTITY_STOPWORDS = {
+    "a", "an", "and", "any", "are", "as", "at", "be", "but", "by",
+    "can", "did", "do", "does", "for", "from", "go", "had", "has",
+    "have", "he", "hello", "her", "here", "him", "his", "how", "i",
+    "if", "in", "is", "it", "its", "me", "my", "no", "not", "of",
+    "oh", "on", "or", "our", "she", "so", "that", "the", "their",
+    "them", "there", "they", "this", "to", "up", "us", "wait", "we",
+    "what", "when", "where", "which", "who", "why", "with", "you",
+    "your", "yes",
+}
+
+
+def plausible_source_entity_form(value: Any) -> bool:
+    """Reject ordinary dialogue words before they can become entity aliases."""
+    form = str(value or "").strip()
+    if not form:
+        return False
+    if re.search(r"[A-Za-z]", form):
+        words = re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", form)
+        if not words:
+            return False
+        if len(words) == 1 and words[0].casefold() in _LATIN_ENTITY_STOPWORDS:
+            return False
+    return True
+
+
 def applicable_glossary_entries(segment: dict, glossary: list[dict] | None) -> list[dict]:
     """Return validated video-level entities that occur in this source turn."""
     source_parts = [str(segment.get("text", ""))]
@@ -124,7 +150,11 @@ def applicable_glossary_entries(segment: dict, glossary: list[dict] | None) -> l
         if not isinstance(entry, dict):
             continue
         target_form = str(entry.get("target_form", "")).strip()
-        source_forms = [str(value).strip() for value in entry.get("source_forms", []) if str(value).strip()]
+        source_forms = [
+            str(value).strip()
+            for value in entry.get("source_forms", [])
+            if plausible_source_entity_form(value)
+        ]
         if target_form and source_forms and any(
             _source_contains_form(source_text, form) for form in source_forms
         ):

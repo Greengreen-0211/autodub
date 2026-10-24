@@ -15,6 +15,7 @@ from unittest.mock import patch
 import wave
 
 from translation_quality import (
+    applicable_glossary_entries,
     prepare_tts_punctuation,
     translate_segments,
     require_translated,
@@ -47,6 +48,20 @@ def translation(sid, tiny=False):
 
 
 class TranslationTests(unittest.TestCase):
+    def test_common_words_cannot_become_entity_aliases(self):
+        glossary = [{
+            "source_forms": ["Olaf", "Where", "you"],
+            "target_form": "雪宝",
+        }]
+        self.assertEqual(
+            applicable_glossary_entries({"text": "Where are you?"}, glossary),
+            [],
+        )
+        self.assertEqual(
+            applicable_glossary_entries({"text": "Olaf, where are you?"}, glossary),
+            [{"source_forms": ["Olaf"], "target_form": "雪宝"}],
+        )
+
     def test_multi_sentence_comma_chain_restores_strong_boundaries(self):
         source_text = (
             "I just can't. The sky's awake, so I'm awake. "
