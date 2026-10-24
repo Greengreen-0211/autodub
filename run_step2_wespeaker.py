@@ -2855,7 +2855,7 @@ def _reconcile_turn_clusters(
             "consistency_q25": round(consistency["q25"], 4),
         })
     diagnostics = {
-        "algorithm": "stable_core_identity_consensus_v10_immutable_atoms",
+        "algorithm": "stable_core_identity_consensus_v11_sentence_first",
         "turn_count": len(turns),
         "raw_speaker_count": len(raw_clusters),
         "speaker_count": len(identity_clusters),
@@ -3844,6 +3844,15 @@ def update_dialogue_identity_diagnostics(segments, diagnostics):
         == "multi_speaker_text_unsplittable"
         for segment in segments
     )
+    diagnostics["sentence_segmentation_contract"] = "sentence_first_v1"
+    diagnostics["long_internal_pause_segment_count"] = sum(
+        bool(segment.get("contains_long_internal_pause"))
+        for segment in segments
+    )
+    diagnostics["protected_internal_speaker_change_count"] = sum(
+        len(segment.get("unsplit_identity_boundaries") or [])
+        for segment in segments
+    )
     return diagnostics
 
 
@@ -4068,7 +4077,7 @@ def build_clustering_comparison(repaired, pairwise):
         "comparison_unit": "immutable_sentence_atom",
         "same_atomic_units": same_atomic_units,
         "atomic_segment_count": len(repaired) if same_atomic_units else None,
-        "production_algorithm": "stable_core_identity_consensus_v10_immutable_atoms",
+        "production_algorithm": "stable_core_identity_consensus_v11_sentence_first",
         "baseline_algorithm": "wespeaker_pairwise_cosine_average_linkage",
         "pairwise_distance_threshold": _env_float(
             "SPEAKER_CLUSTER_THRESHOLD", 0.5

@@ -441,7 +441,7 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertLess(len(identities), 5)
         self.assertEqual(
             diagnostics["algorithm"],
-            "stable_core_identity_consensus_v10_immutable_atoms",
+            "stable_core_identity_consensus_v11_sentence_first",
         )
         self.assertGreater(
             diagnostics["global_partition_candidate_count"], 1
@@ -945,7 +945,7 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
         ]
         self.assertEqual(len(merge_adjacent_speaker_turns(segments)), 2)
 
-    def test_long_word_gap_is_a_hard_render_boundary(self):
+    def test_long_word_gap_inside_sentence_is_pause_not_text_cut(self):
         segments = [{
             "id": 0, "start": 0.0, "end": 4.0,
             "text": "First line Second line",
@@ -960,25 +960,26 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
             segments,
             [{"start": 0.0, "end": 4.0, "speaker": "SPEAKER_00"}],
         )
-        self.assertEqual(len(result), 2)
-        self.assertTrue(result[0]["hard_silence_after"])
-        self.assertTrue(result[1]["hard_silence_before"])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "First line Second line")
+        self.assertFalse(result[0]["hard_silence_after"])
+        self.assertFalse(result[0]["hard_silence_before"])
         self.assertEqual(result[0]["mix_start"], 0.1)
-        self.assertEqual(result[0]["mix_end"], 1.08)
-        self.assertEqual(result[1]["mix_start"], 1.9)
-        self.assertEqual(result[1]["mix_end"], 2.98)
-        self.assertEqual(len(merge_adjacent_speaker_turns(result)), 2)
+        self.assertEqual(result[0]["mix_end"], 2.98)
+        self.assertTrue(result[0]["contains_long_internal_pause"])
+        self.assertEqual(result[0]["internal_pause_boundaries"], [{
+            "start": 1.0,
+            "end": 2.0,
+            "duration": 1.0,
+            "token_index": 2,
+        }])
+        self.assertEqual(len(merge_adjacent_speaker_turns(result)), 1)
         self.assertEqual(result[0]["source_start"], 0.0)
         self.assertEqual(result[0]["source_end"], 4.0)
-        self.assertEqual(result[1]["source_start"], 0.0)
-        self.assertEqual(result[1]["source_end"], 4.0)
         self.assertEqual(result[0]["atomic_start"], 0.0)
-        self.assertEqual(result[1]["atomic_end"], 4.0)
-        self.assertNotEqual(
-            result[0]["atomic_segment_id"], result[1]["atomic_segment_id"]
-        )
+        self.assertEqual(result[0]["atomic_end"], 4.0)
 
-    def test_persistent_word_ownership_keeps_b_opening_words_out_of_a(self):
+    def test_persistent_word_ownership_cannot_cut_unfinished_sentence(self):
         segments = [{
             "id": 0, "start": 0.0, "end": 3.0,
             "text": "A speaks B starts now",
@@ -995,13 +996,64 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
             {"start": 1.0, "end": 3.0, "speaker": "SPEAKER_01"},
         ]
         result = align_segments_with_rttm(segments, spans)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "A speaks B starts now")
+        self.assertTrue(result[0]["speaker_boundary_ambiguous"])
+        self.assertEqual(
+            result[0]["speaker_assignment_status"],
+            "multi_speaker_text_unsplittable",
+        )
+        self.assertEqual(result[0]["unsplit_identity_boundaries"], [1.0])
+        self.assertNotIn(
+            "speaker_boundary", result[0]["segment_split_reasons"]
+        )
+
+    def test_complete_sentences_split_before_acoustic_assignment(self):
+        segments = [{
+            "id": 0, "start": 0.0, "end": 4.0,
+            "text": "Step up. Now hold on to the railing.",
+            "qwen3_time_stamps": [
+                {"text": "Step", "start": 0.1, "end": 0.5},
+                {"text": "up.", "start": 0.5, "end": 0.9},
+                {"text": "Now", "start": 1.8, "end": 2.1},
+                {"text": "hold", "start": 2.1, "end": 2.4},
+                {"text": "on", "start": 2.4, "end": 2.6},
+                {"text": "to", "start": 2.6, "end": 2.8},
+                {"text": "the", "start": 2.8, "end": 3.0},
+                {"text": "railing.", "start": 3.0, "end": 3.7},
+            ],
+        }]
+        spans = [
+            {"start": 0.0, "end": 1.3, "speaker": "SPEAKER_00"},
+            {"start": 1.3, "end": 4.0, "speaker": "SPEAKER_01"},
+        ]
+        result = align_segments_with_rttm(segments, spans)
         self.assertEqual([item["text"] for item in result], [
-            "A speaks", "B starts now"
+            "Step up.", "Now hold on to the railing."
         ])
         self.assertEqual([item["speaker"] for item in result], [
             "SPEAKER_00", "SPEAKER_01"
         ])
-        self.assertIn("speaker_boundary", result[0]["segment_split_reasons"])
+        self.assertTrue(result[0]["hard_silence_after"])
+        self.assertTrue(result[1]["hard_silence_before"])
+
+    def test_pause_and_speaker_change_do_not_split_wake_up(self):
+        segments = [{
+            "id": 0, "start": 0.0, "end": 2.0,
+            "text": "Wake up!",
+            "qwen3_time_stamps": [
+                {"text": "Wake", "start": 0.1, "end": 0.5},
+                {"text": "up!", "start": 1.4, "end": 1.8},
+            ],
+        }]
+        spans = [
+            {"start": 0.0, "end": 0.9, "speaker": "SPEAKER_00"},
+            {"start": 0.9, "end": 2.0, "speaker": "SPEAKER_01"},
+        ]
+        result = align_segments_with_rttm(segments, spans)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "Wake up!")
+        self.assertTrue(result[0]["contains_long_internal_pause"])
 
     def test_clustering_comparison_is_label_invariant(self):
         repaired = [

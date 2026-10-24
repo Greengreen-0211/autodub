@@ -27,9 +27,9 @@ class AlignmentConfig:
     minimum_sentence_seconds: float = 0.80
     target_sentence_seconds: float = 8.0
     maximum_sentence_seconds: float = 12.0
-    # A verified word gap this large is an acoustic boundary, not merely a
-    # sentence-boundary candidate.  It must survive speaker-turn reassembly so
-    # TTS never stretches one utterance across a long silent interval.
+    # A verified word gap this large is retained as a render pause.  It may
+    # separate two already-complete sentences, but never cuts an unfinished
+    # sentence merely because the speaker paused.
     hard_silence_seconds: float = 0.75
     speaker_snap_radius_seconds: float = 0.80
     minimum_speaker_turn_seconds: float = 0.45
@@ -234,38 +234,23 @@ def sentence_boundary_indices(
     *,
     config: AlignmentConfig = AlignmentConfig(),
 ) -> List[int]:
-    """Return token-gap indices that form usable sentence candidates."""
+    """Return only lexical boundaries that end a complete sentence.
+
+    Silence, duration and diarization are useful timing evidence, but none of
+    them proves that a phrase is linguistically complete.  Letting those
+    signals create text boundaries produced fragments such as ``Wake / up!``
+    and ``Where are / you?``.  Step 2 therefore treats terminal punctuation as
+    the only automatic sentence cut inside an ASR transport segment.
+    """
     if len(items) < 2:
         return []
     boundaries: List[int] = []
-    group_start = float(items[0].get("start", 0.0))
-    last_boundary = 0
     for index in range(1, len(items)):
         left = str(items[index - 1].get("text", "")).strip()
-        gap = _gap_seconds(items, index)
-        elapsed = float(items[index - 1].get("end", group_start)) - group_start
         punctuation = str(items[index - 1].get("punctuation_after", "none"))
         strong = punctuation == "strong" or bool(STRONG_PUNCTUATION.search(left))
-        weak = punctuation == "weak" or bool(WEAK_PUNCTUATION.search(left))
-        should_split = False
-        if strong and elapsed >= config.minimum_sentence_seconds:
-            should_split = True
-        elif gap >= config.strong_gap_seconds and elapsed >= config.minimum_sentence_seconds:
-            should_split = True
-        elif (
-            weak
-            and gap >= config.weak_gap_seconds
-            and elapsed >= config.minimum_sentence_seconds
-        ):
-            should_split = True
-        elif weak and elapsed >= config.target_sentence_seconds:
-            should_split = True
-        elif elapsed >= config.maximum_sentence_seconds:
-            should_split = True
-        if should_split and index > last_boundary:
+        if strong:
             boundaries.append(index)
-            last_boundary = index
-            group_start = float(items[index].get("start", group_start))
     return boundaries
 
 
@@ -274,7 +259,7 @@ def hard_silence_boundary_indices(
     *,
     config: AlignmentConfig = AlignmentConfig(),
 ) -> List[int]:
-    """Return reliable token gaps that must remain separate render slots."""
+    """Return reliable token gaps for pause/render metadata."""
     if len(items) < 2:
         return []
     return [
@@ -544,9 +529,13 @@ def _snap_change_to_gap(
     config: AlignmentConfig,
     minimum_score: float = 0.0,
     minimum_gap_seconds: float = 0.0,
+    allowed_indices: Optional[Sequence[int]] = None,
 ) -> Optional[int]:
+    allowed = set(allowed_indices) if allowed_indices is not None else None
     candidates = []
     for index in range(1, len(items)):
+        if allowed is not None and index not in allowed:
+            continue
         left_end = float(items[index - 1].get("end", change_time))
         right_start = float(items[index].get("start", change_time))
         if _gap_seconds(items, index) < minimum_gap_seconds:
@@ -769,18 +758,17 @@ def align_segments_with_rttm(
             output.append(segment)
             continue
 
-        sentence_candidates_for_turn = sentence_boundary_indices(items, config=config)
+        # Text segmentation is decided before acoustic alignment.  A complete
+        # lexical sentence is immutable; silence and speaker changes may add
+        # diagnostics inside it, but may not cut it into orphaned phrases.
+        sentence_splits = set(
+            sentence_boundary_indices(items, config=config)
+        )
         hard_silence_splits = set(
             hard_silence_boundary_indices(items, config=config)
         )
-        sentence_splits = set(
-            long_turn_boundary_indices(
-                items,
-                sentence_candidates_for_turn,
-                config=config,
-            )
-        )
         speaker_splits: Dict[int, Dict[str, Any]] = {}
+        protected_internal_changes: List[Dict[str, Any]] = []
         for change in segment_changes:
             if not change.get("text_split_allowed", True):
                 continue
@@ -796,16 +784,23 @@ def align_segments_with_rttm(
                     if change.get("boundary_source") == "acoustic_scan"
                     else 0.0
                 ),
+                allowed_indices=sentence_splits,
             )
             if boundary is not None:
                 speaker_splits[boundary] = change
+            else:
+                protected_internal_changes.append(dict(change))
         for boundary, evidence in persistent_token_speaker_boundaries(
             items, spans, config=config
         ).items():
-            speaker_splits.setdefault(boundary, evidence)
-        split_indices = sorted(
-            sentence_splits | hard_silence_splits | set(speaker_splits)
-        )
+            if boundary in sentence_splits:
+                speaker_splits.setdefault(boundary, evidence)
+            else:
+                protected_internal_changes.append(dict(evidence))
+        # Every split is now a complete-sentence boundary.  In particular,
+        # neither a long pause nor a speaker label change can create text such
+        # as ``To / the magic``.  Those signals remain attached below.
+        split_indices = sorted(sentence_splits)
 
         # Exact transcript spans are mandatory for splitting.  A partial or
         # mismatched alignment is retained for audit, never used to guess text.
@@ -879,7 +874,7 @@ def align_segments_with_rttm(
                 result["speaker_boundary_ambiguous"] = True
             blocked_group_changes = [
                 item
-                for item in identity_only_changes
+                for item in identity_only_changes + protected_internal_changes
                 if start < float(item["time"]) < end
             ]
             if blocked_group_changes:
@@ -890,10 +885,10 @@ def align_segments_with_rttm(
                 result["speaker_assignment_confidence"] = min(
                     result["speaker_assignment_confidence"], 0.65
                 )
-                result["unsplit_identity_boundaries"] = [
+                result["unsplit_identity_boundaries"] = sorted({
                     round(float(item["time"]), 3)
                     for item in blocked_group_changes
-                ]
+                })
             result["qwen3_time_stamps"] = (
                 [] if use_timing_skeleton else items[left:right]
             )
@@ -911,12 +906,31 @@ def align_segments_with_rttm(
                 # remain the textual/transport boundaries for compatibility.
                 result["mix_start"] = result["speech_start"]
                 result["mix_end"] = result["speech_end"]
+            internal_pauses = []
+            for pause_index in sorted(hard_silence_splits):
+                if not (left < pause_index < right):
+                    continue
+                pause_start = float(
+                    items[pause_index - 1].get("end", start)
+                )
+                pause_end = float(items[pause_index].get("start", end))
+                internal_pauses.append({
+                    "start": round(pause_start, 3),
+                    "end": round(pause_end, 3),
+                    "duration": round(max(0.0, pause_end - pause_start), 3),
+                    "token_index": pause_index,
+                })
+            result["internal_pause_boundaries"] = internal_pauses
+            result["contains_long_internal_pause"] = bool(internal_pauses)
             result["hard_silence_before"] = bool(left in hard_silence_splits)
             result["hard_silence_after"] = bool(right in hard_silence_splits)
             result["segment_split_reasons"] = sorted(
                 {
                     *( ["sentence_boundary"] if right in sentence_splits else [] ),
-                    *( ["hard_silence_boundary"] if right in hard_silence_splits else [] ),
+                    *( ["hard_silence_boundary"] if (
+                        right in sentence_splits
+                        and right in hard_silence_splits
+                    ) else [] ),
                     *( ["speaker_boundary"] if right in speaker_splits else [] ),
                 }
             )
