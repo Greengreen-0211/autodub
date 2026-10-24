@@ -8,10 +8,31 @@ SAD mask.  It never creates sentence boundaries by itself.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 
 TimeRange = Tuple[float, float]
+
+
+def _spoken_duration_prior(text: Any) -> Tuple[float, float]:
+    """Return a soft centre/ceiling for detecting impossible word spans.
+
+    This never creates a timestamp on its own.  It only prevents an ambiguous
+    five-word sentence from inheriting several seconds of unrelated activity.
+    """
+    value = str(text or "")
+    cjk = len(re.findall(r"[\u3400-\u9fff]", value))
+    words = len(re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)?", value))
+    if cjk:
+        centre = cjk / 4.2
+    elif words:
+        centre = words / 2.5
+    else:
+        centre = max(0.35, len(value.strip()) / 8.0)
+    centre = max(0.35, centre)
+    ceiling = max(0.75, centre * 1.65 + 0.15)
+    return centre, ceiling
 
 
 def merge_ranges(ranges: Iterable[TimeRange], max_gap: float = 0.0) -> List[TimeRange]:
@@ -164,11 +185,72 @@ def attach_precise_tts_placement(
             if abs(first_acoustic - word_start) <= 0.25:
                 onset = max(onset, first_acoustic - 0.03)
         speech_islands = intersect_ranges(active, [(onset, hard_end)]) or word_ranges
+        ambiguous = bool(segment.get("speaker_boundary_ambiguous"))
+        timing_reason = "word_vad_consensus"
+        ratio_guard = None
+        word_span = max(0.0, word_end - word_start)
+        duration_centre, duration_ceiling = _spoken_duration_prior(
+            segment.get("text", "")
+        )
+        # Speaker ambiguity means the inherited word skeleton may still be
+        # structurally valid while owning activity from a neighbouring turn.
+        # When its span is implausible for the sentence, retain the median word
+        # anchor but limit it to a local acoustic window.  Public sentence
+        # bounds remain untouched.
+        if ambiguous and word_span > duration_ceiling:
+            midpoints = sorted((start + end) / 2.0 for start, end in items)
+            word_centre = midpoints[len(midpoints) // 2]
+            guarded_duration = min(
+                duration_ceiling,
+                max(0.45, duration_centre * 1.25),
+            )
+            guarded_start = max(
+                outer_start,
+                word_centre - guarded_duration / 2.0,
+            )
+            guarded_end = min(
+                outer_end,
+                guarded_start + guarded_duration,
+            )
+            if guarded_end - guarded_start < guarded_duration:
+                guarded_start = max(outer_start, guarded_end - guarded_duration)
+            guarded_activity = intersect_ranges(
+                speech_islands, [(guarded_start, guarded_end)]
+            )
+            if guarded_activity:
+                onset = max(
+                    outer_start,
+                    guarded_activity[0][0] - float(pre_roll),
+                )
+                hard_end = min(
+                    outer_end,
+                    guarded_activity[-1][1] + float(post_roll),
+                )
+                speech_islands = guarded_activity
+            else:
+                onset, hard_end = guarded_start, guarded_end
+                speech_islands = [(guarded_start, guarded_end)]
+            timing_reason = "ambiguous_word_span_ratio_guard"
+            ratio_guard = {
+                "word_span": round(word_span, 3),
+                "text_duration_centre": round(duration_centre, 3),
+                "text_duration_ceiling": round(duration_ceiling, 3),
+                "guarded_start": round(onset, 3),
+                "guarded_end": round(hard_end, 3),
+            }
         effective = sum(max(0.0, end - start) for start, end in speech_islands)
         word_effective = sum(max(0.0, end - start) for start, end in word_ranges)
         # Energy VAD can clip unvoiced consonants.  Never budget less than the
         # aligned word evidence, while still removing long internal silence.
-        effective = max(effective, word_effective)
+        if timing_reason == "ambiguous_word_span_ratio_guard":
+            # The word span is the evidence being rejected; do not re-expand
+            # the target duration from that same span.
+            effective = min(
+                max(effective, min(duration_centre, hard_end - onset)),
+                hard_end - onset,
+            )
+        else:
+            effective = max(effective, word_effective)
         effective = min(max(0.1, effective + pre_roll + post_roll), hard_end - onset)
         internal_pauses = [
             [round(left[1], 3), round(right[0], 3)]
@@ -185,8 +267,17 @@ def attach_precise_tts_placement(
             "tts_internal_pauses": internal_pauses,
             "tts_timing_precision": "word_vad_consensus",
             "tts_timing_confidence": round(
-                min(0.98, 0.82 + (0.12 if acoustic else 0.0)), 4
+                (
+                    0.58
+                    if timing_reason == "ambiguous_word_span_ratio_guard"
+                    else (
+                        0.72 if ambiguous
+                        else min(0.98, 0.82 + (0.12 if acoustic else 0.0))
+                    )
+                ), 4
             ),
+            "tts_timing_reason": timing_reason,
+            "tts_timing_ratio_guard": ratio_guard,
         })
         audit.append({
             "segment_id": str(segment.get("id")),
@@ -196,6 +287,8 @@ def attach_precise_tts_placement(
             "target_speech_duration": round(effective, 3),
             "speech_islands": segment["tts_speech_islands"],
             "internal_pauses": internal_pauses,
+            "timing_reason": timing_reason,
+            "ratio_guard": ratio_guard,
         })
         output.append(segment)
     return output, audit

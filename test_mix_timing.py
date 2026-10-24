@@ -15,10 +15,18 @@ class MixTimingTests(unittest.TestCase):
 
     def test_explicit_source_overlap_is_preserved(self):
         planned = plan_mix_windows([
+            {"start": 1.0, "end": 4.0, "allowed_overlap_seconds": 0.35},
+            {"start": 3.2, "end": 5.0},
+        ], 10.0)
+        self.assertAlmostEqual(planned[0]["hard_end"], 3.55)
+        self.assertTrue(planned[0]["allow_overlap"])
+
+    def test_boolean_overlap_without_measured_budget_is_not_unbounded(self):
+        planned = plan_mix_windows([
             {"start": 1.0, "end": 4.0, "allow_overlap": True},
             {"start": 3.2, "end": 5.0},
         ], 10.0)
-        self.assertEqual(planned[0]["hard_end"], 4.0)
+        self.assertEqual(planned[0]["hard_end"], 3.2)
 
     def test_video_end_is_always_a_hard_limit(self):
         planned = plan_mix_windows([

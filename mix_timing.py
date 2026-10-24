@@ -10,9 +10,10 @@ def plan_mix_windows(
 ) -> List[Dict[str, Any]]:
     """Return sorted clips with an exclusive hard end and available length.
 
-    Unless source overlap is explicitly preserved with ``allow_overlap``, a
-    clip can never extend past the next dub onset.  Its own planned ``end`` and
-    the video duration remain hard upper bounds as well.
+    A clip may extend past the next onset only by its measured
+    ``allowed_overlap_seconds`` budget.  A legacy boolean cannot grant
+    unbounded overlap.  The clip's planned ``end`` and video duration remain
+    hard upper bounds as well.
     """
     ordered = sorted(
         (dict(item) for item in clips),
@@ -22,11 +23,19 @@ def plan_mix_windows(
     for index, item in enumerate(ordered):
         start = max(0.0, float(item.get("start", 0.0)))
         hard_end = min(duration, float(item.get("end", duration)))
-        if index + 1 < len(ordered) and not item.get("allow_overlap"):
-            hard_end = min(
-                hard_end,
-                max(0.0, float(ordered[index + 1].get("start", hard_end))),
+        if index + 1 < len(ordered):
+            next_start = max(
+                0.0, float(ordered[index + 1].get("start", hard_end))
             )
+            try:
+                allowed_overlap = max(
+                    0.0, float(item.get("allowed_overlap_seconds", 0.0))
+                )
+            except (TypeError, ValueError):
+                allowed_overlap = 0.0
+            hard_end = min(hard_end, next_start + allowed_overlap)
+            item["allowed_overlap_seconds"] = allowed_overlap
+            item["allow_overlap"] = allowed_overlap > 0.0
         item["start"] = start
         item["hard_end"] = max(start, hard_end)
         item["available_ms"] = max(

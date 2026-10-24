@@ -16,34 +16,40 @@ def duration_quality(actual: float, target: float) -> dict:
             "duration_quality":"passed" if actual>0 and target>0 and absolute<=limit else "failed"}
 
 
-def natural_duration_fit(actual: float, target: float) -> dict:
+def natural_duration_fit(actual: float, target: float, provenance: str = "") -> dict:
     """Judge unwarped, silence-trimmed TTS against the source speech window.
 
-    Ratios are deliberately wider for very short utterances, where a single
-    consonant or breath makes percentage error unstable.  This decision must
-    be made before atempo; postprocessed audio is not evidence that the
-    translation itself fits naturally.
+    Every decision is expressed as ``synthesized / source-slot``.  Trusted OCR
+    wording receives a wider *naturalness* band, but never a wider physical
+    collision window.  This decision must be made before atempo;
+    postprocessed audio is not evidence that the translation itself fits
+    naturally.
     """
     actual = float(actual or 0.0)
     target = float(target or 0.0)
     ratio = actual / target if actual > 0.0 and target > 0.0 else 0.0
     absolute = abs(actual - target)
-    if target < 1.0:
-        lower, upper = 0.0, float("inf")
-        passed = actual > 0.0 and absolute <= float(
-            os.getenv("AUTODUB_TTS_SHORT_ABSOLUTE_TOLERANCE", "0.25")
-        )
-        rule = "short_absolute"
+    trusted_ocr = str(provenance or "").lower() in {
+        "ocr_direct", "ocr_repaired", "ocr_hybrid", "ocr_assisted",
+    }
+    if trusted_ocr:
+        lower = float(os.getenv("AUTODUB_TTS_OCR_NATURAL_MIN_RATIO", "0.68"))
+        upper = float(os.getenv("AUTODUB_TTS_OCR_NATURAL_MAX_RATIO", "1.35"))
+        rule = "trusted_ocr_ratio"
+    elif target < 1.0:
+        lower = float(os.getenv("AUTODUB_TTS_NATURAL_MIN_RATIO_TINY", "0.60"))
+        upper = float(os.getenv("AUTODUB_TTS_NATURAL_MAX_RATIO_TINY", "1.40"))
+        rule = "tiny_ratio"
     elif target < 2.0:
         lower = float(os.getenv("AUTODUB_TTS_NATURAL_MIN_RATIO_SHORT", "0.75"))
         upper = float(os.getenv("AUTODUB_TTS_NATURAL_MAX_RATIO_SHORT", "1.25"))
-        passed = lower <= ratio <= upper
         rule = "short_ratio"
     else:
         lower = float(os.getenv("AUTODUB_TTS_NATURAL_MIN_RATIO", "0.80"))
         upper = float(os.getenv("AUTODUB_TTS_NATURAL_MAX_RATIO", "1.20"))
         passed = lower <= ratio <= upper
         rule = "standard_ratio"
+    passed = actual > 0.0 and lower <= ratio <= upper
     direction = "suitable"
     if not passed:
         direction = "expand" if actual < target else "compress"
@@ -57,6 +63,7 @@ def natural_duration_fit(actual: float, target: float) -> dict:
         "natural_duration_lower_ratio": lower,
         "natural_duration_upper_ratio": upper,
         "natural_duration_rule": rule,
+        "natural_duration_provenance": str(provenance or "standard"),
         "natural_duration_fit": "passed" if passed else "failed",
         "duration_rewrite_direction": direction,
         "duration_log_distance": distance,
@@ -221,14 +228,16 @@ def stage_fingerprint(state, config, backend):
     segments=[{k:s.get(k) for k in ("id","text","start","end","speaker","emotion","tts_engine",
                                    "translation_request_fingerprint", "tts_placement_start",
                                    "tts_hard_end", "tts_target_duration",
-                                   "tts_timing_precision")} for s in state.get("segments_step3",[])]
+                                   "tts_timing_precision", "tts_timing_reason",
+                                   "speaker_boundary_ambiguous",
+                                   "translation_selection_source")} for s in state.get("segments_step3",[])]
     media={}
     for key in ("vocals_path","accomp_path"):
         path=Path(str(state.get(key) or ""))
         if path.is_file():
             info=path.stat()
             media[key]={"path":str(path.resolve()),"size":info.st_size,"mtime_ns":info.st_mtime_ns}
-    payload={"version":"tts-stage-v2.4.0-duration-loop","segments":segments,"media":media,"backend":backend,
+    payload={"version":"tts-stage-v2.5.0-context-ratio-overlap","segments":segments,"media":media,"backend":backend,
              "input_file":state.get("input_file"),
              "target_lang":str(config.target_lang).lower(),
              "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs")))}

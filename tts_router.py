@@ -144,10 +144,10 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         for key in (
             "text", "language", "target_language", "emotion", "speaker",
             "ref_audio", "ref_text", "target_duration", "model",
-            "measure_natural_duration",
+            "measure_natural_duration", "translation_selection_source",
         )
     }
-    payload["version"] = "tts-request-v2.5.0-duration-retranslation"
+    payload["version"] = "tts-request-v2.6.0-context-ratio-overlap"
     payload["worker_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_worker.py").read_bytes()).hexdigest()
     payload["policy_sha256"] = hashlib.sha256(Path(__file__).with_name("scheme3_policy.py").read_bytes()).hexdigest()
     payload["quality_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_quality.py").read_bytes()).hexdigest()
@@ -789,12 +789,17 @@ class TTSRouter:
                 "start": placement_start, "model": model, "tts_engine": model,
                 "end": hard_end,
                 "hard_duration": max(0.0, hard_end - placement_start),
-                "allow_overlap": bool(segment.get("allow_overlap", False)),
+                "allow_overlap": False,
+                "allowed_overlap_seconds": 0.0,
+                "source_overlap_evidence": "none",
                 "placement_source": placement_source,
                 "planned_engine": model, "fallback_count": 0, "fallback_reason": "",
                 "translations_candidates": segment.get("translations_candidates", []),
                 "attempted_engines": [model], "attempted_texts": [text],
                 "source_segment": segment,
+                "translation_selection_source": str(
+                    segment.get("translation_selection_source", "standard")
+                ),
                 "duration_attempt": 0,
                 "measure_natural_duration": self.duration_rewriter is not None,
             }
@@ -809,8 +814,45 @@ class TTSRouter:
         chronological = sorted(items, key=lambda row: float(row["start"]))
         for position, item in enumerate(chronological):
             hard_end = float(item["end"])
-            if position + 1 < len(chronological) and not item.get("allow_overlap"):
-                hard_end = min(hard_end, float(chronological[position + 1]["start"]))
+            if position + 1 < len(chronological):
+                following = chronological[position + 1]
+                current_source = item.get("source_segment") or {}
+                following_source = following.get("source_segment") or {}
+                try:
+                    source_overlap = max(
+                        0.0,
+                        float(current_source.get("end"))
+                        - float(following_source.get("start")),
+                    )
+                except (TypeError, ValueError):
+                    source_overlap = 0.0
+                distinct_speakers = str(item.get("speaker")) != str(
+                    following.get("speaker")
+                )
+                reliable_overlap = (
+                    source_overlap
+                    >= float(os.getenv("AUTODUB_TTS_MIN_SOURCE_OVERLAP", "0.12"))
+                    and distinct_speakers
+                    and not bool(current_source.get("speaker_boundary_ambiguous"))
+                    and not bool(following_source.get("speaker_boundary_ambiguous"))
+                )
+                allowed_overlap = (
+                    min(
+                        source_overlap,
+                        float(os.getenv("AUTODUB_TTS_MAX_SOURCE_OVERLAP", "1.50")),
+                    )
+                    if reliable_overlap else 0.0
+                )
+                item["allowed_overlap_seconds"] = round(allowed_overlap, 6)
+                item["allow_overlap"] = allowed_overlap > 0.0
+                item["source_overlap_evidence"] = (
+                    "distinct_speaker_source_intersection"
+                    if allowed_overlap > 0.0 else "none"
+                )
+                hard_end = min(
+                    hard_end,
+                    float(following["start"]) + allowed_overlap,
+                )
             item["end"] = max(float(item["start"]), hard_end)
             item["hard_duration"] = max(0.0, item["end"] - float(item["start"]))
             if item["hard_duration"] > 0.04:
@@ -915,7 +957,8 @@ class TTSRouter:
                             generation_request={k:item[k] for k in ("text","language","target_language","emotion",
                                                "speaker","ref_audio","ref_text","target_duration","start","model",
                                                "reference_segment_id","reference_purity_score",
-                                               "measure_natural_duration")},
+                                               "measure_natural_duration",
+                                               "translation_selection_source")},
                             placement_start=item["start"],
                             placement_end=item["end"],
                             placement_source=item.get("placement_source", "segment_start"),
@@ -933,7 +976,9 @@ class TTSRouter:
             if metadata.get("status")=="success":
                 clips.append({"segment_id":sid, "start":item["start"], "end":item["end"], "file":metadata["file"],
                               "tts_engine":item["model"], "request_fingerprint":item["request_fingerprint"],
-                              "allow_overlap":bool(item.get("allow_overlap", False))})
+                              "allow_overlap":bool(item.get("allow_overlap", False)),
+                              "allowed_overlap_seconds":float(item.get("allowed_overlap_seconds", 0.0)),
+                              "source_overlap_evidence":item.get("source_overlap_evidence", "none")})
             output_rows.append(metadata)
             previous[sid] = metadata
             print(f"[TTS] segment={sid} planned={item['planned_engine']} actual={item['model']} "
@@ -975,7 +1020,15 @@ class TTSRouter:
                     or current.get("actual_duration")
                     or 0.0
                 )
-                fit = natural_duration_fit(natural, item["target_duration"])
+                fit = natural_duration_fit(
+                    natural,
+                    item["target_duration"],
+                    str(
+                        (item.get("source_segment") or {}).get(
+                            "translation_selection_source", "standard"
+                        )
+                    ),
+                )
                 candidate = {
                     "attempt": attempt_index,
                     "text": item["text"],

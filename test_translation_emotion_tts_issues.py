@@ -265,6 +265,12 @@ class TranslationTests(unittest.TestCase):
         cached=translate_segments(segments,"en","zh","test",request,batch_size=1)
         self.assertEqual(calls[0]["next_text"],segments[1]["text"])
         self.assertEqual(calls[1]["previous_text"],segments[0]["text"])
+        self.assertEqual(calls[0]["dialogue_context"][0]["relative_index"], 1)
+        self.assertTrue(calls[0]["dialogue_context"][0]["same_speaker"])
+        self.assertEqual(
+            cached[0]["translation_dialogue_context"],
+            calls[0]["dialogue_context"],
+        )
         calls.clear()
         translate_segments(segments,"en","zh","test",request,cached=cached,force_ids={"1"})
         self.assertEqual([c["id"] for c in calls],["1"])
@@ -507,6 +513,24 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(clips,[]);self.assertEqual(calls,["confucius4"])
             self.assertEqual(results[0]["status"],"failed")
 
+    def test_only_measured_reliable_source_overlap_is_preserved(self):
+        calls=[]
+        with tempfile.TemporaryDirectory() as tmp, patch("tts_router.preflight_models"):
+            router=self.setup_router(tmp)
+            rows=[
+                dict(source(0), start=0.0, end=2.0, speaker="A", tts_engine="f5tts"),
+                dict(source(1), start=1.6, end=2.6, speaker="B", tts_engine="f5tts"),
+            ]
+            with patch("tts_router._run_worker",side_effect=self.worker(calls,set())):
+                clips,_=router.run(rows,"unused")
+            self.assertAlmostEqual(clips[0]["allowed_overlap_seconds"],0.4)
+            self.assertTrue(clips[0]["allow_overlap"])
+
+            rows[1]["speaker_boundary_ambiguous"]=True
+            with patch("tts_router._run_worker",side_effect=self.worker([],set())):
+                clips,_=router.run(rows,"unused",force=True)
+            self.assertEqual(clips[0]["allowed_overlap_seconds"],0.0)
+
     def test_missing_speaker_reference_uses_nearest_safe_reference(self):
         calls = []
         def postprocess(source_path, destination, target_duration):
@@ -689,10 +713,26 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(duration_quality(2.49,5.68)["duration_quality"],"failed")
         self.assertEqual(duration_quality(5.6,5.68)["duration_quality"],"passed")
 
-    def test_natural_duration_fit_uses_short_absolute_and_long_ratio_rules(self):
+    def test_natural_duration_fit_uses_percentage_rules(self):
         self.assertEqual(natural_duration_fit(0.7, 0.5)["natural_duration_fit"], "passed")
         self.assertEqual(natural_duration_fit(2.5, 2.0)["duration_rewrite_direction"], "compress")
         self.assertEqual(natural_duration_fit(1.5, 2.0)["duration_rewrite_direction"], "expand")
+
+    def test_trusted_ocr_uses_wider_percentage_band(self):
+        self.assertEqual(
+            natural_duration_fit(2.6, 2.0)["natural_duration_fit"],
+            "failed",
+        )
+        trusted = natural_duration_fit(2.6, 2.0, "ocr_direct")
+        self.assertEqual(trusted["natural_duration_fit"], "passed")
+        self.assertEqual(trusted["natural_duration_rule"], "trusted_ocr_ratio")
+
+    def test_light_duration_fit_is_ratio_based_and_ocr_aware(self):
+        standard = LightTTSSelector._duration_fit(2.6, 2.0, 3.0, "standard")
+        trusted = LightTTSSelector._duration_fit(2.6, 2.0, 3.0, "ocr_direct")
+        self.assertEqual(standard["duration_fit"], "borderline")
+        self.assertEqual(trusted["duration_fit"], "suitable")
+        self.assertAlmostEqual(trusted["duration_ratio"], 1.3)
 
     def test_tampered_wav_is_not_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,9 +8,9 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.13.0"
+RULE_VERSION = "translation-v2.14.0-context-ratio"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "native-dubbing-ocr-v14-formal-tts-feedback"
+PROMPT_VERSION = "native-dubbing-ocr-v15-dialogue-context-ratio"
 
 OCR_HARD_CONFLICTS = {
     "wrong_entity",
@@ -691,7 +691,8 @@ def _restore_backend_candidate_priorities(validated: dict, cached: dict) -> None
 
 def segment_fingerprint(segment: dict, previous: str, following: str, source: str,
                         target: str, model: str,
-                        entity_glossary: list[dict] | None = None) -> str:
+                        entity_glossary: list[dict] | None = None,
+                        dialogue_context: list[dict] | None = None) -> str:
     payload = {"rules": RULE_VERSION, "language_check": LANGUAGE_VERSION, "prompt": PROMPT_VERSION,
                "source": language_code(source), "target": language_code(target), "model": model,
                "segment": {k: segment.get(k) for k in
@@ -700,10 +701,34 @@ def segment_fingerprint(segment: dict, previous: str, following: str, source: st
                             "tts_hard_end", "tts_target_duration",
                             "tts_timing_precision")},
                "previous_text": previous, "next_text": following,
+               "dialogue_context": dialogue_context or [],
                "entity_glossary": entity_glossary or [],
                "ocr_translation_references": segment.get("_ocr_translation_references", []),
                "ocr_source_spelling_hints": segment.get("_ocr_source_spelling_hints", [])}
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def _dialogue_context(
+    segments: list[dict], index: int, radius: int = 3
+) -> list[dict]:
+    """Return a compact, speaker-aware scene window around one source line."""
+    current_speaker = str(segments[index].get("speaker", "Unknown"))
+    context = []
+    left = max(0, index - max(1, int(radius)))
+    right = min(len(segments), index + max(1, int(radius)) + 1)
+    for other_index in range(left, right):
+        if other_index == index:
+            continue
+        item = segments[other_index]
+        context.append({
+            "relative_index": other_index - index,
+            "speaker": str(item.get("speaker", "Unknown")),
+            "same_speaker": str(item.get("speaker", "Unknown")) == current_speaker,
+            "text": str(item.get("text", "")),
+            "start": item.get("start"),
+            "end": item.get("end"),
+        })
+    return context
 
 
 def translate_segments(segments: list[dict], source: str, target: str, model: str,
@@ -720,9 +745,11 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         sid = ids[i]
         before = str(segments[i-1].get("text", "")) if i else ""
         after = str(segments[i+1].get("text", "")) if i+1 < len(segments) else ""
+        dialogue_context = _dialogue_context(segments, i)
         required_entities = applicable_glossary_entries(segment, entity_glossary)
         fp = segment_fingerprint(
-            segment, before, after, source, target, model, required_entities
+            segment, before, after, source, target, model, required_entities,
+            dialogue_context,
         )
         # Prompt-only keys are intentionally not copied into persisted/public rows.
         public_segment = {
@@ -747,12 +774,17 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
             else:
                 validated = validate_translation(known, segment, source, target)
                 _restore_backend_candidate_priorities(validated, known)
+                if known.get("translation_selection_source"):
+                    validated["translation_selection_source"] = str(
+                        known["translation_selection_source"]
+                    )
                 row.update(validated)
             row["translation_attempts"] = known.get("translation_attempts", 0)
             row["translation_cache_hit"] = True
         except ValueError:
             pending.append(i)
         rows.append(row)
+        rows[i]["translation_dialogue_context"] = dialogue_context
         references = []
         for reference in segment.get("_ocr_translation_references", [])[:3]:
             if not isinstance(reference, dict):
@@ -770,6 +802,8 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     "missing_rate": reference.get("missing_rate"),
                     "extra_rate": reference.get("extra_rate"),
                     "frame_support": reference.get("frame_support"),
+                    "adaptive_time_match": bool(reference.get("adaptive_time_match", False)),
+                    "temporal_outside_seconds": reference.get("temporal_outside_seconds"),
                     "composed": bool(reference.get("composed", False)),
                     "subtitle_cards": reference.get("subtitle_cards", [])[:8],
                     "source_clauses": reference.get("source_clauses", [])[:12],
@@ -853,6 +887,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         inputs[i] = {"id": sid, "speaker": segment.get("speaker", "Unknown"),
                      "text_asr_corrected": segment.get("text", ""),
                      "previous_text": before, "next_text": after,
+                     "dialogue_context": dialogue_context,
                      "duration": public_duration,
                      "speech_duration_seconds": round(speech_duration, 3),
                      "compact_spoken_budget": compact_budget,
@@ -1167,6 +1202,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     )
                     if trusted_primary:
                         valid["text"] = trusted_primary["text"]
+                        valid["translation_selection_source"] = str(
+                            trusted_primary.get("_selection_priority", "standard")
+                        )
                     valid["translations_candidates"] = candidates[:5]
                 elif preferred and response_row.get("ocr_reference_complete") is True:
                     valid["translation_warnings"].append(

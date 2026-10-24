@@ -297,6 +297,32 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertEqual(len(refined[0]["tts_internal_pauses"]), 1)
         self.assertEqual(audit[0]["precision"], "word_vad_consensus")
 
+    def test_ambiguous_implausible_word_span_uses_local_ratio_guard(self):
+        segment = {
+            "id": 7, "start": 43.49, "end": 49.61,
+            "text": "Hold on to the railing.",
+            "timestamp_precision": "word",
+            "speaker_boundary_ambiguous": True,
+            "qwen3_time_stamps": [
+                {"text": "Hold", "start": 43.51, "end": 44.2},
+                {"text": "on", "start": 44.3, "end": 45.0},
+                {"text": "to", "start": 45.1, "end": 45.8},
+                {"text": "the", "start": 46.0, "end": 47.0},
+                {"text": "railing", "start": 47.1, "end": 49.25},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(43.5, 49.3)]
+        )
+        row = refined[0]
+        self.assertEqual(
+            row["tts_timing_reason"], "ambiguous_word_span_ratio_guard"
+        )
+        self.assertLess(row["tts_hard_end"] - row["tts_placement_start"], 3.6)
+        self.assertLess(row["tts_target_duration"], 3.6)
+        self.assertLess(row["tts_timing_confidence"], 0.7)
+        self.assertIsNotNone(audit[0]["ratio_guard"])
+
     def test_source_activity_can_only_extend_existing_vocal_edges(self):
         fused = fuse_speech_regions(
             [(5.0, 6.0)], [(1.0, 2.0), (4.9, 6.15)]
@@ -581,6 +607,31 @@ class OCRTimelineTests(unittest.TestCase):
             self.assertEqual(reference["target_text"], "来点魔法！来点魔法！")
             self.assertTrue(reference["repetition_count_mismatch"])
             self.assertEqual(reference["reference_policy"], "repair_or_compress")
+
+    def test_exact_ocr_can_use_adaptive_temporal_margin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory) / "ocr_optimized"
+            cache_dir.mkdir(parents=True)
+            frame_text = (
+                "<ref>Hold on to the railing.</ref>\n"
+                "<ref>请抓紧栏杆。</ref>"
+            )
+            (cache_dir / "ocr_frames.json").write_text(
+                json.dumps({
+                    "a": {"status": "ok", "timestamp": 11.1, "segment_id": "7", "text": frame_text},
+                    "b": {"status": "ok", "timestamp": 11.3, "segment_id": "7", "text": frame_text},
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result = prepare_ocr_translation_references(
+                directory,
+                [{"id": 7, "start": 8.0, "end": 10.0,
+                  "text": "Hold on to the railing."}],
+                "en", "zh",
+            )
+            reference = result["references_by_segment"]["7"][0]
+            self.assertTrue(reference["adaptive_time_match"])
+            self.assertGreater(reference["temporal_outside_seconds"], 0.8)
 
     def test_coarse_duration_uses_full_slot_for_hard_gate(self):
         ideal, available = LightTTSSelector._speech_window({
