@@ -324,6 +324,23 @@ class LightTTSSelector:
         start = float(segment["start"])
         end = float(segment["end"])
         available = max(0.4, end - start)
+        try:
+            explicit_start = float(segment.get("tts_placement_start"))
+            explicit_target = float(segment.get("tts_target_duration"))
+            explicit_hard_end = float(
+                segment.get(
+                    "tts_hard_end",
+                    segment.get("tts_placement_end"),
+                )
+            )
+        except (TypeError, ValueError):
+            explicit_start = explicit_target = explicit_hard_end = 0.0
+        if (
+            start <= explicit_start < explicit_hard_end <= end + 0.001
+            and explicit_target > 0.0
+        ):
+            hard_duration = max(0.4, explicit_hard_end - explicit_start)
+            return min(max(0.4, explicit_target), hard_duration), hard_duration
         # Coarse recovery explicitly means that only the outer acoustic bounds
         # are trusted.  Speaker alignment can carry stale/collapsed Qwen word
         # timestamps into a copied segment; using those values would turn a
@@ -403,9 +420,15 @@ class LightTTSSelector:
             if candidates[int(row["candidate_index"])].get("_selection_priority")
             in {"ocr_repaired", "ocr_hybrid"}
         ]
+        native_standard = [
+            row for row in successful
+            if candidates[int(row["candidate_index"])].get("_selection_priority")
+            == "native_standard"
+        ]
         standard = [
             row for row in successful
-            if candidates[int(row["candidate_index"])].get("_selection_priority") == "standard"
+            if candidates[int(row["candidate_index"])].get("_selection_priority")
+            in {"native_standard", "faithful_variant", "standard"}
         ]
         # Audit-failed/unavailable OCR remains in diagnostics but is never a
         # selectable dubbing candidate.
@@ -445,6 +468,14 @@ class LightTTSSelector:
         # Once timing is usable, preserve the standard natural translation
         # instead of selecting a more verbose variant merely because it fills
         # a little more of the source window.
+        native_suitable = [
+            row for row in native_standard if row["duration_fit"] == "suitable"
+        ]
+        if native_suitable:
+            return min(
+                native_suitable, key=lambda row: float(row["duration_error"])
+            ), "native_standard_duration_suitable"
+
         standard_suitable = [row for row in standard if row["duration_fit"] == "suitable"]
         if standard_suitable:
             return min(

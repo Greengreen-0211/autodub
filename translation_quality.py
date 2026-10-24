@@ -8,9 +8,9 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.12.1"
+RULE_VERSION = "translation-v2.13.0"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v13-compact-duration"
+PROMPT_VERSION = "native-dubbing-ocr-v14-formal-tts-feedback"
 
 OCR_HARD_CONFLICTS = {
     "wrong_entity",
@@ -640,7 +640,11 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
     # Candidate metadata returned by the model is untrusted. Provenance is
     # assigned only by this module after validation.
     for candidate in candidates:
-        candidate["_selection_priority"] = "standard"
+        candidate["_selection_priority"] = (
+            "native_standard"
+            if canonical(candidate.get("text")) == primary_key
+            else "faithful_variant"
+        )
     trusted_ocr = any(
         isinstance(reference, dict)
         and str(reference.get("confidence", "")).lower() == "high"
@@ -669,7 +673,10 @@ def _restore_backend_candidate_priorities(validated: dict, cached: dict) -> None
     A resumable checkpoint, however, already contains backend-validated OCR
     candidates and must retain their selection priority on a cache hit.
     """
-    allowed = {"ocr_direct", "ocr_repaired", "ocr_hybrid", "ocr_reference", "standard"}
+    allowed = {
+        "ocr_direct", "ocr_repaired", "ocr_hybrid", "ocr_reference",
+        "native_standard", "faithful_variant", "standard",
+    }
     priorities = {
         _canonical(candidate.get("text")): candidate.get("_selection_priority")
         for candidate in cached.get("translations_candidates", [])
@@ -688,7 +695,10 @@ def segment_fingerprint(segment: dict, previous: str, following: str, source: st
     payload = {"rules": RULE_VERSION, "language_check": LANGUAGE_VERSION, "prompt": PROMPT_VERSION,
                "source": language_code(source), "target": language_code(target), "model": model,
                "segment": {k: segment.get(k) for k in
-                           ("id", "text", "start", "end", "speaker", "translation_allow_identity")},
+                           ("id", "text", "start", "end", "speaker",
+                            "translation_allow_identity", "tts_placement_start",
+                            "tts_hard_end", "tts_target_duration",
+                            "tts_timing_precision")},
                "previous_text": previous, "next_text": following,
                "entity_glossary": entity_glossary or [],
                "ocr_translation_references": segment.get("_ocr_translation_references", []),
@@ -759,6 +769,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     "source_coverage": reference.get("source_coverage"),
                     "missing_rate": reference.get("missing_rate"),
                     "extra_rate": reference.get("extra_rate"),
+                    "frame_support": reference.get("frame_support"),
                     "composed": bool(reference.get("composed", False)),
                     "subtitle_cards": reference.get("subtitle_cards", [])[:8],
                     "source_clauses": reference.get("source_clauses", [])[:12],
@@ -767,7 +778,16 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     "usage_policy": (
                         "preferred_if_complete"
                         if (
-                            str(reference.get("confidence", "")).lower() == "high"
+                            (
+                                str(reference.get("confidence", "")).lower() == "high"
+                                or (
+                                    str(reference.get("confidence", "")).lower() == "medium"
+                                    and float(reference.get("source_coverage") or 0.0) >= 0.90
+                                    and float(reference.get("missing_rate") or 1.0) <= 0.10
+                                    and float(reference.get("extra_rate") or 1.0) <= 0.08
+                                    and int(reference.get("frame_support") or 0) >= 2
+                                )
+                            )
                             and str(reference.get("reference_policy", "hint")) != "hint"
                         )
                         else "terminology_hint"
@@ -792,6 +812,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         public_duration = max(
             0.1, float(segment["end"]) - float(segment["start"])
         )
+        explicit_speech_duration = segment.get("tts_target_duration")
         try:
             mix_start = float(
                 segment.get("mix_start", segment.get("speech_start"))
@@ -807,6 +828,11 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
             )
         except (TypeError, ValueError):
             speech_duration = public_duration
+        try:
+            if explicit_speech_duration is not None:
+                speech_duration = float(explicit_speech_duration)
+        except (TypeError, ValueError):
+            pass
         speech_duration = max(0.1, speech_duration)
         target_code = language_code(target)
         if target_code == "en":
@@ -830,12 +856,17 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                      "duration": public_duration,
                      "speech_duration_seconds": round(speech_duration, 3),
                      "compact_spoken_budget": compact_budget,
+                     "candidate_roles": [
+                         "native_standard", "faithful_compact", "ocr_adapted"
+                     ],
                      "minimum_candidates": (
                          1 if is_tiny(str(segment.get("text", ""))) or trusted_ocr else 2
                      ),
                      "entity_glossary": required_entities,
                      "ocr_translation_references": references,
                      "ocr_source_spelling_hints": source_spelling_hints}
+        rows[i]["translation_entity_glossary"] = required_entities
+        rows[i]["translation_ocr_references"] = references
 
     def save():
         if checkpoint:

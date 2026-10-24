@@ -212,7 +212,11 @@ class F5TTSBackend:
         }
         parameters = inspect.signature(self.model.infer).parameters
         target_duration = float(item.get("target_duration") or 0.0)
-        if "fix_duration" in parameters and target_duration > 0:
+        if (
+            "fix_duration" in parameters
+            and target_duration > 0
+            and not bool(item.get("measure_natural_duration", False))
+        ):
             from f5_tts.infer.utils_infer import preprocess_ref_audio_text
             # F5's duration includes the *processed* reference, not just output.
             # Keep ref_file unchanged so infer() hits its preprocessing cache.

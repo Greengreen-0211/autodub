@@ -188,6 +188,30 @@ class DurationTests(unittest.TestCase):
                     self.assertAlmostEqual(calls[-1][2], 6.2 + target)
                     self.assertEqual(calls[-1][0], str(raw))
 
+    def test_f5_duration_loop_measures_unconstrained_natural_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp, "reference.wav")
+            wav(raw, 4.0)
+            observed = []
+
+            class Model:
+                def infer(
+                    self, ref_file, ref_text, gen_text, file_wave,
+                    show_info, fix_duration=None,
+                ):
+                    observed.append(fix_duration)
+                    wav(file_wave, 1.7)
+
+            backend = tts_worker.F5TTSBackend.__new__(tts_worker.F5TTSBackend)
+            backend.model = Model()
+            duration = backend.generate({
+                "ref_audio": str(raw), "ref_text": "Reference.",
+                "text": "Natural words", "target_duration": 1.0,
+                "measure_natural_duration": True,
+            }, Path(tmp, "natural.wav"))
+            self.assertEqual(observed, [None])
+            self.assertAlmostEqual(duration, 1.7, places=2)
+
     def test_f5_legacy_api_without_duration_keeps_existing_call(self):
         with tempfile.TemporaryDirectory() as tmp:
             class Model:

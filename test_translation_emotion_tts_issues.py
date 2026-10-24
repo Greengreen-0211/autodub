@@ -25,7 +25,12 @@ from light_tts_selector import LightTTSSelector, EspeakBackend
 from emotion_recognizer import apply_emotion_reliability
 from scheme3_policy import build_scheme3_segments, describe_scheme3_decision
 import tts_router
-from tts_quality import duration_quality, stage_fingerprint, validate_mix_state
+from tts_quality import (
+    duration_quality,
+    natural_duration_fit,
+    stage_fingerprint,
+    validate_mix_state,
+)
 from tts_preflight import cache_environment, check_model, cached_file, requirements
 
 ROOT=Path(__file__).resolve().parent
@@ -266,6 +271,30 @@ class TranslationTests(unittest.TestCase):
         calls.clear()
         translate_segments(segments,"en","zh","new-model",request,cached=cached)
         self.assertEqual(len(calls),2)
+
+    def test_repeated_high_coverage_medium_ocr_reaches_semantic_audit(self):
+        captured = []
+        segment = source()
+        segment["_ocr_translation_references"] = [{
+            "source_text": segment["text"],
+            "target_text": "这是完整的一句话。",
+            "confidence": "medium",
+            "reference_policy": "repair_or_compress",
+            "source_coverage": 0.95,
+            "missing_rate": 0.04,
+            "extra_rate": 0.02,
+            "frame_support": 3,
+        }]
+
+        def request(items):
+            captured.extend(items)
+            return {"translations": [translation(0)]}
+
+        translate_segments([segment], "en", "zh", "test", request, retries=0)
+        self.assertEqual(
+            captured[0]["ocr_translation_references"][0]["usage_policy"],
+            "preferred_if_complete",
+        )
 
     def test_language_and_identity_rules(self):
         for text,target in (("Any","zh"),("中文 sentence","en"),("","en"),("Hello","ja")):
@@ -541,6 +570,96 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(results[0]["tts_text"],"short")
             self.assertEqual(len(calls),1)
 
+    def test_formal_tts_can_request_two_targeted_retranslations(self):
+        calls = []
+        rewrites = iter(["rewrite one", "rewrite two"])
+
+        def worker(model, plan, result, force=False):
+            calls.append(model)
+            data = json.loads(Path(result).read_text())
+            durations = {"initial words": 2.0, "rewrite one": 1.4, "rewrite two": 1.1}
+            for item in json.loads(Path(plan).read_text())["items"]:
+                duration = durations[item["text"]]
+                wav(item["raw_path"], duration)
+                data[item["segment_id"]].update(
+                    status="success", generated_duration=duration
+                )
+            Path(result).write_text(json.dumps(data))
+            return 0
+
+        def postprocess(src, dst, target, **_kwargs):
+            shutil.copy2(src, dst)
+            natural = tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration": natural,
+                "post_trim_duration": natural,
+                "actual_duration": natural,
+                "atempo_factor": 1.0,
+                "atempo_raw_factor": natural / target,
+                "atempo_capped": False,
+            }
+
+        def rewrite(_segment, _text, _feedback, _history):
+            return {"text": next(rewrites), "native_fluency": "pass"}
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ), patch("tts_router._run_worker", side_effect=worker), patch(
+            "tts_router._postprocess", side_effect=postprocess
+        ), patch("tts_router.electricity_quality", return_value={}), patch(
+            "tts_router.voice_consistency_quality", return_value={}
+        ):
+            ref = Path(tmp) / "ref.wav"
+            wav(ref)
+            router = tts_router.TTSRouter(
+                SimpleNamespace(
+                    temp_dir=tmp, target_lang="en", source_lang="en",
+                    disable_tts_fallback=False,
+                ),
+                scheme="scheme3",
+                duration_rewriter=rewrite,
+            )
+            router._speaker_references = lambda *_args: {
+                "A": {"audio": str(ref), "text": "source text"}
+            }
+            segment = dict(
+                source(text="initial words"), end=2.0, tts_engine="f5tts",
+                tts_placement_start=0.0, tts_target_duration=1.0,
+                tts_hard_end=2.0,
+            )
+            clips, results = router.run([segment], "unused")
+            first_calls = list(calls)
+            quality_state = {
+                "segments_step3": [dict(segment, text="rewrite two")],
+                "audio_clips": clips,
+                "tts_router_results": results,
+                "tts_backend": "scheme3",
+            }
+            quality_config = SimpleNamespace(target_lang="en")
+            quality_state["tts_stage_manifest"] = {
+                "fingerprint": stage_fingerprint(
+                    quality_state, quality_config, "scheme3"
+                ),
+                "success": 1,
+            }
+            self.assertEqual(
+                validate_mix_state(quality_state, quality_config), []
+            )
+            calls.clear()
+            resumed_clips, resumed_results = router.run([segment], "unused")
+            self.assertEqual(calls, [])
+            self.assertEqual(resumed_results[0]["tts_text"], "rewrite two")
+            self.assertEqual(len(resumed_clips), 1)
+            rewritten_segment = dict(segment, text="rewrite two")
+            router.run([rewritten_segment], "unused")
+            self.assertEqual(calls, [])
+        self.assertEqual(first_calls, ["f5tts", "f5tts", "f5tts"])
+        self.assertEqual(results[0]["tts_text"], "rewrite two")
+        self.assertEqual(results[0]["duration_rewrite_count"], 2)
+        self.assertEqual(results[0]["duration_selected_attempt"], 2)
+        self.assertEqual(len(results[0]["duration_attempt_history"]), 3)
+        self.assertEqual(len(clips), 1)
+
 
 class QualityTests(unittest.TestCase):
     def mix(self,tmp):
@@ -569,6 +688,11 @@ class QualityTests(unittest.TestCase):
     def test_duration_gate(self):
         self.assertEqual(duration_quality(2.49,5.68)["duration_quality"],"failed")
         self.assertEqual(duration_quality(5.6,5.68)["duration_quality"],"passed")
+
+    def test_natural_duration_fit_uses_short_absolute_and_long_ratio_rules(self):
+        self.assertEqual(natural_duration_fit(0.7, 0.5)["natural_duration_fit"], "passed")
+        self.assertEqual(natural_duration_fit(2.5, 2.0)["duration_rewrite_direction"], "compress")
+        self.assertEqual(natural_duration_fit(1.5, 2.0)["duration_rewrite_direction"], "expand")
 
     def test_tampered_wav_is_not_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -663,7 +787,8 @@ class PipelineTests(unittest.TestCase):
                 project_name="test",light_tts_enabled=False,
             )
             globals=self.functions({
-                "run_step_3", "_translation_candidates_fingerprint",
+                "run_step_3", "_refine_step3_timing",
+                "_translation_candidates_fingerprint",
                 "_routing_report_rows", "summarize_routing", "print_routing_report",
             },{"StateManager":Manager,"AdvancedTranslator":Translator})
             globals["run_step_3"](config)

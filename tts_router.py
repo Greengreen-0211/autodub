@@ -16,7 +16,7 @@ import subprocess
 import time
 import wave
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from scheme3_policy import (
     SCHEME3_ENGINES,
@@ -28,6 +28,7 @@ from tts_preflight import cache_environment, offline_mode, preflight_models
 from tts_quality import (
     duration_quality,
     electricity_quality,
+    natural_duration_fit,
     voice_consistency_quality,
 )
 
@@ -143,9 +144,10 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         for key in (
             "text", "language", "target_language", "emotion", "speaker",
             "ref_audio", "ref_text", "target_duration", "model",
+            "measure_natural_duration",
         )
     }
-    payload["version"] = "tts-request-v2.4.0-force-fit"
+    payload["version"] = "tts-request-v2.5.0-duration-retranslation"
     payload["worker_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_worker.py").read_bytes()).hexdigest()
     payload["policy_sha256"] = hashlib.sha256(Path(__file__).with_name("scheme3_policy.py").read_bytes()).hexdigest()
     payload["quality_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_quality.py").read_bytes()).hexdigest()
@@ -241,6 +243,29 @@ def _tts_timing(segment: Dict[str, Any]) -> tuple[float, float]:
     return placement_start, placement_end - placement_start
 
 
+def _tts_window(segment: Dict[str, Any]) -> tuple[float, float, float]:
+    """Return placement, ideal spoken duration and exclusive hard end."""
+    placement, legacy_duration = _tts_timing(segment)
+    try:
+        explicit_start = float(segment.get("tts_placement_start", placement))
+        target = float(segment.get("tts_target_duration", legacy_duration))
+        hard_end = float(
+            segment.get(
+                "tts_hard_end",
+                segment.get("tts_placement_end", placement + legacy_duration),
+            )
+        )
+    except (TypeError, ValueError):
+        return placement, legacy_duration, placement + legacy_duration
+    outer_start = float(segment.get("start", placement))
+    outer_end = float(segment.get("end", hard_end))
+    if not (outer_start <= explicit_start < hard_end <= outer_end + 0.001):
+        return placement, legacy_duration, placement + legacy_duration
+    hard_duration = hard_end - explicit_start
+    target = max(0.1, min(target, hard_duration))
+    return explicit_start, target, hard_end
+
+
 def _file_sha256(path: Path) -> str:
     digest=hashlib.sha256()
     with path.open("rb") as handle:
@@ -261,8 +286,8 @@ def _atempo_factor(current: float, target: float) -> tuple[float, bool, float]:
     """
     if target <= 0.1 or abs(current - target) < 0.2:
         return 1.0, False, 1.0
-    minimum = float(os.getenv("AUTODUB_TTS_ATEMPO_MIN", "0.8"))
-    maximum = float(os.getenv("AUTODUB_TTS_ATEMPO_MAX", "1.25"))
+    minimum = float(os.getenv("AUTODUB_TTS_ATEMPO_MIN", "0.9"))
+    maximum = float(os.getenv("AUTODUB_TTS_ATEMPO_MAX", "1.10"))
     # ffmpeg's single atempo filter only accepts [0.5, 2.0]; clamp defensively.
     minimum = max(0.5, min(minimum, 2.0))
     maximum = max(0.5, min(maximum, 2.0))
@@ -366,7 +391,13 @@ def _trim_silence(source: Path, destination: Path) -> Path:
     return destination
 
 
-def _postprocess(source: Path, destination: Path, target_duration: float) -> Dict[str, Any]:
+def _postprocess(
+    source: Path,
+    destination: Path,
+    target_duration: float,
+    *,
+    allow_force_fit: bool = True,
+) -> Dict[str, Any]:
     """Trim silence then time-scale to target; return post-processing metrics."""
     trimmed = destination.with_name(destination.stem + ".trim.wav")
     try:
@@ -383,7 +414,8 @@ def _postprocess(source: Path, destination: Path, target_duration: float) -> Dic
         # risks losing words, so the default final pass compresses rather than
         # stretching concise translations to fill silence.
         if (
-            force_fit
+            allow_force_fit
+            and force_fit
             and target_duration > 0.04
             and natural_duration > target_duration + max(0.005, tolerance)
         ):
@@ -497,7 +529,13 @@ def synthesize(
 
 
 class TTSRouter:
-    def __init__(self, config: Any, *, scheme: str = "scheme2"):
+    def __init__(
+        self,
+        config: Any,
+        *,
+        scheme: str = "scheme2",
+        duration_rewriter: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
+    ):
         if scheme not in {"baseline", "scheme2", "scheme3"}:
             raise ValueError(f"unsupported TTS scheme: {scheme}")
         self.config = config
@@ -509,6 +547,7 @@ class TTSRouter:
         self.final_dir = self.root / "final"
         self.plan_path = self.root / "plan.json"
         self.result_path = self.root / "results.json"
+        self.duration_rewriter = duration_rewriter
 
     @staticmethod
     def _reference_score(segment: Dict[str, Any], clip: Any) -> float:
@@ -714,7 +753,7 @@ class TTSRouter:
                     f"⚠️ segment={segment_id} speaker={speaker} 没有安全参考音频；"
                     f"使用最近可靠声纹 {reference_fallback_speaker}，保留整句并标记降级"
                 )
-            placement_start, duration = _tts_timing(segment)
+            placement_start, duration, hard_end = _tts_window(segment)
             raw_emotion = segment.get("raw_emotion", segment.get("emotion_raw", segment.get("emotion")))
             if "emotion_reliable" in segment:
                 emotion = normalize_emotion(segment.get("emotion")) if segment["emotion_reliable"] else "neutral"
@@ -748,24 +787,54 @@ class TTSRouter:
                 "reference_fallback_speaker": reference_fallback_speaker,
                 "reference_fallback_reason": reference_fallback_reason,
                 "start": placement_start, "model": model, "tts_engine": model,
-                "end": placement_start + duration,
+                "end": hard_end,
+                "hard_duration": max(0.0, hard_end - placement_start),
+                "allow_overlap": bool(segment.get("allow_overlap", False)),
                 "placement_source": placement_source,
                 "planned_engine": model, "fallback_count": 0, "fallback_reason": "",
                 "translations_candidates": segment.get("translations_candidates", []),
                 "attempted_engines": [model], "attempted_texts": [text],
+                "source_segment": segment,
+                "duration_attempt": 0,
+                "measure_natural_duration": self.duration_rewriter is not None,
             }
             self._job_paths(job)
             job["request_fingerprint"] = _request_fingerprint(job)
             job["planned_request_fingerprint"] = job["request_fingerprint"]
             items.append(job)
 
+        # The next dub onset is the final collision boundary. Apply it before
+        # synthesis so duration feedback targets a physically usable slot,
+        # rather than letting Step 5 discover and truncate an overlap later.
+        chronological = sorted(items, key=lambda row: float(row["start"]))
+        for position, item in enumerate(chronological):
+            hard_end = float(item["end"])
+            if position + 1 < len(chronological) and not item.get("allow_overlap"):
+                hard_end = min(hard_end, float(chronological[position + 1]["start"]))
+            item["end"] = max(float(item["start"]), hard_end)
+            item["hard_duration"] = max(0.0, item["end"] - float(item["start"]))
+            if item["hard_duration"] > 0.04:
+                item["target_duration"] = min(
+                    float(item["target_duration"]), item["hard_duration"]
+                )
+            item["request_fingerprint"] = _request_fingerprint(item)
+            item["planned_request_fingerprint"] = item["request_fingerprint"]
+
         active = []
         for item in items:
             known = previous.get(item["segment_id"], {})
             reused = False
+            planned_compatible = (
+                known.get("planned_request_fingerprint")
+                == item["planned_request_fingerprint"]
+                or (
+                    int(known.get("duration_translation_attempts") or 0) > 0
+                    and str(known.get("tts_text") or "") == str(item["text"])
+                )
+            )
             if (not force and known.get("status")=="success" and
                     not (getattr(self.config,"disable_tts_fallback",False) and known.get("actual_engine")!=item["planned_engine"]) and
-                    known.get("planned_request_fingerprint")==item["planned_request_fingerprint"]):
+                    planned_compatible):
                 resumed = dict(item, model=known.get("actual_engine", item["model"]),
                                text=known.get("tts_text", item["text"]))
                 resumed["language"] = _language_code(resumed["target_language_raw"]) if resumed["model"]=="omnivoice" else resumed["target_language"]
@@ -828,6 +897,9 @@ class TTSRouter:
                 self._execute(retry, force=True)
                 previous = _load_results(self.result_path)
 
+        if self.duration_rewriter is not None:
+            previous = self._run_duration_retranslation(items, previous)
+
         clips, output_rows = [], []
         for item in items:
             sid = item["segment_id"]
@@ -842,7 +914,8 @@ class TTSRouter:
                             request_fingerprint=item["request_fingerprint"], target_duration=item["target_duration"],
                             generation_request={k:item[k] for k in ("text","language","target_language","emotion",
                                                "speaker","ref_audio","ref_text","target_duration","start","model",
-                                               "reference_segment_id","reference_purity_score")},
+                                               "reference_segment_id","reference_purity_score",
+                                               "measure_natural_duration")},
                             placement_start=item["start"],
                             placement_end=item["end"],
                             placement_source=item.get("placement_source", "segment_start"),
@@ -859,7 +932,8 @@ class TTSRouter:
                             target_language_raw=item["target_language_raw"])
             if metadata.get("status")=="success":
                 clips.append({"segment_id":sid, "start":item["start"], "end":item["end"], "file":metadata["file"],
-                              "tts_engine":item["model"], "request_fingerprint":item["request_fingerprint"]})
+                              "tts_engine":item["model"], "request_fingerprint":item["request_fingerprint"],
+                              "allow_overlap":bool(item.get("allow_overlap", False))})
             output_rows.append(metadata)
             previous[sid] = metadata
             print(f"[TTS] segment={sid} planned={item['planned_engine']} actual={item['model']} "
@@ -871,8 +945,204 @@ class TTSRouter:
         print("TTS quality failures:", [{"id":r["segment_id"], "error":r.get("error")} for r in output_rows if r.get("status")!="success"])
         return clips, output_rows
 
+    def _run_duration_retranslation(self, items, results):
+        """Measure formal TTS, request at most two rewrites, keep the closest."""
+        maximum_rewrites = max(
+            0, min(2, int(os.getenv("AUTODUB_TTS_DURATION_REWRITES", "2")))
+        )
+        updated_results = dict(results)
+        for item in items:
+            sid = item["segment_id"]
+            metadata = dict(updated_results.get(sid, {}))
+            if metadata.get("status") != "success":
+                continue
+            if (
+                int(metadata.get("duration_translation_attempts") or 0) > 0
+                and Path(str(metadata.get("file") or "")).is_file()
+            ):
+                # A completed three-version decision is immutable on resume.
+                # Its raw attempt files are not part of the public checkpoint.
+                continue
+            candidates = []
+
+            def remember(attempt_index, rewrite_info=None):
+                current = dict(_load_results(self.result_path).get(sid, {}))
+                if current.get("status") != "success":
+                    return None
+                natural = float(
+                    current.get("post_trim_duration")
+                    or current.get("pre_trim_duration")
+                    or current.get("actual_duration")
+                    or 0.0
+                )
+                fit = natural_duration_fit(natural, item["target_duration"])
+                candidate = {
+                    "attempt": attempt_index,
+                    "text": item["text"],
+                    "model": item["model"],
+                    "raw_path": item["raw_path"],
+                    "final_path": item["final_path"],
+                    "request_fingerprint": item["request_fingerprint"],
+                    "metadata": current,
+                    "fit": fit,
+                    "rewrite": rewrite_info or {},
+                }
+                candidates.append(candidate)
+                return candidate
+
+            current_candidate = remember(0)
+            if current_candidate is None:
+                continue
+            for rewrite_index in range(1, maximum_rewrites + 1):
+                if current_candidate["fit"]["natural_duration_fit"] == "passed":
+                    break
+                try:
+                    rewrite = self.duration_rewriter(
+                        dict(item.get("source_segment") or {}),
+                        item["text"],
+                        current_candidate["fit"],
+                        [
+                            {
+                                "text": candidate["text"],
+                                **candidate["fit"],
+                            }
+                            for candidate in candidates
+                        ],
+                    )
+                except Exception as exc:
+                    print(
+                        f"⚠️ segment={sid} 时长定向重译失败，保留已有候选: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    continue
+                rewritten_text = str((rewrite or {}).get("text") or "").strip()
+                if not rewritten_text or rewritten_text in item["attempted_texts"]:
+                    continue
+                item["text"] = rewritten_text
+                item["attempted_texts"].append(rewritten_text)
+                item["duration_attempt"] = rewrite_index
+                self._job_paths(item)
+                item["request_fingerprint"] = _request_fingerprint(item)
+                item["force_regenerate"] = True
+                self._execute([item], force=True)
+                current_candidate = remember(rewrite_index, rewrite)
+                if current_candidate is None:
+                    break
+
+            valid = [
+                candidate for candidate in candidates
+                if candidate["metadata"].get("status") == "success"
+                and candidate["fit"]["natural_duration"] > 0.0
+            ]
+            if not valid:
+                continue
+            passing = [
+                candidate for candidate in valid
+                if candidate["fit"]["natural_duration_fit"] == "passed"
+            ]
+            chosen = (passing or valid)
+            chosen = min(
+                chosen,
+                key=lambda candidate: (
+                    float(candidate["fit"]["duration_log_distance"]),
+                    int(candidate["attempt"]),
+                ),
+            )
+            item.update({
+                "text": chosen["text"],
+                "model": chosen["model"],
+                "tts_engine": chosen["model"],
+                "raw_path": chosen["raw_path"],
+                "final_path": chosen["final_path"],
+                "request_fingerprint": chosen["request_fingerprint"],
+                "duration_attempt": chosen["attempt"],
+            })
+            final_metadata = dict(chosen["metadata"])
+            try:
+                post = _postprocess(
+                    Path(item["raw_path"]), Path(item["final_path"]),
+                    item["target_duration"], allow_force_fit=False,
+                )
+                final_metadata.update(post)
+                hard_duration = float(
+                    item.get("hard_duration") or item["target_duration"]
+                )
+                if (
+                    hard_duration > 0.04
+                    and float(post["actual_duration"]) > hard_duration + 0.01
+                ):
+                    forced = _apply_atempo_exact(
+                        Path(item["final_path"]), Path(item["final_path"]),
+                        hard_duration,
+                    )
+                    final_metadata.update(forced)
+                    final_metadata["forced_duration_reason"] = (
+                        "exceeds_collision_window_after_three_translations"
+                    )
+                    final_metadata["actual_duration"] = _wav_duration(
+                        Path(item["final_path"])
+                    )
+                actual = float(final_metadata["actual_duration"])
+                final_metadata.update(duration_quality(actual, item["target_duration"]))
+                if final_metadata.get("duration_quality") == "failed":
+                    final_metadata.update(
+                        duration_quality="degraded",
+                        duration_degraded_reason=(
+                            "closest_valid_translation_after_duration_retries"
+                        ),
+                    )
+                final_metadata.update(chosen["fit"])
+                final_metadata.update(
+                    status="success",
+                    file=item["final_path"],
+                    audio_sha256=_file_sha256(Path(item["final_path"])),
+                    request_fingerprint=item["request_fingerprint"],
+                    duration_translation_attempts=len(valid),
+                    duration_rewrite_count=max(0, len(valid) - 1),
+                    duration_selected_attempt=chosen["attempt"],
+                    duration_selection_reason=(
+                        "first_natural_fit" if passing
+                        else "closest_of_three_valid_translations"
+                    ),
+                    duration_attempt_history=[
+                        {
+                            "attempt": candidate["attempt"],
+                            "text": candidate["text"],
+                            "natural_duration": round(
+                                candidate["fit"]["natural_duration"], 4
+                            ),
+                            "ratio": round(
+                                candidate["fit"]["natural_duration_ratio"], 4
+                            ),
+                            "fit": candidate["fit"]["natural_duration_fit"],
+                            "direction": candidate["fit"][
+                                "duration_rewrite_direction"
+                            ],
+                        }
+                        for candidate in candidates
+                    ],
+                )
+            except Exception as exc:
+                final_metadata.update(
+                    status="failed",
+                    error=f"final duration selection failed: {exc}",
+                )
+            updated_results[sid] = final_metadata
+            print(
+                f"[TTS duration] segment={sid} attempts={len(valid)} "
+                f"selected={chosen['attempt']} natural="
+                f"{chosen['fit']['natural_duration']:.2f}/"
+                f"{item['target_duration']:.2f}s ratio="
+                f"{chosen['fit']['natural_duration_ratio']:.3f}"
+            )
+            _atomic_json(self.result_path, updated_results)
+        return updated_results
+
     def _job_paths(self, item):
         suffix = f"_{item['model']}"
+        duration_attempt = int(item.get("duration_attempt", 0) or 0)
+        if duration_attempt:
+            suffix += f"_duration_{duration_attempt}"
         safe = _safe_id(item["segment_id"])
         item["raw_path"] = str(self.raw_dir/f"segment_{safe}{suffix}.wav")
         item["final_path"] = str(self.final_dir/f"segment_{safe}{suffix}.wav")
@@ -927,7 +1197,16 @@ class TTSRouter:
                     metadata.update(status="failed",error=f"{model} worker exited with {code}")
                 if metadata.get("status")=="success":
                     try:
-                        post = _postprocess(Path(item["raw_path"]), Path(item["final_path"]), item["target_duration"])
+                        if self.duration_rewriter is None:
+                            post = _postprocess(
+                                Path(item["raw_path"]), Path(item["final_path"]),
+                                item["target_duration"],
+                            )
+                        else:
+                            post = _postprocess(
+                                Path(item["raw_path"]), Path(item["final_path"]),
+                                item["target_duration"], allow_force_fit=False,
+                            )
                         actual = post["actual_duration"]
                         metadata.update(post)
                         metadata.update(file=item["final_path"], actual_duration=actual,

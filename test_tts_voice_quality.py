@@ -85,7 +85,7 @@ class AtempoFactorTests(unittest.TestCase):
     def test_slowdown_is_clamped_but_not_capped(self):
         # An under-length clip is a real failure, not an accepted state.
         factor, capped, raw = tts_router._atempo_factor(0.1, 1.0)
-        self.assertEqual(factor, 0.8)
+        self.assertEqual(factor, 0.9)
         self.assertFalse(capped)
         self.assertEqual(raw, 0.1)
 

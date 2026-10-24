@@ -75,6 +75,132 @@ def intersect_ranges(
     return intersections
 
 
+def fuse_speech_regions(
+    primary: Sequence[TimeRange],
+    secondary: Sequence[TimeRange],
+    *,
+    edge_extension: float = 0.18,
+) -> List[TimeRange]:
+    """Use the source track to restore clipped vocal edges, not add music.
+
+    Demucs vocals are the authoritative activity detector.  A source-track
+    region may only extend an already detected vocal island by a small amount;
+    an unrelated source-only region can therefore never create an early dub.
+    """
+    fused: List[TimeRange] = []
+    secondary_ranges = merge_ranges(secondary, max_gap=0.08)
+    for start, end in merge_ranges(primary, max_gap=0.08):
+        refined_start, refined_end = start, end
+        for other_start, other_end in secondary_ranges:
+            if other_end < start - edge_extension or other_start > end + edge_extension:
+                continue
+            refined_start = min(refined_start, max(start - edge_extension, other_start))
+            refined_end = max(refined_end, min(end + edge_extension, other_end))
+        fused.append((refined_start, refined_end))
+    return merge_ranges(fused, max_gap=0.10)
+
+
+def attach_precise_tts_placement(
+    segments: Sequence[Mapping[str, Any]],
+    speech_ranges: Sequence[TimeRange],
+    *,
+    word_gap_seconds: float = 0.42,
+    pre_roll: float = 0.06,
+    post_roll: float = 0.08,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Attach an ideal speech duration and a separate collision boundary.
+
+    Public sentence bounds remain immutable.  Long pauses between aligned
+    words are retained as diagnostics but are not counted as speech that a
+    translation must fill.  Acoustic activity only refines a word-aligned
+    onset when the two sources agree locally.
+    """
+    active = merge_ranges(speech_ranges, max_gap=0.10)
+    output: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    for source in segments:
+        segment = dict(source)
+        if str(segment.get("timestamp_precision") or "").lower() != "word":
+            output.append(segment)
+            continue
+        items = []
+        for collection in (
+            segment.get("qwen3_time_stamps") or [],
+            segment.get("speaker_timing_time_stamps") or [],
+        ):
+            for item in collection:
+                if not isinstance(item, Mapping):
+                    continue
+                try:
+                    start = float(item.get("start"))
+                    end = float(item.get("end", start))
+                except (TypeError, ValueError):
+                    continue
+                if end > start and str(item.get("text", "")).strip():
+                    items.append((start, end))
+        if not items:
+            output.append(segment)
+            continue
+        outer_start = float(segment.get("start", 0.0))
+        outer_end = float(segment.get("end", outer_start))
+        word_ranges = merge_ranges(
+            [
+                (max(outer_start, start), min(outer_end, end))
+                for start, end in items
+                if end > outer_start and start < outer_end
+            ],
+            max_gap=float(word_gap_seconds),
+        )
+        if not word_ranges:
+            output.append(segment)
+            continue
+        word_start = word_ranges[0][0]
+        word_end = word_ranges[-1][1]
+        acoustic = intersect_ranges(active, [(word_start - 0.25, word_end + 0.25)])
+        onset = max(outer_start, word_start - float(pre_roll))
+        hard_end = min(outer_end, word_end + float(post_roll))
+        if acoustic:
+            first_acoustic = acoustic[0][0]
+            if abs(first_acoustic - word_start) <= 0.25:
+                onset = max(onset, first_acoustic - 0.03)
+        speech_islands = intersect_ranges(active, [(onset, hard_end)]) or word_ranges
+        effective = sum(max(0.0, end - start) for start, end in speech_islands)
+        word_effective = sum(max(0.0, end - start) for start, end in word_ranges)
+        # Energy VAD can clip unvoiced consonants.  Never budget less than the
+        # aligned word evidence, while still removing long internal silence.
+        effective = max(effective, word_effective)
+        effective = min(max(0.1, effective + pre_roll + post_roll), hard_end - onset)
+        internal_pauses = [
+            [round(left[1], 3), round(right[0], 3)]
+            for left, right in zip(word_ranges, word_ranges[1:])
+            if right[0] - left[1] > float(word_gap_seconds)
+        ]
+        segment.update({
+            "tts_placement_start": round(onset, 3),
+            "tts_hard_end": round(hard_end, 3),
+            "tts_target_duration": round(effective, 3),
+            "tts_speech_islands": [
+                [round(start, 3), round(end, 3)] for start, end in speech_islands
+            ],
+            "tts_internal_pauses": internal_pauses,
+            "tts_timing_precision": "word_vad_consensus",
+            "tts_timing_confidence": round(
+                min(0.98, 0.82 + (0.12 if acoustic else 0.0)), 4
+            ),
+        })
+        audit.append({
+            "segment_id": str(segment.get("id")),
+            "precision": "word_vad_consensus",
+            "placement_start": round(onset, 3),
+            "hard_end": round(hard_end, 3),
+            "target_speech_duration": round(effective, 3),
+            "speech_islands": segment["tts_speech_islands"],
+            "internal_pauses": internal_pauses,
+        })
+        output.append(segment)
+    return output, audit
+
+
 def attach_coarse_tts_placement(
     segments: Sequence[Mapping[str, Any]],
     speech_ranges: Sequence[TimeRange],
@@ -96,10 +222,12 @@ def attach_coarse_tts_placement(
     audit: List[Dict[str, Any]] = []
     for source in segments:
         segment = dict(source)
-        if not (
+        precision = str(segment.get("timestamp_precision") or "").lower()
+        recovery_coarse = (
             str(segment.get("asr_recovery_status") or "") == "accepted_coarse"
-            and str(segment.get("timestamp_precision") or "") == "coarse"
-        ):
+            and precision == "coarse"
+        )
+        if precision not in {"coarse", "unusable"}:
             output.append(segment)
             continue
 
@@ -157,16 +285,22 @@ def attach_coarse_tts_placement(
                     ),
                 )
 
-        # A coarse OCR sentence has no trustworthy token-to-island mapping.
-        # Keep the contiguous island group nearest its subtitle hint, but never
-        # create one render window spanning a long acoustic silence.  The
-        # omitted islands remain explicit in diagnostics for local re-ASR.
-        selected = [overlaps[first_index]]
-        for candidate in overlaps[first_index + 1:]:
-            if candidate[0] - selected[-1][1] >= float(hard_silence_seconds):
-                break
-            selected.append(candidate)
-        excluded = overlaps[first_index + len(selected):]
+        if recovery_coarse:
+            # OCR recovery may cover only one dialogue island inside a wider
+            # unresolved interval. Keep the contiguous island group nearest
+            # its subtitle hint and expose the remainder for local recovery.
+            selected = [overlaps[first_index]]
+            for candidate in overlaps[first_index + 1:]:
+                if candidate[0] - selected[-1][1] >= float(hard_silence_seconds):
+                    break
+                selected.append(candidate)
+            excluded = overlaps[first_index + len(selected):]
+        else:
+            # A primary ASR sentence without word timestamps already owns its
+            # full outer interval. Use all acoustic islands for its speech
+            # budget, while retaining long pauses as non-speaking time.
+            selected = overlaps
+            excluded = []
         active_duration = sum(end - start for start, end in selected)
         if active_duration < float(min_activity):
             record.update(
@@ -199,7 +333,24 @@ def attach_coarse_tts_placement(
                 "speech_anchor_end": round(acoustic_end, 3),
                 "tts_placement_start": round(placement_start, 3),
                 "tts_placement_end": round(placement_end, 3),
+                "tts_hard_end": round(placement_end, 3),
+                "tts_target_duration": round(
+                    min(
+                        placement_end - placement_start,
+                        max(
+                            float(min_activity),
+                            active_duration + float(pre_roll) + float(post_roll),
+                        ),
+                    ), 3
+                ),
                 "tts_available_end": round(outer_end, 3),
+                "tts_speech_islands": [
+                    [round(start, 3), round(end, 3)] for start, end in selected
+                ],
+                "tts_timing_precision": (
+                    "coarse_recovery_vad" if recovery_coarse
+                    else "coarse_primary_vad"
+                ),
                 "recovery_timing_method": "vocal_activity_with_ocr_soft_hint",
                 "recovery_timing_confidence": round(confidence, 4),
                 "coarse_timing_excluded_islands": [

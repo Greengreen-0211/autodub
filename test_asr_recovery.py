@@ -20,7 +20,11 @@ from light_tts_selector import (
 from ocr_translation_reference import prepare_ocr_translation_references
 from run_step2_wespeaker import invalidate_downstream_state
 from speaker_alignment import merge_adjacent_speaker_turns
-from speech_activity import attach_coarse_tts_placement
+from speech_activity import (
+    attach_coarse_tts_placement,
+    attach_precise_tts_placement,
+    fuse_speech_regions,
+)
 from tts_router import _tts_timing
 from ocr_v211_integration import (
     _load_initial_recovery_state,
@@ -221,6 +225,20 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertTrue(refined[0]["coarse_timing_requires_local_recovery"])
         self.assertEqual(audit[0]["excluded_islands"], [[15.0, 17.0]])
 
+    def test_primary_coarse_timing_keeps_all_owned_islands_but_not_silence(self):
+        segment = {
+            "id": 11, "start": 10.0, "end": 20.0,
+            "text": "One complete sentence.",
+            "asr_recovery_status": "primary", "timestamp_precision": "coarse",
+        }
+        refined, _audit = attach_coarse_tts_placement(
+            [segment], [(10.5, 12.0), (15.0, 17.0)]
+        )
+        self.assertEqual(refined[0]["tts_placement_start"], 10.44)
+        self.assertEqual(refined[0]["tts_hard_end"], 17.08)
+        self.assertLess(refined[0]["tts_target_duration"], 4.0)
+        self.assertEqual(len(refined[0]["tts_speech_islands"]), 2)
+
     def test_precise_tts_uses_mix_window_not_transport_bounds(self):
         placement, duration = _tts_timing({
                 "start": 10.0,
@@ -262,6 +280,30 @@ class OCRTimelineTests(unittest.TestCase):
         refined, audit = attach_coarse_tts_placement([segment], [(13.1, 17.2)])
         self.assertEqual(refined[0], segment)
         self.assertEqual(audit, [])
+
+    def test_precise_timing_counts_speech_islands_not_long_internal_pause(self):
+        segment = {
+            "id": 2, "start": 10.0, "end": 15.0, "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Hello", "start": 10.2, "end": 10.8},
+                {"text": "again", "start": 13.0, "end": 13.7},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(10.18, 10.82), (12.98, 13.72)]
+        )
+        self.assertLess(refined[0]["tts_target_duration"], 2.0)
+        self.assertGreater(refined[0]["tts_hard_end"] - refined[0]["tts_placement_start"], 3.0)
+        self.assertEqual(len(refined[0]["tts_internal_pauses"]), 1)
+        self.assertEqual(audit[0]["precision"], "word_vad_consensus")
+
+    def test_source_activity_can_only_extend_existing_vocal_edges(self):
+        fused = fuse_speech_regions(
+            [(5.0, 6.0)], [(1.0, 2.0), (4.9, 6.15)]
+        )
+        self.assertEqual(len(fused), 1)
+        self.assertAlmostEqual(fused[0][0], 4.9)
+        self.assertAlmostEqual(fused[0][1], 6.15)
 
     def test_coarse_tts_placement_is_idempotent(self):
         segment = {
