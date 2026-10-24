@@ -89,6 +89,12 @@ class AtempoFactorTests(unittest.TestCase):
         self.assertFalse(capped)
         self.assertEqual(raw, 0.1)
 
+    def test_exact_filter_chain_supports_large_speedup(self):
+        chain = tts_router._atempo_filter_chain(5.0)
+        factors = [float(part.split("=")[1]) for part in chain.split(",")]
+        self.assertTrue(all(0.5 <= factor <= 2.0 for factor in factors))
+        self.assertAlmostEqual(math.prod(factors), 5.0, places=6)
+
 
 class TrimSilenceTests(unittest.TestCase):
     def test_leading_and_trailing_silence_removed(self):
@@ -126,6 +132,32 @@ class PostprocessTests(unittest.TestCase):
             self.assertIn("atempo_factor", post)
             self.assertIn("atempo_capped", post)
             self.assertTrue(dst.is_file())
+
+    def test_postprocess_force_fits_overlength_audio_instead_of_truncating(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "raw.wav"
+            dst = Path(tmp) / "final.wav"
+            write_wav(src, 3.0, sample=tone())
+
+            def exact(source, destination, target):
+                write_wav(destination, target, sample=tone())
+                return {
+                    "forced_duration_fit": True,
+                    "forced_atempo_factor": 3.0,
+                    "forced_atempo_chain": "atempo=2,atempo=1.5",
+                }
+
+            with patch(
+                "tts_router._trim_silence",
+                side_effect=lambda source, destination: shutil.copy2(
+                    source, destination
+                ),
+            ), patch("tts_router._apply_atempo", side_effect=copy_adapt), patch(
+                "tts_router._apply_atempo_exact", side_effect=exact
+            ):
+                post = tts_router._postprocess(src, dst, 1.0)
+            self.assertTrue(post["forced_duration_fit"])
+            self.assertAlmostEqual(post["actual_duration"], 1.0, delta=0.05)
 
 
 @unittest.skipUnless(HAS_LIBROSA, "librosa not installed")

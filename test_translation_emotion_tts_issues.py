@@ -183,6 +183,23 @@ class TranslationTests(unittest.TestCase):
         self.assertTrue(all(r["translation_status"]=="success" for r in rows))
         self.assertEqual(checkpoints[0][0]["translation_status"],"success")
 
+    def test_content_validation_failure_is_retried_in_isolation(self):
+        calls = []
+        def request(items):
+            calls.append([row["id"] for row in items])
+            if len(calls) == 1:
+                return {"translations": [{
+                    "id": "0", "text": "Any",
+                    "translations_candidates": [{"text": "Any"}],
+                }]}
+            return {"translations": [translation(0, tiny=True)]}
+        rows = translate_segments(
+            [source(text="Wait.")], "en", "zh", "test", request, retries=2
+        )
+        self.assertEqual(calls, [["0"], ["0"]])
+        self.assertEqual(rows[0]["translation_status"], "success")
+        self.assertEqual(rows[0]["text"], "等等。")
+
     def test_invalid_sibling_candidate_uses_best_valid_without_retry(self):
         def request(items):
             t=translation(0); t["translations_candidates"][1]["text"]="Any"
@@ -440,6 +457,31 @@ class RouterTests(unittest.TestCase):
                 clips,results=router.run([dict(source(),tts_engine="confucius4")],"unused")
             self.assertEqual(clips,[]);self.assertEqual(calls,["confucius4"])
             self.assertEqual(results[0]["status"],"failed")
+
+    def test_missing_speaker_reference_uses_nearest_safe_reference(self):
+        calls = []
+        def postprocess(source_path, destination, target_duration):
+            shutil.copy2(source_path, destination)
+            return {
+                "actual_duration": target_duration,
+                "atempo_capped": False,
+            }
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ), patch("tts_router._postprocess", side_effect=postprocess), patch(
+            "tts_router.electricity_quality", return_value={}
+        ), patch("tts_router.voice_consistency_quality", return_value={}):
+            router = self.setup_router(tmp)
+            segment = dict(source(), speaker="B", tts_engine="f5tts")
+            with patch(
+                "tts_router._run_worker",
+                side_effect=self.worker(calls, set()),
+            ):
+                clips, results = router.run([segment], "unused")
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(results[0]["status"], "success")
+        self.assertTrue(results[0]["reference_fallback"])
+        self.assertEqual(results[0]["reference_fallback_speaker"], "A")
 
     def test_preflight_precedes_any_worker(self):
         with tempfile.TemporaryDirectory() as tmp, patch("tts_router.preflight_models",side_effect=RuntimeError("missing Vocos")),patch("tts_router._run_worker") as worker:

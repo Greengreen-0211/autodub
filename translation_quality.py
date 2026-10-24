@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 RULE_VERSION = "translation-v2.12.1"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v12"
+PROMPT_VERSION = "neutral-dubbing-ocr-v13-compact-duration"
 
 OCR_HARD_CONFLICTS = {
     "wrong_entity",
@@ -761,10 +761,47 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
             reference.get("usage_policy") == "preferred_if_complete"
             for reference in references
         )
+        public_duration = max(
+            0.1, float(segment["end"]) - float(segment["start"])
+        )
+        try:
+            mix_start = float(
+                segment.get("mix_start", segment.get("speech_start"))
+            )
+            mix_end = float(
+                segment.get("mix_end", segment.get("speech_end"))
+            )
+            speech_duration = (
+                mix_end - mix_start
+                if float(segment["start"]) <= mix_start < mix_end
+                <= float(segment["end"]) + 0.001
+                else public_duration
+            )
+        except (TypeError, ValueError):
+            speech_duration = public_duration
+        speech_duration = max(0.1, speech_duration)
+        target_code = language_code(target)
+        if target_code == "en":
+            compact_budget = {
+                "unit": "spoken_words",
+                "maximum": max(1, int(speech_duration * 2.8)),
+            }
+        elif target_code == "zh":
+            compact_budget = {
+                "unit": "cjk_characters",
+                "maximum": max(2, int(speech_duration * 4.5)),
+            }
+        else:
+            compact_budget = {
+                "unit": "seconds",
+                "maximum": round(speech_duration, 3),
+            }
         inputs[i] = {"id": sid, "speaker": segment.get("speaker", "Unknown"),
                      "text_asr_corrected": segment.get("text", ""),
                      "previous_text": before, "next_text": after,
-                     "duration": float(segment["end"])-float(segment["start"]),
+                     "duration": public_duration,
+                     "speech_duration_seconds": round(speech_duration, 3),
+                     "compact_spoken_budget": compact_budget,
                      "minimum_candidates": (
                          1 if is_tiny(str(segment.get("text", ""))) or trusted_ocr else 2
                      ),
@@ -1122,7 +1159,11 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     )
                 else:
                     rows[i]["translation_error"] = reason
-                    rows[i]["translation_retryable"] = _translation_request_error(reason)
+                    # A structurally valid response can still contain a bad
+                    # language, an empty tiny line, or an invalid candidate.
+                    # Retry that one segment in isolation instead of silently
+                    # turning it into an undubbed hole after the batch call.
+                    rows[i]["translation_retryable"] = True
                     print(f"⚠️ translation segment={ids[i]} attempt={rows[i]['translation_attempts']} failed: {exc}")
         save()
 
@@ -1143,8 +1184,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         attempt(pending[offset:offset+max(1, batch_size)])
     if request is not None:
         for i in pending:
-            # Initial batch request plus at most two request-level retries =
-            # three total calls. Content-quality failures are not retried.
+            # Initial batch request plus at most two isolated retries = three
+            # total calls. This includes content-validation failures so a
+            # single malformed tiny line cannot silently disappear.
             for _ in range(max(0, min(2, retries))):
                 if rows[i]["translation_status"] in USABLE_TRANSLATION_STATUSES:
                     break

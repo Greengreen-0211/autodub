@@ -2945,8 +2945,12 @@ class AdvancedTranslator:
                     "time and source text. Use them only when their source_subtitle is semantically consistent "
                     "with text_asr_corrected. They may be stale, incorrect, a watermark, UI text, or belong "
                     "to another line; ignore them whenever they conflict with the ASR text or context. Never "
-                    "replace, complete, or rewrite the ASR source from OCR. Duration is only a soft preference; "
-                    "never remove meaning merely to make the translation shorter. "
+                    "replace, complete, or rewrite the ASR source from OCR. Duration never permits deleting "
+                    "meaning, but every item supplies speech_duration_seconds and a compact_spoken_budget. "
+                    "Include at least one maximally concise, natural spoken candidate that stays within that "
+                    "budget whenever faithful compression is possible. Prefer compact syntax, established short "
+                    "titles, contractions where natural, and remove redundant wording introduced by literal "
+                    "translation; never remove a proposition, name, negation, quantity, or relationship. "
                     "For an OCR reference marked usage_policy=preferred_if_complete, compare it against the full "
                     "ASR meaning. Judge semantic coverage in natural target-language usage, not word-for-word "
                     "surface alignment: implicit subjects, idiomatic compression and normal target-language "
@@ -2974,7 +2978,9 @@ class AdvancedTranslator:
                     "terminology or phrasing while restoring all missing ASR meaning. References marked "
                     "usage_policy=terminology_hint must never be copied wholesale. "
                     "Return the exact supplied string IDs. Generate at least minimum_candidates and at most "
-                    "4 natural candidates. When trusted OCR is present, one strong standard fallback is enough; "
+                    "5 natural candidates. The final candidate should be the shortest faithful spoken version "
+                    "when the standard translation exceeds compact_spoken_budget. When trusted OCR is present, "
+                    "one strong standard fallback is enough; "
                     "do not create artificial paraphrases merely to increase the count. "
                     "Similar lengths are allowed when expanding would distort meaning. "
                     "text is the standard translation. Every candidate must be in the target language; "
@@ -4043,6 +4049,19 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
                     "tts_duration_error": metadata.get("duration_error"),
                     "tts_inference_seconds": metadata.get("inference_seconds"),
                     "tts_rtf": metadata.get("rtf"),
+                    "tts_reference_fallback": metadata.get("reference_fallback", False),
+                    "tts_reference_fallback_speaker": metadata.get(
+                        "reference_fallback_speaker"
+                    ),
+                    "tts_reference_fallback_reason": metadata.get(
+                        "reference_fallback_reason", ""
+                    ),
+                    "tts_forced_duration_fit": metadata.get(
+                        "forced_duration_fit", False
+                    ),
+                    "tts_forced_atempo_factor": metadata.get(
+                        "forced_atempo_factor"
+                    ),
                 })
             enriched_segments.append(updated)
         from tts_quality import stage_fingerprint

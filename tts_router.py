@@ -145,7 +145,7 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
             "ref_audio", "ref_text", "target_duration", "model",
         )
     }
-    payload["version"] = "tts-request-v2.3.0"
+    payload["version"] = "tts-request-v2.4.0-force-fit"
     payload["worker_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_worker.py").read_bytes()).hexdigest()
     payload["policy_sha256"] = hashlib.sha256(Path(__file__).with_name("scheme3_policy.py").read_bytes()).hexdigest()
     payload["quality_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_quality.py").read_bytes()).hexdigest()
@@ -159,6 +159,12 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
     payload["cache"] = cache_environment(str(item.get("model") or "f5tts"))
     payload["duration_limits"] = [os.getenv("AUTODUB_TTS_MAX_DURATION_ERROR", "0.6"),
                                   os.getenv("AUTODUB_TTS_MAX_DURATION_RATIO_ERROR", "0.25")]
+    payload["duration_fit_policy"] = {
+        "force_fit": os.getenv("AUTODUB_TTS_FORCE_FIT", "1"),
+        "force_fit_tolerance": os.getenv(
+            "AUTODUB_TTS_FORCE_FIT_TOLERANCE", "0.03"
+        ),
+    }
     payload["quality_policy"] = {
         "electricity": os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY", "warn"),
         "voice_consistency": os.getenv(
@@ -196,7 +202,34 @@ def _tts_timing(segment: Dict[str, Any]) -> tuple[float, float]:
         except (TypeError, ValueError):
             return legacy
         if start <= mix_start < mix_end <= end + 0.001:
-            return mix_start, mix_end - mix_start
+            # A sentence reconstructed from several timestamp atoms must use
+            # the union of all of its words.  Never inherit a stale inner
+            # fragment window merely because mix_start/mix_end survived a
+            # previous split or recovery pass.
+            word_starts: List[float] = []
+            word_ends: List[float] = []
+            timestamp_sets = (
+                segment.get("qwen3_time_stamps"),
+                segment.get("speaker_timing_time_stamps"),
+            )
+            for timestamp_items in timestamp_sets:
+                for item in timestamp_items or []:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        word_start = float(item.get("start"))
+                        word_end = float(item.get("end", word_start))
+                    except (TypeError, ValueError):
+                        continue
+                    if word_end < start - 0.001 or word_start > end + 0.001:
+                        continue
+                    word_starts.append(max(start, word_start))
+                    word_ends.append(min(end, max(word_start, word_end)))
+            if word_starts and word_ends:
+                mix_start = min(mix_start, min(word_starts))
+                mix_end = max(mix_end, max(word_ends))
+            if start <= mix_start < mix_end <= end + 0.001:
+                return mix_start, mix_end - mix_start
         return legacy
     try:
         placement_start = float(segment.get("tts_placement_start"))
@@ -256,6 +289,50 @@ def _apply_atempo(source: Path, destination: Path, target_duration: float) -> Pa
     return destination
 
 
+def _atempo_filter_chain(factor: float) -> str:
+    """Build an ffmpeg atempo chain for any positive speed factor.
+
+    One atempo filter only accepts values in [0.5, 2.0].  Chaining filters
+    lets the final safety pass fit a usable utterance into its collision-free
+    window instead of cutting the end of the sentence off.
+    """
+    remaining = max(0.01, float(factor))
+    factors: List[float] = []
+    while remaining > 2.0 + 1e-9:
+        factors.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5 - 1e-9:
+        factors.append(0.5)
+        remaining /= 0.5
+    factors.append(max(0.5, min(2.0, remaining)))
+    return ",".join(f"atempo={value:.8f}" for value in factors)
+
+
+def _apply_atempo_exact(
+    source: Path, destination: Path, target_duration: float
+) -> Dict[str, Any]:
+    """Force an over-length clip into the requested window without truncation."""
+    current = _wav_duration(source)
+    if current <= 0 or target_duration <= 0:
+        raise ValueError("invalid duration for exact atempo fit")
+    factor = current / target_duration
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.stem + ".force-fit.tmp.wav")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error", "-i", str(source),
+            "-filter:a", _atempo_filter_chain(factor), "-vn", str(temporary),
+        ],
+        check=True,
+    )
+    os.replace(temporary, destination)
+    return {
+        "forced_duration_fit": True,
+        "forced_atempo_factor": round(factor, 6),
+        "forced_atempo_chain": _atempo_filter_chain(factor),
+    }
+
+
 def _trim_silence(source: Path, destination: Path) -> Path:
     """Trim leading/trailing silence (TTS首尾静音).
 
@@ -298,6 +375,19 @@ def _postprocess(source: Path, destination: Path, target_duration: float) -> Dic
         post_trim = _wav_duration(trimmed)
         factor, capped, raw = _atempo_factor(post_trim, target_duration)
         _apply_atempo(trimmed, destination, target_duration)
+        forced = {}
+        natural_duration = _wav_duration(destination)
+        force_fit = _env_bool("AUTODUB_TTS_FORCE_FIT", True)
+        tolerance = float(os.getenv("AUTODUB_TTS_FORCE_FIT_TOLERANCE", "0.03"))
+        # Short speech may naturally leave a pause.  Only over-length speech
+        # risks losing words, so the default final pass compresses rather than
+        # stretching concise translations to fill silence.
+        if (
+            force_fit
+            and target_duration > 0.04
+            and natural_duration > target_duration + max(0.005, tolerance)
+        ):
+            forced = _apply_atempo_exact(trimmed, destination, target_duration)
     finally:
         if trimmed.exists():
             trimmed.unlink(missing_ok=True)
@@ -308,6 +398,7 @@ def _postprocess(source: Path, destination: Path, target_duration: float) -> Dic
         "atempo_raw_factor": round(raw, 6),
         "atempo_capped": bool(capped),
         "actual_duration": _wav_duration(destination),
+        **forced,
     }
 
 
@@ -514,6 +605,9 @@ class TTSRouter:
             references[speaker] = {
                 "audio": str(ref_path),
                 "text": source_text,
+                "speaker": speaker,
+                "start": float(source_segment["start"]),
+                "end": float(source_segment["end"]),
                 "source_segment_id": str(source_segment.get("id", source_index)),
                 "purity_score": round(float(score), 4),
             }
@@ -546,6 +640,34 @@ class TTSRouter:
         _atomic_json(self.root / "reference_manifest.json", manifest)
         return references
 
+    @staticmethod
+    def _nearest_safe_reference(
+        segment: Dict[str, Any], references: Dict[str, Dict[str, Any]]
+    ) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Return the temporally nearest precise reference as a no-drop fallback."""
+        if not references:
+            return None, None
+        center = (
+            float(segment.get("start", 0.0))
+            + float(segment.get("end", segment.get("start", 0.0)))
+        ) / 2.0
+        speaker, reference = min(
+            references.items(),
+            key=lambda item: (
+                abs(
+                    center
+                    - (
+                        float(item[1].get("start", center))
+                        + float(item[1].get("end", center))
+                    )
+                    / 2.0
+                ),
+                -float(item[1].get("purity_score", 0.0) or 0.0),
+                item[0],
+            ),
+        )
+        return speaker, reference
+
     def run(self, segments: Iterable[Dict[str, Any]], vocal_path: str, *, force: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         from translation_quality import is_skipped, require_translated
         # Segments without any safe target-language text never reach a TTS
@@ -567,11 +689,18 @@ class TTSRouter:
                 raise ValueError(f"invalid/duplicate TTS segment: {segment_id}")
             seen.add(segment_id)
             speaker = str(segment.get("speaker", "SPEAKER_00"))
-            if speaker not in references:
+            reference = references.get(speaker)
+            reference_fallback_speaker = None
+            reference_fallback_reason = ""
+            if reference is None:
+                reference_fallback_speaker, reference = self._nearest_safe_reference(
+                    segment, references
+                )
+            if reference is None:
                 failure = {
                     "segment_id": segment_id,
                     "status": "failed",
-                    "error": "no_safe_precise_reference_audio",
+                    "error": "no_safe_reference_audio_any_speaker",
                     "planned_engine": segment.get("tts_engine"),
                     "actual_engine": None,
                     "fallback_count": 0,
@@ -579,6 +708,12 @@ class TTSRouter:
                 previous[segment_id] = failure
                 unreferenced_results.append(failure)
                 continue
+            if reference_fallback_speaker is not None:
+                reference_fallback_reason = "nearest_safe_precise_reference"
+                print(
+                    f"⚠️ segment={segment_id} speaker={speaker} 没有安全参考音频；"
+                    f"使用最近可靠声纹 {reference_fallback_speaker}，保留整句并标记降级"
+                )
             placement_start, duration = _tts_timing(segment)
             raw_emotion = segment.get("raw_emotion", segment.get("emotion_raw", segment.get("emotion")))
             if "emotion_reliable" in segment:
@@ -605,10 +740,13 @@ class TTSRouter:
                 "target_language": target, "target_language_raw": target_raw,
                 "source_language": normalize_language(segment.get("source_lang", getattr(self.config, "source_lang", "unknown"))),
                 "emotion": emotion, "emotion_score": segment.get("emotion_score"),
-                "speaker": speaker, "ref_audio": references[speaker]["audio"],
-                "ref_text": references[speaker]["text"], "target_duration": duration,
-                "reference_segment_id": references[speaker].get("source_segment_id"),
-                "reference_purity_score": references[speaker].get("purity_score"),
+                "speaker": speaker, "ref_audio": reference["audio"],
+                "ref_text": reference["text"], "target_duration": duration,
+                "reference_segment_id": reference.get("source_segment_id"),
+                "reference_purity_score": reference.get("purity_score"),
+                "reference_fallback": reference_fallback_speaker is not None,
+                "reference_fallback_speaker": reference_fallback_speaker,
+                "reference_fallback_reason": reference_fallback_reason,
                 "start": placement_start, "model": model, "tts_engine": model,
                 "end": placement_start + duration,
                 "placement_source": placement_source,
@@ -714,6 +852,9 @@ class TTSRouter:
                             ),
                             reference_segment_id=item.get("reference_segment_id"),
                             reference_purity_score=item.get("reference_purity_score"),
+                            reference_fallback=item.get("reference_fallback", False),
+                            reference_fallback_speaker=item.get("reference_fallback_speaker"),
+                            reference_fallback_reason=item.get("reference_fallback_reason", ""),
                             source_language=item["source_language"], target_language=item["target_language"],
                             target_language_raw=item["target_language_raw"])
             if metadata.get("status")=="success":

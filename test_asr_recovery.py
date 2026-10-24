@@ -233,6 +233,20 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertEqual(placement, 10.25)
         self.assertAlmostEqual(duration, 2.15)
 
+    def test_precise_tts_expands_stale_mix_window_to_complete_sentence_words(self):
+        placement, duration = _tts_timing({
+            "start": 10.0,
+            "end": 15.0,
+            "mix_start": 13.0,
+            "mix_end": 14.0,
+            "qwen3_time_stamps": [
+                {"text": "Complete", "start": 10.4, "end": 11.2},
+                {"text": "sentence", "start": 13.0, "end": 14.0},
+            ],
+        })
+        self.assertEqual(placement, 10.4)
+        self.assertAlmostEqual(duration, 3.6)
+
     def test_precise_segment_is_unchanged_by_coarse_timing_refiner(self):
         segment = {
             "id": 1,
