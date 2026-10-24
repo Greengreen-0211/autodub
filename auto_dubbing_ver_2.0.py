@@ -2468,7 +2468,12 @@ echo "=== [Step 2-W] WeSpeaker 流水线完成 ==="
             print(f"✅ RTTM 单窗抖动平滑: 修正 {corrected} 个 A-B-A 短说话人孤岛（≤{self.rttm_island_max_seconds:.2f}s）。")
         return smoothed
 
-    def _assign_speakers_from_rttm(self, segments: List[Dict[str, Any]], rttm_spans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _assign_speakers_from_rttm(
+        self,
+        segments: List[Dict[str, Any]],
+        rttm_spans: List[Dict[str, Any]],
+        speaker_boundary_evidence=None,
+    ) -> List[Dict[str, Any]]:
         from speaker_alignment import (
             AlignmentConfig,
             align_segments_with_rttm,
@@ -2478,6 +2483,7 @@ echo "=== [Step 2-W] WeSpeaker 流水线完成 ==="
         result = align_segments_with_rttm(
             segments,
             rttm_spans,
+            speaker_boundary_evidence=speaker_boundary_evidence,
             config=AlignmentConfig(
                 weak_gap_seconds=self.timestamp_weak_gap_seconds,
                 strong_gap_seconds=self.timestamp_strong_gap_seconds,
@@ -3474,19 +3480,31 @@ def run_step_2(config: DubbingConfig) -> None:
         if os.path.exists(rttm_path):
             print("--- [Step 2-W] 检测到已有 WeSpeaker RTTM，直接解析回填 ---")
             diar = SpeakerDiarization(config)
-            aligned = diar._assign_speakers_from_rttm(state["segments_step1"], diar._parse_rttm(rttm_path))
             from run_step2_wespeaker import (
                 attach_speaker_confidence,
                 load_clustering_diagnostics,
                 reassemble_final_speaker_segments,
+                save_clustering_diagnostics,
+                update_dialogue_identity_diagnostics,
             )
 
             clustering_diagnostics = load_clustering_diagnostics()
+            aligned = diar._assign_speakers_from_rttm(
+                state["segments_step1"],
+                diar._parse_rttm(rttm_path),
+                speaker_boundary_evidence=(
+                    (clustering_diagnostics or {}).get("boundaries")
+                ),
+            )
             if clustering_diagnostics:
                 aligned = attach_speaker_confidence(
                     aligned, clustering_diagnostics
                 )
                 aligned = reassemble_final_speaker_segments(aligned)
+                update_dialogue_identity_diagnostics(
+                    aligned, clustering_diagnostics
+                )
+                save_clustering_diagnostics(clustering_diagnostics)
             unique = sorted(set(s["speaker"] for s in aligned))
             print(f"🔍 WeSpeaker 识别出 {len(unique)} 个说话人: {unique}")
             state_mgr.delete_keys([
@@ -3509,6 +3527,9 @@ def run_step_2(config: DubbingConfig) -> None:
                     ),
                     "speaker_count_confidence": clustering_diagnostics.get(
                         "speaker_count_confidence", 0.0
+                    ),
+                    "dialogue_assigned_speaker_count": clustering_diagnostics.get(
+                        "dialogue_assigned_identity_count", len(unique)
                     ),
                 })
             state_mgr.save(checkpoint)

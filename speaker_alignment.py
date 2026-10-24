@@ -604,6 +604,12 @@ def align_segments_with_rttm(
         segment_changes = [
             item for item in changes if segment_start < float(item["time"]) < segment_end
         ]
+        identity_only_changes = [
+            item
+            for item in segment_changes
+            if not item.get("text_split_allowed", True)
+            and item.get("boundary_role") == "identity_separation_only"
+        ]
         if not items or status in {"unusable", "coarse"}:
             segment["speaker"] = normalize_speaker(fallback)
             overlap_total = sum(overlaps.values())
@@ -628,7 +634,19 @@ def align_segments_with_rttm(
             segment["speaker_assignment_confidence"] = round(
                 dominance * (0.70 if status == "coarse" else 0.80), 4
             )
-            if len(overlaps) > 1 and dominance < 0.80:
+            if identity_only_changes:
+                segment["speaker_boundary_ambiguous"] = True
+                segment["speaker_assignment_status"] = (
+                    "multi_speaker_text_unsplittable"
+                )
+                segment["speaker_assignment_confidence"] = min(
+                    segment["speaker_assignment_confidence"], 0.65
+                )
+                segment["unsplit_identity_boundaries"] = [
+                    round(float(item["time"]), 3)
+                    for item in identity_only_changes
+                ]
+            elif len(overlaps) > 1 and dominance < 0.80:
                 segment["speaker_boundary_ambiguous"] = True
                 segment["speaker_assignment_status"] = (
                     "ambiguous_coarse_overlap"
@@ -690,6 +708,18 @@ def align_segments_with_rttm(
         if not text_parts or any(part is None or not part for part in text_parts):
             segment["speaker"] = normalize_speaker(fallback)
             segment["speaker_boundary_ambiguous"] = bool(segment_changes)
+            if identity_only_changes:
+                segment["speaker_assignment_status"] = (
+                    "multi_speaker_text_unsplittable"
+                )
+                segment["speaker_assignment_confidence"] = min(
+                    float(segment.get("speaker_assignment_confidence", 1.0)),
+                    0.65,
+                )
+                segment["unsplit_identity_boundaries"] = [
+                    round(float(item["time"]), 3)
+                    for item in identity_only_changes
+                ]
             output.append(segment)
             continue
 
@@ -731,6 +761,23 @@ def align_segments_with_rttm(
             )
             if len(group_overlaps) > 1 and dominance < 0.80:
                 result["speaker_boundary_ambiguous"] = True
+            blocked_group_changes = [
+                item
+                for item in identity_only_changes
+                if start < float(item["time"]) < end
+            ]
+            if blocked_group_changes:
+                result["speaker_boundary_ambiguous"] = True
+                result["speaker_assignment_status"] = (
+                    "multi_speaker_text_unsplittable"
+                )
+                result["speaker_assignment_confidence"] = min(
+                    result["speaker_assignment_confidence"], 0.65
+                )
+                result["unsplit_identity_boundaries"] = [
+                    round(float(item["time"]), 3)
+                    for item in blocked_group_changes
+                ]
             result["qwen3_time_stamps"] = (
                 [] if use_timing_skeleton else items[left:right]
             )

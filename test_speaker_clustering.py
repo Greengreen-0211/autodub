@@ -9,6 +9,7 @@ from run_step2_wespeaker import (
     _add_structural_sentence_boundaries,
     _acoustic_boundary_scores,
     _centroid_for_centers,
+    _build_acoustic_turns,
     _cluster_centroid,
     _cluster_pair_evidence,
     _combined_merge_penalty,
@@ -19,11 +20,13 @@ from run_step2_wespeaker import (
     _robust_identity_match,
     _robust_embedding_pool,
     _reconcile_turn_clusters,
+    _search_global_identity_partition,
     _select_change_boundaries,
     _soft_continuity_threshold,
     _temporal_assignment_context,
     attach_speaker_confidence,
     reassemble_final_speaker_segments,
+    update_dialogue_identity_diagnostics,
     _timestamp_items,
 )
 from speaker_alignment import (
@@ -171,6 +174,60 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertEqual(len(selected), 1)
         self.assertFalse(selected[0]["text_split_allowed"])
         self.assertEqual(selected[0]["boundary_role"], "identity_diagnostic_only")
+
+    def test_persistent_acoustic_change_separates_identity_without_cutting_text(self):
+        region = ("input", 0.0, 8.0)
+        windows = [
+            {"region": region, "center": value}
+            for value in (1.0, 2.0, 3.0, 5.0, 6.0, 7.0)
+        ]
+        candidate = {
+            "time": 4.0, "score": 0.66, "similarity": 0.34,
+            "gap": 0.0, "left_count": 3, "right_count": 3,
+            "left_cohesion": 0.9, "right_cohesion": 0.9,
+            "left_text": "<acoustic>", "right_text": "<acoustic>",
+            "punctuation": "none", "same_asr_segment": True,
+            "timestamp_reliable": False, "candidate_source": "acoustic_scan",
+            "persistent_acoustic_change": True,
+        }
+        selected, _ = _select_change_boundaries([candidate], windows)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["constraint"], "identity")
+        self.assertFalse(selected[0]["text_split_allowed"])
+        self.assertEqual(
+            selected[0]["boundary_role"], "identity_separation_only"
+        )
+
+    def test_identity_only_boundary_becomes_identity_cannot_link(self):
+        region = ("input", 0.0, 6.0)
+        windows = [
+            {
+                "region": region,
+                "start": center - 0.5,
+                "end": center + 0.5,
+                "center": center,
+                "embedding": (
+                    np.asarray([1.0, 0.0])
+                    if center < 3.0 else np.asarray([0.0, 1.0])
+                ),
+            }
+            for center in (0.75, 1.5, 2.25, 3.75, 4.5, 5.25)
+        ]
+        boundary = {
+            "region": region,
+            "between_regions": None,
+            "time": 3.0,
+            "constraint": "identity",
+            "text_split_allowed": False,
+            "boundary_role": "identity_separation_only",
+        }
+        turns, hard_links, soft_links, evidence = _build_acoustic_turns(
+            windows, [boundary]
+        )
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(hard_links, {(0, 1)})
+        self.assertEqual(soft_links, set())
+        self.assertIs(evidence[(0, 1)], boundary)
 
     def test_strong_punctuation_soft_boundary_remains_reconcilable(self):
         threshold = _soft_continuity_threshold([{
@@ -337,7 +394,7 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertLess(len(identities), 5)
         self.assertEqual(
             diagnostics["algorithm"],
-            "stable_core_identity_consensus_v7",
+            "stable_core_identity_consensus_v8",
         )
         self.assertGreater(
             diagnostics["global_partition_candidate_count"], 1
@@ -352,6 +409,40 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertNotEqual(mapping[0], mapping[1])
         self.assertGreaterEqual(len(protected), 2)
         self.assertEqual(protected_diagnostics["hard_constraint_count"], 1)
+
+    def test_global_partition_rejects_single_link_identity_chain(self):
+        angle = np.deg2rad(36.87)
+        voices = [
+            np.asarray([1.0, 0.0]),
+            np.asarray([np.cos(angle), np.sin(angle)]),
+            np.asarray([np.cos(2 * angle), np.sin(2 * angle)]),
+        ]
+        turns = []
+        raw_clusters = []
+        for voice_index, voice in enumerate(voices):
+            cluster = set()
+            for repeat in range(2):
+                turn_index = len(turns)
+                cluster.add(turn_index)
+                turns.append({
+                    "start": float(turn_index * 3),
+                    "end": float(turn_index * 3 + 2.5),
+                    "duration": 2.5,
+                    "embedding": voice,
+                    "embedding_reliable": True,
+                    "embedding_quality": 0.9,
+                })
+            raw_clusters.append(cluster)
+        partition, _, _, _ = _search_global_identity_partition(
+            raw_clusters, turns, set(), set(), seed_partitions=[]
+        )
+        self.assertGreaterEqual(len(partition), 2)
+        self.assertFalse(any(node == {0, 1, 2} for node in partition))
+        identities, _, _ = _reconcile_turn_clusters(
+            raw_clusters, turns, set(), set(), {}
+        )
+        self.assertGreaterEqual(len(identities), 2)
+        self.assertFalse(any(cluster == set(range(6)) for cluster in identities))
 
     def test_robust_turn_pool_rejects_one_window_outlier(self):
         values = np.asarray([
@@ -613,6 +704,40 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["text"], "Step up onto the rail.")
 
+    def test_identity_only_change_marks_unsplittable_text_ambiguous(self):
+        segments = [{
+            "id": 0, "start": 0.0, "end": 3.0,
+            "text": "Wake up Anna go back.",
+            "qwen3_time_stamps": [
+                {"text": "Wake", "start": 0.1, "end": 0.6},
+                {"text": "up", "start": 0.6, "end": 1.0},
+                {"text": "Anna", "start": 1.0, "end": 1.5},
+                {"text": "go", "start": 1.5, "end": 2.0},
+                {"text": "back", "start": 2.0, "end": 2.8},
+            ],
+        }]
+        spans = [
+            {"start": 0.0, "end": 1.4, "speaker": "SPEAKER_00"},
+            {"start": 1.4, "end": 3.0, "speaker": "SPEAKER_01"},
+        ]
+        result = align_segments_with_rttm(
+            segments,
+            spans,
+            speaker_boundary_evidence=[{
+                "time": 1.4,
+                "text_split_allowed": False,
+                "boundary_role": "identity_separation_only",
+            }],
+        )
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0]["speaker_boundary_ambiguous"])
+        self.assertEqual(
+            result[0]["speaker_assignment_status"],
+            "multi_speaker_text_unsplittable",
+        )
+        self.assertLessEqual(result[0]["speaker_assignment_confidence"], 0.65)
+        self.assertEqual(result[0]["unsplit_identity_boundaries"], [1.4])
+
     def test_acoustic_change_without_word_gap_does_not_cut_phrase(self):
         segments = [{
             "id": 0, "start": 0.0, "end": 2.0,
@@ -735,6 +860,28 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
         self.assertEqual(
             [item["text"] for item in merged[0]["speaker_reference_components"]],
             ["one", "two"],
+        )
+
+    def test_dialogue_identity_count_is_separate_from_acoustic_count(self):
+        diagnostics = {
+            "speaker_profiles": {
+                "SPEAKER_00": {},
+                "SPEAKER_01": {},
+            }
+        }
+        segments = [{
+            "speaker": "SPEAKER_00",
+            "speaker_boundary_ambiguous": True,
+            "speaker_assignment_status": "multi_speaker_text_unsplittable",
+        }]
+        update_dialogue_identity_diagnostics(segments, diagnostics)
+        self.assertEqual(diagnostics["acoustic_identity_count"], 2)
+        self.assertEqual(diagnostics["dialogue_assigned_identity_count"], 1)
+        self.assertEqual(
+            diagnostics["unassigned_acoustic_identities"], ["SPEAKER_01"]
+        )
+        self.assertEqual(
+            diagnostics["unsplittable_multi_speaker_segment_count"], 1
         )
 
 
