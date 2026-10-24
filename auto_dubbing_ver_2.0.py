@@ -2480,7 +2480,6 @@ echo "=== [Step 2-W] WeSpeaker 流水线完成 ==="
         from speaker_alignment import (
             AlignmentConfig,
             align_segments_with_rttm,
-            merge_adjacent_speaker_turns,
         )
 
         result = align_segments_with_rttm(
@@ -2512,13 +2511,10 @@ echo "=== [Step 2-W] WeSpeaker 流水线完成 ==="
             print(f"✅ 句子边界与 RTTM 联合分段: 新增 {split_count} 个片段。")
         if ambiguous_count:
             print(f"⚠️ {ambiguous_count} 个片段的说话人边界证据不足，已保守保留整段。")
-        merged = merge_adjacent_speaker_turns(
-            result,
-            maximum_turn_seconds=self.maximum_sentence_seconds,
-        )
-        if len(merged) < len(result):
-            print(f"✅ 同说话人片段重组: {len(result)} -> {len(merged)} 段。")
-        return merged
+        # Keep Step 2 atoms immutable.  Speaker equality is not permission to
+        # concatenate text or extend timing because the identity may still be
+        # corrected by later global reconciliation.
+        return result
 
     @staticmethod
     def _normalize_speaker(speaker: Any) -> str:

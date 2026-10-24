@@ -656,6 +656,20 @@ def align_segments_with_rttm(
         segment_start = float(segment["start"])
         segment_end = float(segment["end"])
         transcript = str(segment.get("text", ""))
+        # Step 2 may derive safer sentence/turn atoms from word timestamps, but
+        # it must never lose the transport sentence that entered diarization.
+        # These fields are immutable provenance; downstream speaker identity
+        # reconciliation is allowed to change only speaker metadata.
+        segment.setdefault(
+            "source_segment_id", segment.get("id")
+        )
+        segment.setdefault("source_start", round(segment_start, 3))
+        segment.setdefault("source_end", round(segment_end, 3))
+        segment.setdefault("source_text", transcript)
+        # Explicit aliases make the contract discoverable to older consumers
+        # that look for an ``original_*`` timestamp pair.
+        segment.setdefault("original_start", segment["source_start"])
+        segment.setdefault("original_end", segment["source_end"])
         use_timing_skeleton = bool(
             segment.get("speaker_timing_skeleton_valid")
             and segment.get("speaker_timing_time_stamps")
@@ -908,7 +922,16 @@ def align_segments_with_rttm(
             )
             output.append(result)
 
+    source_atom_counts: Dict[str, int] = {}
     for index, segment in enumerate(output):
+        source_key = str(segment.get("source_segment_id", segment.get("id", index)))
+        atom_index = source_atom_counts.get(source_key, 0)
+        source_atom_counts[source_key] = atom_index + 1
+        segment.setdefault("atomic_segment_id", f"{source_key}:{atom_index}")
+        segment.setdefault("atomic_start", round(float(segment["start"]), 3))
+        segment.setdefault("atomic_end", round(float(segment["end"]), 3))
+        segment.setdefault("atomic_text", str(segment.get("text", "")))
+        segment["speaker_segmentation_contract"] = "immutable_atomic_v1"
         segment["id"] = index
     return output
 

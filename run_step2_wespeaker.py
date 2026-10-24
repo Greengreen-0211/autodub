@@ -952,6 +952,23 @@ def _add_structural_sentence_boundaries(
     return combined
 
 
+def _is_high_confidence_identity_change(item):
+    """Require independent evidence before making a local change a cannot-link."""
+    if not item.get("persistent_acoustic_change"):
+        return False
+    timestamp_support = bool(item.get("timestamp_reliable"))
+    acoustic_support = bool(
+        int(item.get("persistence_count") or 0) >= 2
+        and int(item.get("left_count") or 0) >= 2
+        and int(item.get("right_count") or 0) >= 2
+        and float(item.get("left_cohesion") or 0.0)
+        >= HARD_BOUNDARY_MIN_COHESION
+        and float(item.get("right_cohesion") or 0.0)
+        >= HARD_BOUNDARY_MIN_COHESION
+    )
+    return bool(timestamp_support or acoustic_support)
+
+
 def _build_acoustic_turns(windows, boundaries):
     by_region = defaultdict(list)
     for index, window in enumerate(windows):
@@ -1046,7 +1063,13 @@ def _build_acoustic_turns(windows, boundaries):
             if boundary.get("constraint") == "hard":
                 hard_cannot_links.add(edge)
             elif boundary.get("constraint") == "soft":
-                soft_cannot_links.add(edge)
+                if _is_high_confidence_identity_change(boundary):
+                    hard_cannot_links.add(edge)
+                    boundary["identity_constraint"] = (
+                        "hard_persistent_acoustic_change"
+                    )
+                else:
+                    soft_cannot_links.add(edge)
             boundary_evidence[edge] = boundary
         turns_by_region[region] = region_turns
     for item in boundaries:
@@ -1062,7 +1085,13 @@ def _build_acoustic_turns(windows, boundaries):
             if item.get("constraint") == "hard":
                 hard_cannot_links.add(edge)
             elif item.get("constraint") == "soft":
-                soft_cannot_links.add(edge)
+                if _is_high_confidence_identity_change(item):
+                    hard_cannot_links.add(edge)
+                    item["identity_constraint"] = (
+                        "hard_persistent_acoustic_change"
+                    )
+                else:
+                    soft_cannot_links.add(edge)
             boundary_evidence[edge] = item
     return turns, hard_cannot_links, soft_cannot_links, boundary_evidence
 
@@ -1184,10 +1213,18 @@ def _soft_continuity_threshold(boundary_items):
     # A soft boundary is evidence, not a cannot-link.  Convert its acoustic
     # strength into a continuous penalty so weak sentence cuts are easy to
     # reconnect while a clear local voice change still needs stronger proof.
-    return max(
+    threshold = max(
         PROTOTYPE_MERGE_SIMILARITY,
         SENTENCE_CONTINUITY_SIMILARITY + 0.06,
     ) + _soft_boundary_penalty(eligible)
+    # A persistent local voice change is negative identity evidence.  It may
+    # still be a false split, but reconnecting across it must require near-
+    # duplicate acoustic evidence instead of ordinary sentence continuity.
+    persistent_change = any(
+        _is_high_confidence_identity_change(item)
+        for item in eligible
+    )
+    return max(threshold, 0.76) if persistent_change else threshold
 
 
 def _soft_boundary_penalty(boundary_items):
@@ -2818,7 +2855,7 @@ def _reconcile_turn_clusters(
             "consistency_q25": round(consistency["q25"], 4),
         })
     diagnostics = {
-        "algorithm": "stable_core_identity_consensus_v9_balanced",
+        "algorithm": "stable_core_identity_consensus_v10_immutable_atoms",
         "turn_count": len(turns),
         "raw_speaker_count": len(raw_clusters),
         "speaker_count": len(identity_clusters),
@@ -3100,6 +3137,9 @@ def run_temporal_constrained_clustering(segments):
             "threshold": round(float(item.get("threshold", 0.0)), 4),
             "punctuation": item.get("punctuation", "none"),
             "constraint": item.get("constraint", "soft"),
+            "identity_constraint": item.get(
+                "identity_constraint", item.get("constraint", "soft")
+            ),
             "same_asr_segment": bool(item.get("same_asr_segment")),
             "timestamp_reliable": bool(item.get("timestamp_reliable")),
             "left_window_count": int(item.get("left_count", 0)),
@@ -3657,42 +3697,10 @@ def merge_fragment_speakers(segments):
     return segments
 
 
-def merge_adjacent_same_speaker(segments, max_gap=0.5, min_merge_duration=1.5):
-    """合并同一说话人、间隔极短的相邻片段，避免 TTS 碎裂"""
-    if len(segments) < 2:
-        return segments
-    merged = [segments[0].copy()]
-    for seg in segments[1:]:
-        last = merged[-1]
-        gap = float(seg["start"]) - float(last["end"])
-        same_speaker = last["speaker"] == seg["speaker"]
-        last_dur = float(last["end"]) - float(last["start"])
-        seg_dur = float(seg["end"]) - float(seg["start"])
-        should_merge = (
-            same_speaker
-            and gap <= max_gap
-            and (last_dur < min_merge_duration or seg_dur < min_merge_duration)
-        )
-        if should_merge:
-            last["end"] = seg["end"]
-            last["text"] = (last.get("text", "") + " " + seg.get("text", "")).strip()
-            if "qwen3_time_stamps" in last and "qwen3_time_stamps" in seg:
-                last["qwen3_time_stamps"].extend(seg["qwen3_time_stamps"])
-            last["speaker_merged_adjacent"] = True
-        else:
-            merged.append(seg.copy())
-    for i, seg in enumerate(merged):
-        seg["id"] = i
-    if len(merged) < len(segments):
-        print(f"✅ 同 speaker 相邻合并: {len(segments)} -> {len(merged)} 段")
-    return merged
-
-
 def assign_speakers(segments, rttm_spans, diagnostics=None):
     from speaker_alignment import (
         AlignmentConfig,
         align_segments_with_rttm,
-        merge_adjacent_speaker_turns,
     )
 
     result = align_segments_with_rttm(
@@ -3709,10 +3717,10 @@ def assign_speakers(segments, rttm_spans, diagnostics=None):
         print(f"✅ 句子边界与 RTTM 联合分段: 新增 {split_count} 个片段。")
     if ambiguous_count:
         print(f"⚠️ {ambiguous_count} 个片段的说话人边界证据不足，已保守保留整段。")
-    merged = merge_adjacent_speaker_turns(result)
-    if len(merged) < len(result):
-        print(f"✅ 同说话人片段重组: {len(result)} -> {len(merged)} 段。")
-    return merged
+    # Speaker labels are metadata.  Never concatenate text or extend timing
+    # merely because two adjacent atoms currently share a label: a mistaken
+    # label would otherwise destroy the evidence needed to correct it later.
+    return result
 
 
 def load_clustering_diagnostics():
@@ -3740,7 +3748,13 @@ def save_clustering_diagnostics(diagnostics):
 def attach_speaker_confidence(segments, diagnostics):
     """Map global identities without changing text, timing, or segment count."""
     profiles = diagnostics.get("speaker_profiles") or {}
+    raw_profiles = diagnostics.get("raw_speaker_profiles") or {}
     identity_map = diagnostics.get("speaker_identity_map") or {}
+    inverse_identity_map = defaultdict(list)
+    for raw_name, final_name in identity_map.items():
+        inverse_identity_map[normalize_speaker(final_name)].append(
+            normalize_speaker(raw_name)
+        )
     enriched = []
     for source in segments:
         segment = source.copy()
@@ -3750,14 +3764,51 @@ def attach_speaker_confidence(segments, diagnostics):
         )
         segment["speaker_raw"] = raw_speaker
         segment["speaker"] = final_speaker
+        segment["boundary_confidence"] = float(
+            segment.get("speaker_assignment_confidence", 0.0)
+        )
         profile = profiles.get(final_speaker) or {}
-        if profile:
-            segment["speaker_confidence"] = float(
-                profile.get("embedding_quality", 0.0)
+        raw_profile = raw_profiles.get(raw_speaker) or {}
+        if profile or raw_profile:
+            profile_quality = float(profile.get("embedding_quality", 0.0))
+            raw_quality = float(
+                raw_profile.get("embedding_quality", profile_quality)
+            )
+            consistency = profile.get("consistency_q25")
+            if consistency is None:
+                consistency = profile_quality
+            identity_confidence = min(
+                profile_quality,
+                raw_quality,
+                max(0.0, float(consistency)),
+            )
+            raw_member_count = max(
+                1, len(inverse_identity_map.get(final_speaker) or [raw_speaker])
+            )
+            if raw_member_count > 1:
+                identity_confidence *= max(
+                    0.55, 1.0 - 0.08 * (raw_member_count - 1)
+                )
+            segment["identity_confidence"] = round(
+                max(0.0, min(1.0, identity_confidence)), 4
+            )
+            # Compatibility field now reflects identity certainty rather than
+            # local RTTM overlap or profile quality alone.
+            segment["speaker_confidence"] = segment["identity_confidence"]
+            segment["identity_raw_member_count"] = raw_member_count
+            segment["identity_mapping_status"] = (
+                "global_identity_merge"
+                if raw_member_count > 1
+                else "single_raw_identity"
             )
             segment["speaker_assignment"] = diagnostics.get(
                 "algorithm", "prototype_identity_clustering_v2"
             )
+        else:
+            segment["identity_confidence"] = 0.0
+            segment["speaker_confidence"] = 0.0
+            segment["identity_mapping_status"] = "missing_identity_profile"
+        segment["merge_confidence"] = None
         enriched.append(segment)
     return enriched
 
@@ -3797,19 +3848,131 @@ def update_dialogue_identity_diagnostics(segments, diagnostics):
 
 
 def reassemble_final_speaker_segments(segments):
-    """Rejoin fragments only after raw RTTM labels map to global identities."""
-    from speaker_alignment import merge_adjacent_speaker_turns
-
-    merged = merge_adjacent_speaker_turns(segments)
-    if len(merged) < len(segments):
-        print(
-            f"✅ 全局身份回填后片段重组: {len(segments)} -> {len(merged)} 段。"
+    """Annotate logical continuity without modifying atomic text or timing."""
+    annotated = []
+    group_index = -1
+    previous = None
+    for source in segments:
+        segment = source.copy()
+        same_raw_identity = bool(
+            previous
+            and normalize_speaker(previous.get("speaker"))
+            == normalize_speaker(segment.get("speaker"))
+            and normalize_speaker(previous.get("speaker_raw"))
+            == normalize_speaker(segment.get("speaker_raw"))
         )
-    return merged
+        gap = (
+            float(segment["start"]) - float(previous["end"])
+            if previous else float("inf")
+        )
+        protected_boundary = bool(
+            not previous
+            or previous.get("hard_silence_after")
+            or segment.get("hard_silence_before")
+            or previous.get("speaker_boundary_ambiguous")
+            or segment.get("speaker_boundary_ambiguous")
+            or "speaker_boundary"
+            in (previous.get("segment_split_reasons") or [])
+            or "hard_silence_boundary"
+            in (previous.get("segment_split_reasons") or [])
+        )
+        continuation = bool(
+            same_raw_identity
+            and 0.0 <= gap <= 0.80
+            and not protected_boundary
+        )
+        if not continuation:
+            group_index += 1
+            member_index = 0
+        else:
+            member_index = int(previous.get("speaker_group_member_index", 0)) + 1
+        segment["speaker_group_id"] = f"speaker_group_{group_index:04d}"
+        segment["speaker_group_member_index"] = member_index
+        segment["speaker_group_logical_only"] = True
+        segment["speaker_continuation_candidate"] = continuation
+        annotated.append(segment)
+        previous = segment
+    return annotated
+
+
+def assign_speakers_to_fixed_atoms(atoms, rttm_spans):
+    """Project an RTTM hypothesis onto existing atoms without splitting them."""
+    projected = []
+    for source in atoms:
+        segment = source.copy()
+        start = float(segment["start"])
+        end = float(segment["end"])
+        overlaps = speaker_overlaps(start, end, rttm_spans)
+        overlap_total = sum(overlaps.values())
+        if overlaps:
+            raw_speaker = normalize_speaker(max(overlaps, key=overlaps.get))
+            dominant = max(overlaps.values())
+            dominance = dominant / overlap_total if overlap_total > 0.0 else 0.0
+        else:
+            raw_speaker = "SPEAKER_00"
+            dominance = 0.0
+        segment["speaker"] = raw_speaker
+        segment["speaker_raw"] = raw_speaker
+        segment["speaker_overlap_dominance"] = round(dominance, 4)
+        segment["speaker_assignment_confidence"] = round(dominance, 4)
+        segment["boundary_confidence"] = round(dominance, 4)
+        segment["identity_confidence"] = None
+        segment["speaker_confidence"] = None
+        segment["merge_confidence"] = None
+        segment["speaker_assignment_status"] = (
+            "fixed_atom_pairwise_dominant_overlap"
+            if dominance >= 0.80
+            else "fixed_atom_pairwise_ambiguous_overlap"
+        )
+        segment["speaker_boundary_ambiguous"] = bool(
+            len(overlaps) > 1 and dominance < 0.80
+        )
+        segment["speaker_overlap_candidates"] = [
+            {
+                "speaker": normalize_speaker(speaker),
+                "seconds": round(seconds, 3),
+                "ratio": round(
+                    seconds / overlap_total if overlap_total > 0.0 else 0.0,
+                    4,
+                ),
+            }
+            for speaker, seconds in sorted(
+                overlaps.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
+        segment["comparison_segmentation"] = "fixed_repaired_atoms_v1"
+        projected.append(segment)
+    return projected
+
+
+def annotate_pairwise_boundary_disagreements(repaired, pairwise):
+    """Flag possible over-merges without letting the baseline rewrite labels."""
+    if len(repaired) != len(pairwise):
+        return repaired
+    annotated = [item.copy() for item in repaired]
+    for index in range(1, len(annotated)):
+        repaired_change = normalize_speaker(annotated[index - 1].get("speaker")) != (
+            normalize_speaker(annotated[index].get("speaker"))
+        )
+        pairwise_change = normalize_speaker(pairwise[index - 1].get("speaker")) != (
+            normalize_speaker(pairwise[index].get("speaker"))
+        )
+        if pairwise_change and not repaired_change:
+            for target in (annotated[index - 1], annotated[index]):
+                target["identity_merge_disputed_by_pairwise"] = True
+                confidence = target.get("identity_confidence")
+                if confidence is not None:
+                    target["identity_confidence"] = round(
+                        min(float(confidence), 0.65), 4
+                    )
+                    target["speaker_confidence"] = target["identity_confidence"]
+        elif repaired_change and not pairwise_change:
+            annotated[index]["identity_split_disputed_by_pairwise"] = True
+    return annotated
 
 
 def build_clustering_comparison(repaired, pairwise):
-    """Build a label-invariant, duration-weighted A/B comparison."""
+    """Compare labels on one immutable set of sentence atoms."""
     overlap_by_pair = defaultdict(float)
     pairwise_duration = defaultdict(float)
     for baseline in pairwise:
@@ -3846,9 +4009,66 @@ def build_clustering_comparison(repaired, pairwise):
         if mapping.get(baseline_speaker) == repaired_speaker
     )
     total = sum(pairwise_duration.values())
+    repaired_labels = [
+        normalize_speaker(item.get("speaker")) for item in repaired
+    ]
+    pairwise_labels = [
+        normalize_speaker(item.get("speaker")) for item in pairwise
+    ]
+    same_atomic_units = bool(
+        len(repaired) == len(pairwise)
+        and all(
+            left.get("atomic_segment_id") == right.get("atomic_segment_id")
+            and abs(float(left["start"]) - float(right["start"])) < 1e-6
+            and abs(float(left["end"]) - float(right["end"])) < 1e-6
+            and str(left.get("text", "")) == str(right.get("text", ""))
+            for left, right in zip(repaired, pairwise)
+        )
+    )
+    coassignment = {
+        "both_same": 0,
+        "repaired_same_pairwise_different": 0,
+        "repaired_different_pairwise_same": 0,
+        "both_different": 0,
+    }
+    if same_atomic_units:
+        for left in range(len(repaired_labels)):
+            for right in range(left + 1, len(repaired_labels)):
+                repaired_same = repaired_labels[left] == repaired_labels[right]
+                pairwise_same = pairwise_labels[left] == pairwise_labels[right]
+                if repaired_same and pairwise_same:
+                    coassignment["both_same"] += 1
+                elif repaired_same:
+                    coassignment["repaired_same_pairwise_different"] += 1
+                elif pairwise_same:
+                    coassignment["repaired_different_pairwise_same"] += 1
+                else:
+                    coassignment["both_different"] += 1
+    repaired_boundaries = []
+    pairwise_boundaries = []
+    if same_atomic_units:
+        repaired_boundaries = [
+            repaired_labels[index - 1] != repaired_labels[index]
+            for index in range(1, len(repaired_labels))
+        ]
+        pairwise_boundaries = [
+            pairwise_labels[index - 1] != pairwise_labels[index]
+            for index in range(1, len(pairwise_labels))
+        ]
+    mapped_sources = defaultdict(set)
+    for baseline_speaker, repaired_speaker in mapping.items():
+        mapped_sources[repaired_speaker].add(baseline_speaker)
+    mapping_collisions = {
+        repaired_speaker: sorted(sources)
+        for repaired_speaker, sources in mapped_sources.items()
+        if len(sources) > 1
+    }
     return {
-        "version": 1,
-        "production_algorithm": "repaired_temporal_identity_consensus",
+        "version": 2,
+        "comparison_unit": "immutable_sentence_atom",
+        "same_atomic_units": same_atomic_units,
+        "atomic_segment_count": len(repaired) if same_atomic_units else None,
+        "production_algorithm": "stable_core_identity_consensus_v10_immutable_atoms",
         "baseline_algorithm": "wespeaker_pairwise_cosine_average_linkage",
         "pairwise_distance_threshold": _env_float(
             "SPEAKER_CLUSTER_THRESHOLD", 0.5
@@ -3868,12 +4088,36 @@ def build_clustering_comparison(repaired, pairwise):
             ),
         },
         "baseline_to_repaired_label_map": mapping,
+        "many_to_one_mapping_collisions": mapping_collisions,
+        "many_to_one_mapping_collision_count": len(mapping_collisions),
+        "coassignment": coassignment,
+        "adjacent_boundary_disagreement": {
+            "repaired_missed_pairwise_change": sum(
+                baseline and not candidate
+                for candidate, baseline in zip(
+                    repaired_boundaries, pairwise_boundaries
+                )
+            ),
+            "repaired_extra_change": sum(
+                candidate and not baseline
+                for candidate, baseline in zip(
+                    repaired_boundaries, pairwise_boundaries
+                )
+            ),
+            "both_detect_change": sum(
+                candidate and baseline
+                for candidate, baseline in zip(
+                    repaired_boundaries, pairwise_boundaries
+                )
+            ),
+        },
         "duration_weighted_label_agreement": round(
             matched / total if total > 0.0 else 0.0, 4
         ),
         "note": (
             "Agreement is label-invariant after maximum-overlap mapping; "
-            "it is not a ground-truth accuracy score."
+            "it is not a ground-truth accuracy score. Coassignment and "
+            "boundary disagreements separate merge risk from split risk."
         ),
     }
 
@@ -3922,10 +4166,16 @@ def main():
         and os.path.isfile(PAIRWISE_RTTM_PATH)
     ):
         pairwise_spans = parse_rttm(PAIRWISE_RTTM_PATH)
-        pairwise_aligned = assign_speakers(
-            state["segments_step1"], pairwise_spans, diagnostics=None
+        # A/B must use exactly the production atoms.  Letting each hypothesis
+        # split and merge its own text made speaker counts incomparable and
+        # allowed an over-merged result to score deceptively well.
+        pairwise_aligned = assign_speakers_to_fixed_atoms(
+            aligned, pairwise_spans
         )
         clustering_comparison = build_clustering_comparison(
+            aligned, pairwise_aligned
+        )
+        aligned = annotate_pairwise_boundary_disagreements(
             aligned, pairwise_aligned
         )
         clustering_comparison.update({

@@ -33,6 +33,9 @@ from run_step2_wespeaker import (
     _soft_continuity_threshold,
     _temporal_assignment_context,
     attach_speaker_confidence,
+    assign_speakers,
+    assign_speakers_to_fixed_atoms,
+    annotate_pairwise_boundary_disagreements,
     build_clustering_comparison,
     reassemble_final_speaker_segments,
     update_dialogue_identity_diagnostics,
@@ -238,6 +241,41 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertEqual(soft_links, {(0, 1)})
         self.assertIs(evidence[(0, 1)], boundary)
 
+    def test_persistent_change_with_timestamp_support_is_cannot_link(self):
+        region = ("input", 0.0, 6.0)
+        windows = [
+            {
+                "region": region,
+                "start": center - 0.5,
+                "end": center + 0.5,
+                "center": center,
+                "embedding": (
+                    np.asarray([1.0, 0.0])
+                    if center < 3.0 else np.asarray([0.0, 1.0])
+                ),
+            }
+            for center in (0.75, 1.5, 2.25, 3.75, 4.5, 5.25)
+        ]
+        boundary = {
+            "region": region,
+            "between_regions": None,
+            "time": 3.0,
+            "constraint": "soft",
+            "timestamp_reliable": True,
+            "persistent_acoustic_change": True,
+            "text_split_allowed": True,
+            "boundary_role": "speaker_and_text",
+        }
+        _, hard_links, soft_links, _ = _build_acoustic_turns(
+            windows, [boundary]
+        )
+        self.assertEqual(hard_links, {(0, 1)})
+        self.assertEqual(soft_links, set())
+        self.assertEqual(
+            boundary["identity_constraint"],
+            "hard_persistent_acoustic_change",
+        )
+
     def test_strong_punctuation_soft_boundary_remains_reconcilable(self):
         threshold = _soft_continuity_threshold([{
             "same_asr_segment": True,
@@ -403,7 +441,7 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertLess(len(identities), 5)
         self.assertEqual(
             diagnostics["algorithm"],
-            "stable_core_identity_consensus_v9_balanced",
+            "stable_core_identity_consensus_v10_immutable_atoms",
         )
         self.assertGreater(
             diagnostics["global_partition_candidate_count"], 1
@@ -930,6 +968,15 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
         self.assertEqual(result[1]["mix_start"], 1.9)
         self.assertEqual(result[1]["mix_end"], 2.98)
         self.assertEqual(len(merge_adjacent_speaker_turns(result)), 2)
+        self.assertEqual(result[0]["source_start"], 0.0)
+        self.assertEqual(result[0]["source_end"], 4.0)
+        self.assertEqual(result[1]["source_start"], 0.0)
+        self.assertEqual(result[1]["source_end"], 4.0)
+        self.assertEqual(result[0]["atomic_start"], 0.0)
+        self.assertEqual(result[1]["atomic_end"], 4.0)
+        self.assertNotEqual(
+            result[0]["atomic_segment_id"], result[1]["atomic_segment_id"]
+        )
 
     def test_persistent_word_ownership_keeps_b_opening_words_out_of_a(self):
         segments = [{
@@ -1007,7 +1054,7 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
         )
         self.assertEqual(len(result[0]["speaker_overlap_candidates"]), 2)
 
-    def test_global_identity_mapping_reassembles_raw_label_fragments(self):
+    def test_global_identity_mapping_never_reassembles_atomic_sentences(self):
         segments = [
             {"id": 0, "start": 0.0, "end": 1.0, "text": "one", "speaker": "SPEAKER_00"},
             {"id": 1, "start": 1.0, "end": 2.0, "text": "two", "speaker": "SPEAKER_01"},
@@ -1021,14 +1068,85 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
         }
         mapped = attach_speaker_confidence(segments, diagnostics)
         merged = reassemble_final_speaker_segments(mapped)
-        self.assertEqual(len(merged), 1)
-        self.assertEqual(merged[0]["text"], "one two")
-        self.assertTrue(merged[0]["speaker_reference_mixed_raw"])
-        self.assertEqual(len(merged[0]["speaker_reference_components"]), 2)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual([item["text"] for item in merged], ["one", "two"])
         self.assertEqual(
-            [item["text"] for item in merged[0]["speaker_reference_components"]],
-            ["one", "two"],
+            [(item["start"], item["end"]) for item in merged],
+            [(0.0, 1.0), (1.0, 2.0)],
         )
+        self.assertTrue(all(item["speaker_group_logical_only"] for item in merged))
+        # A global identity merge is not sufficient evidence even for a
+        # logical continuation group when the raw identities differ.
+        self.assertNotEqual(
+            merged[0]["speaker_group_id"], merged[1]["speaker_group_id"]
+        )
+
+    def test_step2_assignment_does_not_join_same_speaker_sentences(self):
+        segments = [
+            {"id": 0, "start": 0.0, "end": 1.0, "text": "Question?",
+             "qwen3_time_stamps": [
+                 {"text": "Question", "start": 0.1, "end": 0.8}
+             ]},
+            {"id": 1, "start": 1.1, "end": 2.0, "text": "Answer.",
+             "qwen3_time_stamps": [
+                 {"text": "Answer", "start": 1.2, "end": 1.8}
+             ]},
+        ]
+        result = assign_speakers(segments, [
+            {"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}
+        ])
+        self.assertEqual(len(result), 2)
+        self.assertEqual([item["text"] for item in result], ["Question?", "Answer."])
+        self.assertEqual(
+            [(item["source_start"], item["source_end"]) for item in result],
+            [(0.0, 1.0), (1.1, 2.0)],
+        )
+
+    def test_pairwise_projection_preserves_fixed_atoms(self):
+        atoms = [{
+            "id": 7,
+            "atomic_segment_id": "3:0",
+            "start": 1.0,
+            "end": 3.0,
+            "text": "Do you trust me?",
+            "speaker": "SPEAKER_00",
+        }]
+        projected = assign_speakers_to_fixed_atoms(atoms, [
+            {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_08"},
+            {"start": 2.0, "end": 3.0, "speaker": "SPEAKER_09"},
+        ])
+        self.assertEqual(len(projected), 1)
+        self.assertEqual(projected[0]["atomic_segment_id"], "3:0")
+        self.assertEqual(projected[0]["text"], "Do you trust me?")
+        self.assertEqual((projected[0]["start"], projected[0]["end"]), (1.0, 3.0))
+
+    def test_comparison_reports_merge_and_boundary_risk_on_same_atoms(self):
+        repaired = [
+            {"atomic_segment_id": "0:0", "start": 0.0, "end": 1.0,
+             "text": "question", "speaker": "SPEAKER_00"},
+            {"atomic_segment_id": "1:0", "start": 1.0, "end": 2.0,
+             "text": "answer", "speaker": "SPEAKER_00"},
+        ]
+        pairwise = [
+            {**repaired[0], "speaker": "SPEAKER_08"},
+            {**repaired[1], "speaker": "SPEAKER_09"},
+        ]
+        report = build_clustering_comparison(repaired, pairwise)
+        self.assertTrue(report["same_atomic_units"])
+        self.assertEqual(
+            report["coassignment"]["repaired_same_pairwise_different"], 1
+        )
+        self.assertEqual(
+            report["adjacent_boundary_disagreement"][
+                "repaired_missed_pairwise_change"
+            ],
+            1,
+        )
+        annotated = annotate_pairwise_boundary_disagreements(
+            repaired, pairwise
+        )
+        self.assertTrue(annotated[0]["identity_merge_disputed_by_pairwise"])
+        self.assertTrue(annotated[1]["identity_merge_disputed_by_pairwise"])
 
     def test_dialogue_identity_count_is_separate_from_acoustic_count(self):
         diagnostics = {
