@@ -165,9 +165,6 @@ FRAGMENTATION_SINGLETON_RATIO = _env_float(
 FRAGMENTATION_RELAXATION = _env_float(
     "AUTODUB_DIAR_FRAGMENTATION_RELAXATION", 0.04
 )
-GLOBAL_PARTITION_NEAR_TIE = _env_float(
-    "AUTODUB_DIAR_GLOBAL_PARTITION_NEAR_TIE", 0.025
-)
 STRUCTURAL_SOFT_CHANGE_MIN = _env_float(
     "AUTODUB_DIAR_STRUCTURAL_SOFT_CHANGE_MIN", 0.44
 )
@@ -778,20 +775,19 @@ def _select_change_boundaries(candidates, windows):
             # identities separate even when it is not safe to cut transcript
             # text. Keeping these decisions independent prevents the stricter
             # anti-over-splitting policy from silently merging real speakers.
-            candidate["constraint"] = (
-                "identity"
-                if acoustic_scan
-                and persistent
-                and candidate["score"]
-                >= ACOUSTIC_IDENTITY_SEPARATION_MIN_SCORE
-                else "soft"
-            )
+            # Persistence is useful evidence for preserving a local turn and
+            # auditing an unsplittable transcript, but it is not proof that
+            # the voices can never belong to the same global identity.
+            candidate["constraint"] = "soft"
             candidate["boundary_role"] = (
                 "speaker_and_text"
                 if candidate["text_split_allowed"]
                 else (
                     "identity_separation_only"
-                    if candidate["constraint"] == "identity"
+                    if acoustic_scan
+                    and persistent
+                    and candidate["score"]
+                    >= ACOUSTIC_IDENTITY_SEPARATION_MIN_SCORE
                     else "identity_diagnostic_only"
                 )
             )
@@ -956,7 +952,7 @@ def _build_acoustic_turns(windows, boundaries):
             left = max(left_candidates, key=lambda index: turns[index]["end"])
             right = min(right_candidates, key=lambda index: turns[index]["start"])
             edge = (min(left, right), max(left, right))
-            if boundary.get("constraint") in {"hard", "identity"}:
+            if boundary.get("constraint") == "hard":
                 hard_cannot_links.add(edge)
             elif boundary.get("constraint") == "soft":
                 soft_cannot_links.add(edge)
@@ -972,7 +968,7 @@ def _build_acoustic_turns(windows, boundaries):
             left = left_turns[-1]
             right = right_turns[0]
             edge = (min(left, right), max(left, right))
-            if item.get("constraint") in {"hard", "identity"}:
+            if item.get("constraint") == "hard":
                 hard_cannot_links.add(edge)
             elif item.get("constraint") == "soft":
                 soft_cannot_links.add(edge)
@@ -1191,7 +1187,7 @@ def _sandwich_protection_penalty(
         item = boundary_evidence[
             (min(neighbour, singleton), max(neighbour, singleton))
         ]
-        if item.get("constraint") in {"soft", "hard", "identity"}:
+        if item.get("constraint") in {"soft", "hard"}:
             supported_edges += 1
     return (
         SANDWICH_SINGLETON_PENALTY
@@ -1592,75 +1588,61 @@ def _partition_soft_boundary_ratio(turn_groups, soft_cannot_links):
     return float(violations) / len(soft_cannot_links)
 
 
-def _conservative_cross_support(evidence):
-    """Summarize cross-identity support without single-link chaining.
+def _has_two_core_single_bridge(node, adjacency, raw_clusters, turns):
+    """Detect a single-link bridge between two independently supported cores.
 
-    The directional q25 forces every sizeable acoustic state to have support
-    in the opposite group.  A high centroid or one excellent pair can no
-    longer compensate for an unsupported subgroup.
+    The v7 search intentionally allows several acoustic states of one person
+    to form a connected graph.  The unsafe case is narrower: two multi-atom,
+    sufficiently long cores connected by only one pairwise edge.  Removing
+    that bridge must not collapse both communities into one identity merely
+    because the overall graph is technically connected.
     """
-    return min(
-        float(evidence.get("support_median", evidence["median"])),
-        float(evidence.get("support_q25", evidence["q25"])) + 0.03,
-        float(evidence["centroid"]) + 0.04,
-    )
+    atoms = set(node)
+    if len(atoms) < 4:
+        return False
 
+    edges = {
+        (min(left, right), max(left, right))
+        for left in atoms
+        for right in adjacency.get(left, set())
+        if left != right
+    }
 
-def _global_merge_is_supported(
-    left_node,
-    right_node,
-    raw_clusters,
-    turns,
-    merge_support_floor,
-    established_support_floor,
-):
-    """Require direct bidirectional evidence for every global merge step."""
-    left_group = {
-        turn_index
-        for raw_index in left_node
-        for turn_index in raw_clusters[raw_index]
-    }
-    right_group = {
-        turn_index
-        for raw_index in right_node
-        for turn_index in raw_clusters[raw_index]
-    }
-    left_profile = _identity_profile(left_group, turns)
-    right_profile = _identity_profile(right_group, turns)
-    # Weak fragments are assigned only after stable identities have been
-    # selected, where uniqueness and temporal context can also be checked.
-    if not left_profile["prototype"] or not right_profile["prototype"]:
-        return False, {}
-    threshold = max(
-        merge_support_floor + 0.04,
-        min(established_support_floor, 0.72),
-    )
-    evidence = _cluster_pair_evidence(left_group, right_group, turns)
-    conservative = _conservative_cross_support(evidence)
-    if conservative < threshold - 0.04:
-        return False, {
-            "threshold": threshold,
-            "conservative_support": conservative,
-        }
-    if not _robust_identity_match(evidence, threshold, anchor_pair=True):
-        return False, {
-            "threshold": threshold,
-            "conservative_support": conservative,
-        }
-    preserves, consistency = _merge_preserves_identity(
-        left_group, right_group, turns, threshold
-    )
-    if not preserves:
-        return False, {
-            "threshold": threshold,
-            "conservative_support": conservative,
-            **consistency,
-        }
-    return True, {
-        "threshold": threshold,
-        "conservative_support": conservative,
-        **consistency,
-    }
+    def reliable_duration(component):
+        return sum(
+            max(0.0, float(turns[turn_index].get("duration", 0.0)))
+            for raw_index in component
+            for turn_index in raw_clusters[raw_index]
+            if turns[turn_index].get("embedding_reliable")
+        )
+
+    for blocked_left, blocked_right in edges:
+        start = min(atoms)
+        visited = set()
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            for neighbour in adjacency.get(current, set()):
+                if {
+                    current, neighbour
+                } == {blocked_left, blocked_right}:
+                    continue
+                if neighbour in atoms and neighbour not in visited:
+                    stack.append(neighbour)
+        if visited == atoms:
+            continue
+        other = atoms - visited
+        if (
+            len(visited) >= 2
+            and len(other) >= 2
+            and reliable_duration(visited) >= 2.40
+            and reliable_duration(other) >= 2.40
+        ):
+            return True
+    return False
 
 
 def _score_identity_partition(
@@ -1783,14 +1765,15 @@ def _score_identity_partition(
                     continue
                 pair = (min(left, right), max(left, right))
                 if raw_pair_support is not None:
-                    support = _conservative_cross_support(
-                        raw_pair_support[pair]
-                    )
+                    support = raw_pair_support[pair]
                 else:
                     evidence = _cluster_pair_evidence(
                         raw_clusters[left], raw_clusters[right], turns
                     )
-                    support = _conservative_cross_support(evidence)
+                    support = max(
+                        evidence["centroid"],
+                        evidence.get("support_median", evidence["median"]),
+                    )
                 peer_support.append(support)
                 if support >= merge_support_floor:
                     adjacency[left].add(right)
@@ -1818,6 +1801,10 @@ def _score_identity_partition(
         # internally coherent subgroups must never be silently unioned.
         if component_count > 1:
             return None
+        if _has_two_core_single_bridge(
+            node, adjacency, raw_clusters, turns
+        ):
+            return None
     unsupported_merge_penalty = (
         float(np.mean([
             max(0.0, merge_support_floor - support)
@@ -1841,11 +1828,6 @@ def _score_identity_partition(
             support >= merge_support_floor for support in directional_support
         ])) if directional_support else 0.0
     )
-    identity_consistency_q25 = float(np.median([
-        _cluster_consistency(group, turns)["q25"]
-        for group in turn_groups
-        if len(group) >= 2
-    ])) if any(len(group) >= 2 for group in turn_groups) else 0.0
     # There is deliberately no ordinary singleton or speaker-count penalty.
     # Those terms caused opposite failures on different videos. Supported
     # reuse earns a reward; weak islands and unsupported merges remain costly.
@@ -1853,13 +1835,12 @@ def _score_identity_partition(
         0.72 * assignment_margin
         + 0.34 * cohesion
         + 0.22 * separation
-        + 0.08 * reuse_ratio
-        + 0.08 * prototype_coverage
-        + 0.18 * identity_consistency_q25
-        - 0.10 * low_quality_singleton_ratio
+        + 0.18 * reuse_ratio
+        + 0.12 * prototype_coverage
+        - 0.38 * low_quality_singleton_ratio
         - 0.06 * soft_violation_ratio
-        - 1.05 * unsupported_merge_penalty
-        - 1.00 * established_merge_penalty
+        - 0.90 * unsupported_merge_penalty
+        - 0.78 * established_merge_penalty
     )
     return {
         "score": float(score),
@@ -1875,7 +1856,6 @@ def _score_identity_partition(
         "unsupported_merge_penalty": unsupported_merge_penalty,
         "established_merge_penalty": established_merge_penalty,
         "prototype_coverage": prototype_coverage,
-        "identity_consistency_q25": identity_consistency_q25,
         "identity_component_count_max": max(identity_component_counts or [1]),
     }
 
@@ -1899,11 +1879,11 @@ def _search_global_identity_partition(
             evidence = _cluster_pair_evidence(
                 raw_clusters[left], raw_clusters[right], turns
             )
-            raw_pair_support[(left, right)] = evidence
-    support_values = np.asarray([
-        _conservative_cross_support(evidence)
-        for evidence in raw_pair_support.values()
-    ], dtype=float)
+            raw_pair_support[(left, right)] = max(
+                evidence["centroid"],
+                evidence.get("support_median", evidence["median"]),
+            )
+    support_values = np.asarray(list(raw_pair_support.values()), dtype=float)
     if len(support_values):
         merge_support_floor = float(np.clip(
             np.quantile(support_values, 0.25), 0.38, 0.56
@@ -1952,16 +1932,6 @@ def _search_global_identity_partition(
                         turn_groups[right],
                         hard_cannot_links,
                     ):
-                        continue
-                    supported, _ = _global_merge_is_supported(
-                        partition[left],
-                        partition[right],
-                        raw_clusters,
-                        turns,
-                        merge_support_floor,
-                        established_support_floor,
-                    )
-                    if not supported:
                         continue
                     merged = partition[left] | partition[right]
                     candidate = [
@@ -2016,21 +1986,7 @@ def _search_global_identity_partition(
         updated["selection_score"] = metrics["score"] + 0.08 * stability
         rescored.append((partition, updated))
     rescored.sort(key=lambda item: item[1]["selection_score"], reverse=True)
-    best_selection_score = rescored[0][1]["selection_score"]
-    near_best = [
-        item for item in rescored
-        if item[1]["selection_score"]
-        >= best_selection_score - GLOBAL_PARTITION_NEAR_TIE
-    ]
-    # When several explanations are effectively tied, preserve the more
-    # conservative identity count. Wrongly merging two people is more harmful
-    # downstream than temporarily retaining a supported extra identity.
-    selected_partition, selected_metrics = max(
-        near_best,
-        key=lambda item: (
-            item[1]["speaker_count"], item[1]["selection_score"]
-        ),
-    )
+    selected_partition, selected_metrics = rescored[0]
     selected_metrics = dict(selected_metrics)
     selected_metrics.update({
         "merge_support_floor": merge_support_floor,
@@ -2771,7 +2727,7 @@ def _reconcile_turn_clusters(
             "consistency_q25": round(consistency["q25"], 4),
         })
     diagnostics = {
-        "algorithm": "stable_core_identity_consensus_v8",
+        "algorithm": "stable_core_identity_consensus_v9_balanced",
         "turn_count": len(turns),
         "raw_speaker_count": len(raw_clusters),
         "speaker_count": len(identity_clusters),
@@ -3666,6 +3622,13 @@ def assign_speakers(segments, rttm_spans, diagnostics=None):
 def load_clustering_diagnostics():
     if not os.path.isfile(CLUSTERING_DIAGNOSTICS_PATH):
         return None
+    try:
+        with open(CLUSTERING_DIAGNOSTICS_PATH, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError) as exc:
+        print(f"⚠️ 无法读取说话人聚类诊断: {exc}")
+        return None
 
 
 def save_clustering_diagnostics(diagnostics):
@@ -3676,13 +3639,6 @@ def save_clustering_diagnostics(diagnostics):
     with open(temporary_path, "w", encoding="utf-8") as stream:
         json.dump(diagnostics, stream, ensure_ascii=False, indent=2)
     os.replace(temporary_path, CLUSTERING_DIAGNOSTICS_PATH)
-    try:
-        with open(CLUSTERING_DIAGNOSTICS_PATH, "r", encoding="utf-8") as stream:
-            payload = json.load(stream)
-        return payload if isinstance(payload, dict) else None
-    except (OSError, ValueError) as exc:
-        print(f"⚠️ 无法读取说话人聚类诊断: {exc}")
-        return None
 
 
 def attach_speaker_confidence(segments, diagnostics):

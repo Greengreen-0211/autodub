@@ -1,4 +1,8 @@
 import unittest
+import tempfile
+from pathlib import Path
+
+import run_step2_wespeaker as wespeaker_module
 
 try:
     import numpy as np
@@ -16,6 +20,7 @@ from run_step2_wespeaker import (
     _constrained_turn_clusters,
     _adaptive_identity_thresholds,
     _merge_preserves_identity,
+    _has_two_core_single_bridge,
     _pair_evidence_diagnostics,
     _robust_identity_match,
     _robust_embedding_pool,
@@ -175,7 +180,7 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertFalse(selected[0]["text_split_allowed"])
         self.assertEqual(selected[0]["boundary_role"], "identity_diagnostic_only")
 
-    def test_persistent_acoustic_change_separates_identity_without_cutting_text(self):
+    def test_persistent_acoustic_change_marks_identity_without_hard_block(self):
         region = ("input", 0.0, 8.0)
         windows = [
             {"region": region, "center": value}
@@ -192,13 +197,13 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         }
         selected, _ = _select_change_boundaries([candidate], windows)
         self.assertEqual(len(selected), 1)
-        self.assertEqual(selected[0]["constraint"], "identity")
+        self.assertEqual(selected[0]["constraint"], "soft")
         self.assertFalse(selected[0]["text_split_allowed"])
         self.assertEqual(
             selected[0]["boundary_role"], "identity_separation_only"
         )
 
-    def test_identity_only_boundary_becomes_identity_cannot_link(self):
+    def test_identity_only_boundary_remains_reconcilable_soft_link(self):
         region = ("input", 0.0, 6.0)
         windows = [
             {
@@ -217,7 +222,7 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
             "region": region,
             "between_regions": None,
             "time": 3.0,
-            "constraint": "identity",
+            "constraint": "soft",
             "text_split_allowed": False,
             "boundary_role": "identity_separation_only",
         }
@@ -225,8 +230,8 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
             windows, [boundary]
         )
         self.assertEqual(len(turns), 2)
-        self.assertEqual(hard_links, {(0, 1)})
-        self.assertEqual(soft_links, set())
+        self.assertEqual(hard_links, set())
+        self.assertEqual(soft_links, {(0, 1)})
         self.assertIs(evidence[(0, 1)], boundary)
 
     def test_strong_punctuation_soft_boundary_remains_reconcilable(self):
@@ -394,7 +399,7 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         self.assertLess(len(identities), 5)
         self.assertEqual(
             diagnostics["algorithm"],
-            "stable_core_identity_consensus_v8",
+            "stable_core_identity_consensus_v9_balanced",
         )
         self.assertGreater(
             diagnostics["global_partition_candidate_count"], 1
@@ -443,6 +448,40 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
         )
         self.assertGreaterEqual(len(identities), 2)
         self.assertFalse(any(cluster == set(range(6)) for cluster in identities))
+
+    def test_two_established_cores_cannot_merge_through_one_bridge(self):
+        turns = [
+            {
+                "duration": 1.5,
+                "embedding_reliable": True,
+            }
+            for _ in range(4)
+        ]
+        raw_clusters = [{0}, {1}, {2}, {3}]
+        adjacency = {
+            0: {1},
+            1: {0, 2},
+            2: {1, 3},
+            3: {2},
+        }
+        self.assertTrue(_has_two_core_single_bridge(
+            {0, 1, 2, 3}, adjacency, raw_clusters, turns
+        ))
+
+        redundant_cross_support = {
+            0: {1},
+            1: {0, 2},
+            2: {1, 3},
+            3: {2},
+        }
+        redundant_cross_support[0].add(3)
+        redundant_cross_support[3].add(0)
+        self.assertFalse(_has_two_core_single_bridge(
+            {0, 1, 2, 3},
+            redundant_cross_support,
+            raw_clusters,
+            turns,
+        ))
 
     def test_robust_turn_pool_rejects_one_window_outlier(self):
         values = np.asarray([
@@ -677,6 +716,27 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
 
 
 class SpeakerAlignmentFallbackTests(unittest.TestCase):
+    def test_clustering_diagnostics_round_trip_from_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = wespeaker_module.CLUSTERING_DIAGNOSTICS_PATH
+            try:
+                wespeaker_module.CLUSTERING_DIAGNOSTICS_PATH = str(
+                    Path(directory) / "speaker_clustering_diagnostics.json"
+                )
+                expected = {
+                    "algorithm": "stable_core_identity_consensus_v9_balanced",
+                    "speaker_identity_map": {
+                        "SPEAKER_00": "SPEAKER_00",
+                        "SPEAKER_01": "SPEAKER_00",
+                    },
+                }
+                wespeaker_module.save_clustering_diagnostics(expected)
+                self.assertEqual(
+                    wespeaker_module.load_clustering_diagnostics(), expected
+                )
+            finally:
+                wespeaker_module.CLUSTERING_DIAGNOSTICS_PATH = original_path
+
     def test_diagnostic_only_rttm_change_does_not_cut_text(self):
         segments = [{
             "id": 0, "start": 0.0, "end": 3.0,
