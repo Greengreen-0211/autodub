@@ -54,7 +54,12 @@ class TranslationTests(unittest.TestCase):
             "target_form": "雪宝",
         }]
         self.assertEqual(
-            applicable_glossary_entries({"text": "Where are you?"}, glossary),
+            applicable_glossary_entries({
+                "text": "Where are you?",
+                "_ocr_translation_references": [{
+                    "source_text": "Olaf. Where are you?",
+                }],
+            }, glossary),
             [],
         )
         self.assertEqual(

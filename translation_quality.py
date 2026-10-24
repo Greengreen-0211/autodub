@@ -138,13 +138,11 @@ def plausible_source_entity_form(value: Any) -> bool:
 
 def applicable_glossary_entries(segment: dict, glossary: list[dict] | None) -> list[dict]:
     """Return validated video-level entities that occur in this source turn."""
-    source_parts = [str(segment.get("text", ""))]
-    source_parts.extend(
-        str(reference.get("source_text", ""))
-        for reference in segment.get("_ocr_translation_references", [])
-        if isinstance(reference, dict)
-    )
-    source_text = " ".join(source_parts)
+    # Only the authoritative ASR sentence may create a mandatory glossary
+    # constraint. OCR references can span adjacent subtitle cards and are
+    # useful as spelling/translation hints, but must never import a neighbour's
+    # entity into the current sentence (for example Olaf -> "Where are you?").
+    source_text = str(segment.get("text", ""))
     output = []
     for entry in glossary or []:
         if not isinstance(entry, dict):
