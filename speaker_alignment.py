@@ -27,6 +27,10 @@ class AlignmentConfig:
     minimum_sentence_seconds: float = 0.80
     target_sentence_seconds: float = 8.0
     maximum_sentence_seconds: float = 12.0
+    # A verified word gap this large is an acoustic boundary, not merely a
+    # sentence-boundary candidate.  It must survive speaker-turn reassembly so
+    # TTS never stretches one utterance across a long silent interval.
+    hard_silence_seconds: float = 0.75
     speaker_snap_radius_seconds: float = 0.80
     minimum_speaker_turn_seconds: float = 0.45
     island_max_seconds: float = 0.30
@@ -265,6 +269,21 @@ def sentence_boundary_indices(
     return boundaries
 
 
+def hard_silence_boundary_indices(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    config: AlignmentConfig = AlignmentConfig(),
+) -> List[int]:
+    """Return reliable token gaps that must remain separate render slots."""
+    if len(items) < 2:
+        return []
+    return [
+        index
+        for index in range(1, len(items))
+        if _gap_seconds(items, index) >= config.hard_silence_seconds
+    ]
+
+
 def sentence_candidates(
     items: Sequence[Mapping[str, Any]],
     *,
@@ -328,6 +347,80 @@ def speaker_overlaps(
             speaker = normalize_speaker(span.get("speaker"))
             overlaps[speaker] = overlaps.get(speaker, 0.0) + overlap
     return overlaps
+
+
+def persistent_token_speaker_boundaries(
+    items: Sequence[Mapping[str, Any]],
+    spans: Sequence[Mapping[str, Any]],
+    *,
+    config: AlignmentConfig = AlignmentConfig(),
+) -> Dict[int, Dict[str, Any]]:
+    """Find safe word boundaries where RTTM ownership persistently changes.
+
+    This is intentionally stricter than ordinary RTTM snapping: both token
+    runs must have high per-token dominance and enough voiced duration.  It
+    recovers B's first words when A and B speak back-to-back without inventing
+    a textual cut from a single noisy diarization window.
+    """
+    owners: List[Optional[str]] = []
+    confidences: List[float] = []
+    for item in items:
+        start = float(item.get("start", 0.0))
+        end = float(item.get("end", start))
+        overlaps = speaker_overlaps(start, end, spans)
+        total = sum(overlaps.values())
+        if total <= 0.0:
+            owners.append(None)
+            confidences.append(0.0)
+            continue
+        owner = max(overlaps, key=overlaps.get)
+        owners.append(owner)
+        confidences.append(overlaps[owner] / total)
+
+    result: Dict[int, Dict[str, Any]] = {}
+    index = 0
+    while index < len(items):
+        owner = owners[index]
+        run_end = index + 1
+        while run_end < len(items) and owners[run_end] == owner:
+            run_end += 1
+        if owner is not None and run_end < len(items):
+            next_owner = owners[run_end]
+            next_end = run_end + 1
+            while next_end < len(items) and owners[next_end] == next_owner:
+                next_end += 1
+            left_duration = (
+                float(items[run_end - 1].get("end", 0.0))
+                - float(items[index].get("start", 0.0))
+            )
+            right_duration = (
+                float(items[next_end - 1].get("end", 0.0))
+                - float(items[run_end].get("start", 0.0))
+            )
+            if (
+                next_owner is not None
+                and next_owner != owner
+                and run_end - index >= 2
+                and next_end - run_end >= 2
+                and left_duration >= config.minimum_speaker_turn_seconds
+                and right_duration >= config.minimum_speaker_turn_seconds
+                and min(confidences[index:run_end], default=0.0) >= 0.80
+                and min(confidences[run_end:next_end], default=0.0) >= 0.80
+            ):
+                result[run_end] = {
+                    "time": (
+                        float(items[run_end - 1].get("end", 0.0))
+                        + float(items[run_end].get("start", 0.0))
+                    )
+                    / 2.0,
+                    "boundary_source": "persistent_word_rttm_ownership",
+                    "text_split_allowed": True,
+                    "boundary_role": "speaker_and_text",
+                    "left_speaker": normalize_speaker(owner),
+                    "right_speaker": normalize_speaker(next_owner),
+                }
+        index = run_end
+    return result
 
 
 def smooth_rttm_spans(
@@ -663,6 +756,9 @@ def align_segments_with_rttm(
             continue
 
         sentence_candidates_for_turn = sentence_boundary_indices(items, config=config)
+        hard_silence_splits = set(
+            hard_silence_boundary_indices(items, config=config)
+        )
         sentence_splits = set(
             long_turn_boundary_indices(
                 items,
@@ -689,7 +785,13 @@ def align_segments_with_rttm(
             )
             if boundary is not None:
                 speaker_splits[boundary] = change
-        split_indices = sorted(sentence_splits | set(speaker_splits))
+        for boundary, evidence in persistent_token_speaker_boundaries(
+            items, spans, config=config
+        ).items():
+            speaker_splits.setdefault(boundary, evidence)
+        split_indices = sorted(
+            sentence_splits | hard_silence_splits | set(speaker_splits)
+        )
 
         # Exact transcript spans are mandatory for splitting.  A partial or
         # mismatched alignment is retained for audit, never used to guess text.
@@ -791,9 +893,16 @@ def align_segments_with_rttm(
                 result["speech_end"] = round(
                     min(end, float(group_items[-1].get("end", end)) + 0.08), 3
                 )
+                # Rendering uses the speech-bearing window.  Public start/end
+                # remain the textual/transport boundaries for compatibility.
+                result["mix_start"] = result["speech_start"]
+                result["mix_end"] = result["speech_end"]
+            result["hard_silence_before"] = bool(left in hard_silence_splits)
+            result["hard_silence_after"] = bool(right in hard_silence_splits)
             result["segment_split_reasons"] = sorted(
                 {
                     *( ["sentence_boundary"] if right in sentence_splits else [] ),
+                    *( ["hard_silence_boundary"] if right in hard_silence_splits else [] ),
                     *( ["speaker_boundary"] if right in speaker_splits else [] ),
                 }
             )
@@ -865,6 +974,12 @@ def merge_adjacent_speaker_turns(
                 in (left.get("segment_split_reasons") or [])
             )
         )
+        protected_silence_boundary = bool(
+            left.get("hard_silence_after")
+            or segment.get("hard_silence_before")
+            or "hard_silence_boundary"
+            in (left.get("segment_split_reasons") or [])
+        )
         if (
             normalize_speaker(left.get("speaker"))
             == normalize_speaker(segment.get("speaker"))
@@ -878,6 +993,7 @@ def merge_adjacent_speaker_turns(
             and not left.get("speaker_boundary_ambiguous")
             and not segment.get("speaker_boundary_ambiguous")
             and not protected_sentence_boundary
+            and not protected_silence_boundary
         ):
             left_reference_end = float(left["end"])
             parent_ids = list(left.get("parent_segment_ids") or [])
@@ -890,6 +1006,8 @@ def merge_adjacent_speaker_turns(
             left["end"] = segment["end"]
             if segment.get("speech_end") is not None:
                 left["speech_end"] = segment["speech_end"]
+            if segment.get("mix_end") is not None:
+                left["mix_end"] = segment["mix_end"]
             left["alignment_confidence"] = min(
                 float(left.get("alignment_confidence", 0.35)),
                 float(segment.get("alignment_confidence", 0.35)),

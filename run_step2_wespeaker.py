@@ -177,11 +177,21 @@ RELIABLE_TURN_MIN_WINDOWS = _env_int(
 RELIABLE_TURN_MIN_COHESION = _env_float(
     "AUTODUB_DIAR_RELIABLE_TURN_MIN_COHESION", 0.55
 )
+HARD_SILENCE_SECONDS = _env_float(
+    "AUTODUB_HARD_SILENCE_SECONDS", 0.75
+)
 CLUSTERING_DIAGNOSTICS_PATH = os.path.join(
     WORK_DIR, "speaker_clustering_diagnostics.json"
 )
+PAIRWISE_LABELS_PATH = os.path.join(WORK_DIR, "labels_wespeaker_pairwise")
+PAIRWISE_RTTM_PATH = os.path.join(WORK_DIR, "result_wespeaker_pairwise.rttm")
+CLUSTER_COMPARISON_PATH = os.path.join(
+    WORK_DIR, "speaker_clustering_comparison.json"
+)
 
 DOWNSTREAM_STATE_KEYS = (
+    "speaker_clustering_comparison",
+    "segments_step2_wespeaker_pairwise",
     "segments_emotion",
     "segments_audio_analyzed",
     "segments_step3",
@@ -331,10 +341,40 @@ def run_wespeaker_pipeline(segments_step1):
         "--subseg-cmn", "true",
     ], env=env, cwd=WESPEAKER_EXAMPLE_DIR)
 
-    print("\n=== [Step 2-W] 时序边界 + 稀有说话人保护聚类 ===")
-    if not run_temporal_constrained_clustering(segments_step1):
-        print("⚠️ 词级时间戳或边界证据不足，回退到 UMAP + HDBSCAN 聚类。")
-        run_adaptive_clustering()
+    cluster_mode = os.getenv(
+        "AUTODUB_DIAR_CLUSTER_MODE", "compare"
+    ).strip().lower()
+    if cluster_mode not in {"repaired", "pairwise", "compare"}:
+        raise ValueError(
+            "AUTODUB_DIAR_CLUSTER_MODE must be repaired, pairwise, or compare"
+        )
+    # Diagnostics describe one concrete label run.  Never let a previous
+    # repaired run remap a fresh pairwise/adaptive baseline.
+    if os.path.isfile(CLUSTERING_DIAGNOSTICS_PATH):
+        os.remove(CLUSTERING_DIAGNOSTICS_PATH)
+
+    if cluster_mode == "pairwise":
+        print("\n=== [Step 2-W] WeSpeaker 两两余弦平均链接聚类 ===")
+        run_wespeaker_pairwise_clustering(
+            os.path.join(WORK_DIR, "labels")
+        )
+    else:
+        print("\n=== [Step 2-W] 时序边界 + 稀有说话人保护聚类 ===")
+        if not run_temporal_constrained_clustering(segments_step1):
+            print("⚠️ 词级时间戳或边界证据不足，回退到 UMAP + HDBSCAN 聚类。")
+            run_adaptive_clustering()
+        if cluster_mode == "compare":
+            shutil.copy2(
+                os.path.join(WORK_DIR, "labels"),
+                os.path.join(WORK_DIR, "labels_repaired"),
+            )
+            print("\n=== [Step 2-W] 旁路生成 WeSpeaker 两两聚类基线 ===")
+            run_wespeaker_pairwise_clustering(PAIRWISE_LABELS_PATH)
+            run_cmd([
+                "python3", "wespeaker/diar/make_rttm.py",
+                "--labels", PAIRWISE_LABELS_PATH,
+                "--channel", "1",
+            ], env=env, cwd=WESPEAKER_EXAMPLE_DIR, stdout_file=PAIRWISE_RTTM_PATH)
 
     print("\n=== [Step 2-W] WeSpeaker: 生成 RTTM ===")
     rttm_path = os.path.join(WORK_DIR, "result.rttm")
@@ -345,6 +385,57 @@ def run_wespeaker_pipeline(segments_step1):
     ], env=env, cwd=WESPEAKER_EXAMPLE_DIR, stdout_file=rttm_path)
 
     return rttm_path
+
+
+def run_wespeaker_pairwise_clustering(labels_out):
+    """Legacy pairwise baseline on the exact same WeSpeaker embeddings.
+
+    This mirrors the repository's former cosine/average-linkage path.  It is
+    deliberately free of word-boundary and temporal cannot-link constraints,
+    making it a clean A/B baseline for the repaired clustering path.
+    """
+    if kaldiio is None or np is None:
+        raise RuntimeError("WeSpeaker 两两聚类需要 kaldiio 和 numpy")
+    from sklearn.cluster import AgglomerativeClustering
+
+    distance_threshold = _env_float("SPEAKER_CLUSTER_THRESHOLD", 0.5)
+    emb_scp = os.path.join(WORK_DIR, "embedding", "emb.scp")
+    utt_embs = defaultdict(list)
+    utt_keys = defaultdict(list)
+    with kaldiio.ReadHelper(f"scp:{emb_scp}") as reader:
+        for key, matrix in reader:
+            utterance = key.split("-")[0]
+            embedding = matrix.mean(axis=0) if matrix.ndim == 2 else matrix
+            utt_embs[utterance].append(embedding)
+            utt_keys[utterance].append(key)
+
+    os.makedirs(os.path.dirname(labels_out), exist_ok=True)
+    with open(labels_out, "w", encoding="utf-8") as stream:
+        for utterance, embeddings in utt_embs.items():
+            values = _normalized_rows(np.stack(embeddings))
+            if len(values) == 1:
+                labels = np.zeros(1, dtype=int)
+            else:
+                kwargs = {
+                    "n_clusters": None,
+                    "linkage": "average",
+                    "distance_threshold": distance_threshold,
+                }
+                try:
+                    labels = AgglomerativeClustering(
+                        metric="cosine", **kwargs
+                    ).fit_predict(values)
+                except TypeError:
+                    labels = AgglomerativeClustering(
+                        affinity="cosine", **kwargs
+                    ).fit_predict(values)
+            for key, label in zip(utt_keys[utterance], labels):
+                stream.write(f"{key} {int(label)}\n")
+            print(
+                f"  {utterance}: {len(values)} 个窗口，"
+                f"两两聚类得到 {len(set(int(value) for value in labels))} 人，"
+                f"distance_threshold={distance_threshold:.3f}"
+            )
 
 
 def _normalized_rows(values):
@@ -3598,11 +3689,16 @@ def merge_adjacent_same_speaker(segments, max_gap=0.5, min_merge_duration=1.5):
 
 
 def assign_speakers(segments, rttm_spans, diagnostics=None):
-    from speaker_alignment import align_segments_with_rttm, merge_adjacent_speaker_turns
+    from speaker_alignment import (
+        AlignmentConfig,
+        align_segments_with_rttm,
+        merge_adjacent_speaker_turns,
+    )
 
     result = align_segments_with_rttm(
         segments,
         rttm_spans,
+        config=AlignmentConfig(hard_silence_seconds=HARD_SILENCE_SECONDS),
         speaker_boundary_evidence=(diagnostics or {}).get("boundaries"),
     )
     split_count = max(0, len(result) - len(segments))
@@ -3712,6 +3808,76 @@ def reassemble_final_speaker_segments(segments):
     return merged
 
 
+def build_clustering_comparison(repaired, pairwise):
+    """Build a label-invariant, duration-weighted A/B comparison."""
+    overlap_by_pair = defaultdict(float)
+    pairwise_duration = defaultdict(float)
+    for baseline in pairwise:
+        baseline_start = float(baseline["start"])
+        baseline_end = float(baseline["end"])
+        baseline_speaker = str(baseline.get("speaker", "SPEAKER_00"))
+        pairwise_duration[baseline_speaker] += max(
+            0.0, baseline_end - baseline_start
+        )
+        for candidate in repaired:
+            overlap = max(
+                0.0,
+                min(baseline_end, float(candidate["end"]))
+                - max(baseline_start, float(candidate["start"])),
+            )
+            if overlap:
+                overlap_by_pair[
+                    (baseline_speaker, str(candidate.get("speaker", "SPEAKER_00")))
+                ] += overlap
+
+    mapping = {}
+    for baseline_speaker in pairwise_duration:
+        candidates = [
+            (seconds, repaired_speaker)
+            for (source, repaired_speaker), seconds in overlap_by_pair.items()
+            if source == baseline_speaker
+        ]
+        if candidates:
+            mapping[baseline_speaker] = max(candidates)[1]
+
+    matched = sum(
+        seconds
+        for (baseline_speaker, repaired_speaker), seconds in overlap_by_pair.items()
+        if mapping.get(baseline_speaker) == repaired_speaker
+    )
+    total = sum(pairwise_duration.values())
+    return {
+        "version": 1,
+        "production_algorithm": "repaired_temporal_identity_consensus",
+        "baseline_algorithm": "wespeaker_pairwise_cosine_average_linkage",
+        "pairwise_distance_threshold": _env_float(
+            "SPEAKER_CLUSTER_THRESHOLD", 0.5
+        ),
+        "repaired": {
+            "speaker_count": len({str(item.get("speaker")) for item in repaired}),
+            "segment_count": len(repaired),
+            "ambiguous_segment_count": sum(
+                bool(item.get("speaker_boundary_ambiguous")) for item in repaired
+            ),
+        },
+        "wespeaker_pairwise": {
+            "speaker_count": len({str(item.get("speaker")) for item in pairwise}),
+            "segment_count": len(pairwise),
+            "ambiguous_segment_count": sum(
+                bool(item.get("speaker_boundary_ambiguous")) for item in pairwise
+            ),
+        },
+        "baseline_to_repaired_label_map": mapping,
+        "duration_weighted_label_agreement": round(
+            matched / total if total > 0.0 else 0.0, 4
+        ),
+        "note": (
+            "Agreement is label-invariant after maximum-overlap mapping; "
+            "it is not a ground-truth accuracy score."
+        ),
+    }
+
+
 def main():
     print("=== [Step 2] WeSpeaker + 时序约束聚类 说话人分离 ===")
     print(f"当前 Python: {sys.executable}")
@@ -3748,6 +3914,42 @@ def main():
         update_dialogue_identity_diagnostics(aligned, diagnostics)
         save_clustering_diagnostics(diagnostics)
 
+    clustering_comparison = None
+    pairwise_aligned = None
+    if (
+        os.getenv("AUTODUB_DIAR_CLUSTER_MODE", "compare").strip().lower()
+        == "compare"
+        and os.path.isfile(PAIRWISE_RTTM_PATH)
+    ):
+        pairwise_spans = parse_rttm(PAIRWISE_RTTM_PATH)
+        pairwise_aligned = assign_speakers(
+            state["segments_step1"], pairwise_spans, diagnostics=None
+        )
+        clustering_comparison = build_clustering_comparison(
+            aligned, pairwise_aligned
+        )
+        clustering_comparison.update({
+            "repaired_labels_path": os.path.join(WORK_DIR, "labels_repaired"),
+            "repaired_rttm_path": rttm_path,
+            "pairwise_labels_path": PAIRWISE_LABELS_PATH,
+            "pairwise_rttm_path": PAIRWISE_RTTM_PATH,
+        })
+        pairwise_segments_path = os.path.join(
+            WORK_DIR, "segments_step2_wespeaker_pairwise.json"
+        )
+        with open(pairwise_segments_path, "w", encoding="utf-8") as stream:
+            json.dump(pairwise_aligned, stream, ensure_ascii=False, indent=2)
+        clustering_comparison["pairwise_segments_path"] = pairwise_segments_path
+        with open(CLUSTER_COMPARISON_PATH, "w", encoding="utf-8") as stream:
+            json.dump(clustering_comparison, stream, ensure_ascii=False, indent=2)
+        print(
+            "🔬 聚类 A/B: "
+            f"修复版={clustering_comparison['repaired']['speaker_count']} 人，"
+            f"WeSpeaker两两={clustering_comparison['wespeaker_pairwise']['speaker_count']} 人，"
+            "映射后时长一致率="
+            f"{clustering_comparison['duration_weighted_label_agreement']:.1%}"
+        )
+
     unique = sorted(set(s["speaker"] for s in aligned))
     print(f"🔍 最终识别出 {len(unique)} 个说话人: {unique}")
     if diagnostics and diagnostics.get("unassigned_acoustic_identities"):
@@ -3766,6 +3968,9 @@ def main():
             + ", ".join(removed)
         )
     state["segments_step2"] = aligned
+    if clustering_comparison is not None:
+        state["speaker_clustering_comparison"] = clustering_comparison
+        state["segments_step2_wespeaker_pairwise"] = pairwise_aligned
     if diagnostics:
         state["speaker_clustering"] = diagnostics
         state["estimated_speaker_count"] = diagnostics.get(

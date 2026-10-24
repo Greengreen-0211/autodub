@@ -93,6 +93,82 @@ def electricity_quality(path):
             **metrics}
 
 
+def _voice_proxy_embedding(path):
+    """Return a lightweight timbre embedding for post-TTS consistency audit.
+
+    This is intentionally a proxy built from normalized MFCC statistics, not
+    a replacement for WeSpeaker clustering. It is language-independent enough
+    to catch gross reference/voice mismatches and remains advisory by default.
+    """
+    try:
+        import numpy as np
+        import librosa
+        y, sr = librosa.load(str(path), sr=16000, mono=True)
+    except Exception:
+        return None
+    if y is None or len(y) < 1600:
+        return None
+    try:
+        y, _ = librosa.effects.trim(y, top_db=35)
+        if len(y) < 1600:
+            return None
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+        delta = librosa.feature.delta(mfcc)
+        vector = np.concatenate([
+            np.mean(mfcc, axis=1),
+            np.std(mfcc, axis=1),
+            np.mean(delta, axis=1),
+            np.std(delta, axis=1),
+        ]).astype(float)
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 1e-9 else None
+    except Exception:
+        return None
+
+
+def voice_consistency_quality(reference_path, synthesized_path):
+    """Audit whether synthesized timbre remains close to its chosen reference.
+
+    Policy mirrors the electric-artifact gate. ``warn`` records the result;
+    ``block`` lets the router try its existing fallback chain. The conservative
+    default threshold should be calibrated with production samples before
+    enabling blocking.
+    """
+    policy = os.getenv(
+        "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY", "warn"
+    ).strip().lower()
+    if policy == "off":
+        return {
+            "voice_consistency_quality": "skipped",
+            "voice_consistency_policy": policy,
+        }
+    reference = _voice_proxy_embedding(reference_path)
+    synthesized = _voice_proxy_embedding(synthesized_path)
+    if reference is None or synthesized is None:
+        return {
+            "voice_consistency_quality": "skipped",
+            "voice_consistency_policy": policy,
+            "voice_consistency_reason": "feature extraction unavailable",
+            "voice_consistency_backend": "mfcc_proxy",
+        }
+    similarity = float(reference @ synthesized)
+    minimum = float(os.getenv(
+        "AUTODUB_TTS_MIN_VOICE_CONSISTENCY", "0.45"
+    ))
+    failed = similarity < minimum
+    return {
+        "voice_consistency_quality": "failed" if failed else "passed",
+        "voice_consistency_policy": policy,
+        "voice_consistency_similarity": round(similarity, 6),
+        "voice_consistency_threshold": minimum,
+        "voice_consistency_backend": "mfcc_proxy",
+        "voice_consistency_reason": (
+            f"proxy_similarity={similarity:.4f}<{minimum:.4f}"
+            if failed else ""
+        ),
+    }
+
+
 def stage_fingerprint(state, config, backend):
     segments=[{k:s.get(k) for k in ("id","text","start","end","speaker","emotion","tts_engine",
                                    "translation_request_fingerprint")} for s in state.get("segments_step3",[])]
@@ -102,7 +178,7 @@ def stage_fingerprint(state, config, backend):
         if path.is_file():
             info=path.stat()
             media[key]={"path":str(path.resolve()),"size":info.st_size,"mtime_ns":info.st_mtime_ns}
-    payload={"version":"tts-stage-v2.2.1","segments":segments,"media":media,"backend":backend,
+    payload={"version":"tts-stage-v2.3.0","segments":segments,"media":media,"backend":backend,
              "input_file":state.get("input_file"),
              "target_lang":str(config.target_lang).lower(),
              "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs")))}

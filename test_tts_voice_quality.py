@@ -20,9 +20,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 import tts_router
-from tts_quality import electricity_quality
+from tts_quality import electricity_quality, voice_consistency_quality
 
 HAS_LIBROSA = importlib.util.find_spec("librosa") is not None
+
+
+class VoiceConsistencyTests(unittest.TestCase):
+    def test_off_policy_skips_without_loading_audio_features(self):
+        with patch.dict(os.environ, {
+            "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY": "off"
+        }):
+            result = voice_consistency_quality("missing.wav", "missing.wav")
+        self.assertEqual(result["voice_consistency_quality"], "skipped")
+        self.assertEqual(result["voice_consistency_policy"], "off")
 
 
 def write_wav(path, duration_s, rate=16000, sample=None):

@@ -2343,6 +2343,9 @@ class SpeakerDiarization:
         self.sentence_speaker_max_seconds = _env_float("AUTODUB_SENTENCE_SPEAKER_MAX_SECONDS", 8.0)
         self.sentence_speaker_min_ratio = _env_float("AUTODUB_SENTENCE_SPEAKER_MIN_RATIO", 0.60)
         self.timestamp_weak_gap_seconds = _env_float("AUTODUB_TIMESTAMP_WEAK_GAP_SECONDS", 0.35)
+        self.hard_silence_seconds = _env_float(
+            "AUTODUB_HARD_SILENCE_SECONDS", 0.75
+        )
         self.timestamp_strong_gap_seconds = _env_float("AUTODUB_TIMESTAMP_STRONG_GAP_SECONDS", 0.60)
         self.minimum_sentence_seconds = _env_float("AUTODUB_MIN_SENTENCE_SECONDS", 0.80)
         self.target_sentence_seconds = _env_float("AUTODUB_TARGET_SENTENCE_SECONDS", 8.0)
@@ -2490,6 +2493,7 @@ echo "=== [Step 2-W] WeSpeaker 流水线完成 ==="
                 minimum_sentence_seconds=self.minimum_sentence_seconds,
                 target_sentence_seconds=self.target_sentence_seconds,
                 maximum_sentence_seconds=self.maximum_sentence_seconds,
+                hard_silence_seconds=self.hard_silence_seconds,
                 speaker_snap_radius_seconds=self.rttm_snap_max_seconds,
                 minimum_speaker_turn_seconds=self.minimum_speaker_turn_seconds,
                 island_max_seconds=(
@@ -3345,10 +3349,33 @@ class Mixer:
     def run(self, audio_clips_info: List[Dict[str, Any]], accomp_path: str, original_video: str, duration: float) -> None:
         print("--- [Step 5] 混音 ---")
         final_audio = AudioSegment.silent(duration=int(duration * 1000))
-        for item in audio_clips_info:
+        from mix_timing import plan_mix_windows
+
+        ordered_clips = plan_mix_windows(audio_clips_info, duration)
+        bounded_count = 0
+        for item in ordered_clips:
             if os.path.exists(item["file"]):
                 clip = AudioSegment.from_wav(item["file"])
-                final_audio = final_audio.overlay(clip, position=int(float(item["start"]) * 1000))
+                start = float(item["start"])
+                hard_end = float(item["hard_end"])
+                available_ms = int(item["available_ms"])
+                if available_ms <= 0:
+                    print(
+                        f"⚠️ 跳过无可用混音窗口的 TTS 片段: "
+                        f"segment={item.get('segment_id')} start={start:.3f} end={hard_end:.3f}"
+                    )
+                    continue
+                if len(clip) > available_ms:
+                    clip = clip[:available_ms]
+                    fade_ms = min(25, max(0, len(clip) // 4))
+                    if fade_ms:
+                        clip = clip.fade_out(fade_ms)
+                    bounded_count += 1
+                final_audio = final_audio.overlay(
+                    clip, position=int(round(start * 1000))
+                )
+        if bounded_count:
+            print(f"⚠️ {bounded_count} 个超时 TTS 片段已限制在各自混音窗口内，未覆盖下一句。")
         if os.path.exists(accomp_path):
             bg = AudioSegment.from_wav(accomp_path)
             final_audio = final_audio.overlay(bg - 6)

@@ -83,6 +83,7 @@ def attach_coarse_tts_placement(
     post_roll: float = 0.08,
     subtitle_tolerance: float = 0.70,
     min_activity: float = 0.16,
+    hard_silence_seconds: float = 0.75,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Attach acoustic TTS windows only to coarse recovered dialogue.
 
@@ -156,7 +157,16 @@ def attach_coarse_tts_placement(
                     ),
                 )
 
-        selected = overlaps[first_index:]
+        # A coarse OCR sentence has no trustworthy token-to-island mapping.
+        # Keep the contiguous island group nearest its subtitle hint, but never
+        # create one render window spanning a long acoustic silence.  The
+        # omitted islands remain explicit in diagnostics for local re-ASR.
+        selected = [overlaps[first_index]]
+        for candidate in overlaps[first_index + 1:]:
+            if candidate[0] - selected[-1][1] >= float(hard_silence_seconds):
+                break
+            selected.append(candidate)
+        excluded = overlaps[first_index + len(selected):]
         active_duration = sum(end - start for start, end in selected)
         if active_duration < float(min_activity):
             record.update(
@@ -192,6 +202,10 @@ def attach_coarse_tts_placement(
                 "tts_available_end": round(outer_end, 3),
                 "recovery_timing_method": "vocal_activity_with_ocr_soft_hint",
                 "recovery_timing_confidence": round(confidence, 4),
+                "coarse_timing_excluded_islands": [
+                    [round(start, 3), round(end, 3)] for start, end in excluded
+                ],
+                "coarse_timing_requires_local_recovery": bool(excluded),
             }
         )
         record.update(
@@ -204,6 +218,9 @@ def attach_coarse_tts_placement(
             available_end=round(outer_end, 3),
             active_duration=round(active_duration, 3),
             confidence=round(confidence, 4),
+            excluded_islands=[
+                [round(start, 3), round(end, 3)] for start, end in excluded
+            ],
         )
         audit.append(record)
         output.append(segment)

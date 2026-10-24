@@ -97,6 +97,53 @@ class OfflineTests(unittest.TestCase):
 
 
 class DurationTests(unittest.TestCase):
+    def test_reference_uses_pure_components_from_reassembled_identity(self):
+        class FakeAudio:
+            dBFS = -20.0
+
+            def __init__(self, length=30000):
+                self.length = int(length)
+
+            def __len__(self):
+                return self.length
+
+            def __getitem__(self, item):
+                start = int(item.start or 0)
+                stop = int(item.stop if item.stop is not None else self.length)
+                return FakeAudio(max(0, stop - start))
+
+            def export(self, path, format="wav"):
+                Path(path).write_bytes(b"RIFF")
+
+        fake_pydub = ModuleType("pydub")
+        fake_pydub.AudioSegment = SimpleNamespace(
+            from_wav=lambda path: FakeAudio()
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            sys.modules, {"pydub": fake_pydub}
+        ):
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            router._reference_score = lambda segment, clip: float(segment["end"])
+            segments = [{
+                "id": 9, "start": 0.0, "end": 8.0, "speaker": "A",
+                "text": "joined", "speaker_reference_mixed_raw": True,
+                "speaker_reference_components": [
+                    {"id": "9:0", "start": 0.0, "end": 3.0,
+                     "text": "first", "speaker_assignment_confidence": 0.9},
+                    {"id": "9:1", "start": 3.2, "end": 8.0,
+                     "text": "second", "speaker_assignment_confidence": 0.9},
+                ],
+            }]
+            reference = router._speaker_references(segments, "unused.wav")["A"]
+            self.assertEqual(reference["source_segment_id"], "9:1")
+            self.assertEqual(reference["text"], "second")
+            manifest = json.loads(
+                (router.root / "reference_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(manifest["speakers"]["A"]["concatenated"])
+
     def test_reference_precision_gate_only_rejects_coarse_recovery(self):
         self.assertTrue(tts_router._is_precise_reference_segment({}))
         self.assertTrue(tts_router._is_precise_reference_segment({
@@ -107,6 +154,15 @@ class DurationTests(unittest.TestCase):
         }))
         self.assertFalse(tts_router._is_precise_reference_segment({
             "asr_recovery_status": "accepted_coarse"
+        }))
+        self.assertFalse(tts_router._is_precise_reference_segment({
+            "speaker_boundary_ambiguous": True
+        }))
+        self.assertTrue(tts_router._is_precise_reference_segment({
+            "speaker_assignment_confidence": 0.60
+        }))
+        self.assertTrue(tts_router._is_precise_reference_segment({
+            "speaker_assignment_confidence": 0.90
         }))
 
     def test_f5_native_duration_includes_processed_reference(self):

@@ -340,9 +340,18 @@ class LightTTSSelector:
                 and placement_start < available_end <= end + 0.001
             ):
                 ideal = max(0.4, placement_end - placement_start)
-                maximum = max(0.4, available_end - placement_start)
-                return ideal, maximum
+                # Step 5 enforces placement_end as a hard collision boundary;
+                # a translation must therefore fit this acoustic island, not
+                # consume later silence or a later island in the outer span.
+                return ideal, ideal
             return available, available
+        try:
+            mix_start = float(segment.get("mix_start", segment.get("speech_start")))
+            mix_end = float(segment.get("mix_end", segment.get("speech_end")))
+        except (TypeError, ValueError):
+            mix_start = mix_end = 0.0
+        if start <= mix_start < mix_end <= end + 0.001:
+            available = max(0.4, mix_end - mix_start)
         starts: List[float] = []
         ends: List[float] = []
         for item in segment.get("qwen3_time_stamps", []) or []:

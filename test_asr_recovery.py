@@ -199,7 +199,39 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertAlmostEqual(duration, 2.94)
         ideal, available = LightTTSSelector._speech_window(refined[0])
         self.assertAlmostEqual(ideal, 2.94)
-        self.assertAlmostEqual(available, 6.66)
+        self.assertAlmostEqual(available, 2.94)
+
+    def test_coarse_window_does_not_span_a_long_internal_silence(self):
+        segment = {
+            "id": 10,
+            "start": 10.0,
+            "end": 20.0,
+            "text": "Recovered dialogue",
+            "asr_recovery_status": "accepted_coarse",
+            "timestamp_precision": "coarse",
+        }
+        refined, audit = attach_coarse_tts_placement(
+            [segment], [(10.5, 12.0), (15.0, 17.0)]
+        )
+        self.assertEqual(refined[0]["tts_placement_start"], 10.44)
+        self.assertEqual(refined[0]["tts_placement_end"], 12.08)
+        self.assertEqual(
+            refined[0]["coarse_timing_excluded_islands"], [[15.0, 17.0]]
+        )
+        self.assertTrue(refined[0]["coarse_timing_requires_local_recovery"])
+        self.assertEqual(audit[0]["excluded_islands"], [[15.0, 17.0]])
+
+    def test_precise_tts_uses_mix_window_not_transport_bounds(self):
+        placement, duration = _tts_timing({
+                "start": 10.0,
+                "end": 13.0,
+                "speech_start": 10.25,
+                "speech_end": 12.4,
+                "mix_start": 10.25,
+                "mix_end": 12.4,
+            })
+        self.assertEqual(placement, 10.25)
+        self.assertAlmostEqual(duration, 2.15)
 
     def test_precise_segment_is_unchanged_by_coarse_timing_refiner(self):
         segment = {

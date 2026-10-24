@@ -25,7 +25,11 @@ from scheme3_policy import (
     select_scheme3_tts_engine,
 )
 from tts_preflight import cache_environment, offline_mode, preflight_models
-from tts_quality import duration_quality, electricity_quality
+from tts_quality import (
+    duration_quality,
+    electricity_quality,
+    voice_consistency_quality,
+)
 
 
 MODEL_DISPLAY = {
@@ -47,11 +51,15 @@ MODEL_ORDER = ("f5tts", "indextts2", "cosyvoice3", "confucius4", "omnivoice")
 
 def _is_precise_reference_segment(segment: Dict[str, Any]) -> bool:
     """Whether a segment has audio/text alignment safe for voice reference."""
-    return not (
+    if (
         str(segment.get("timestamp_precision", "")).lower() == "coarse"
         or str(segment.get("asr_recovery_status", "")).lower()
         == "accepted_coarse"
-    )
+        or bool(segment.get("speaker_boundary_ambiguous"))
+        or bool(segment.get("speaker_reference_mixed_raw"))
+    ):
+        return False
+    return True
 
 
 def _language_code(language: Any) -> str:
@@ -137,9 +145,10 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
             "ref_audio", "ref_text", "target_duration", "model",
         )
     }
-    payload["version"] = "tts-request-v2.2.1"
+    payload["version"] = "tts-request-v2.3.0"
     payload["worker_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_worker.py").read_bytes()).hexdigest()
     payload["policy_sha256"] = hashlib.sha256(Path(__file__).with_name("scheme3_policy.py").read_bytes()).hexdigest()
+    payload["quality_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_quality.py").read_bytes()).hexdigest()
     configuration_keys = {
         "f5tts":("F5TTS_REPO","F5TTS_MODEL_PATH","F5TTS_VOCODER_LOCAL_PATH"),
         "indextts2":("INDEX_TTS_ROOT","INDEX_TTS_MODEL_DIR"),
@@ -150,6 +159,15 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
     payload["cache"] = cache_environment(str(item.get("model") or "f5tts"))
     payload["duration_limits"] = [os.getenv("AUTODUB_TTS_MAX_DURATION_ERROR", "0.6"),
                                   os.getenv("AUTODUB_TTS_MAX_DURATION_RATIO_ERROR", "0.25")]
+    payload["quality_policy"] = {
+        "electricity": os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY", "warn"),
+        "voice_consistency": os.getenv(
+            "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY", "warn"
+        ),
+        "minimum_voice_consistency": os.getenv(
+            "AUTODUB_TTS_MIN_VOICE_CONSISTENCY", "0.45"
+        ),
+    }
     ref_audio = Path(str(item.get("ref_audio") or ""))
     if ref_audio.is_file():
         digest = hashlib.sha256()
@@ -172,6 +190,13 @@ def _tts_timing(segment: Dict[str, Any]) -> tuple[float, float]:
         str(segment.get("asr_recovery_status") or "") == "accepted_coarse"
         and str(segment.get("timestamp_precision") or "") == "coarse"
     ):
+        try:
+            mix_start = float(segment.get("mix_start", segment.get("speech_start")))
+            mix_end = float(segment.get("mix_end", segment.get("speech_end")))
+        except (TypeError, ValueError):
+            return legacy
+        if start <= mix_start < mix_end <= end + 0.001:
+            return mix_start, mix_end - mix_start
         return legacy
     try:
         placement_start = float(segment.get("tts_placement_start"))
@@ -406,32 +431,55 @@ class TTSRouter:
         speech_ratio = sum(end - start for start, end in nonsilent) / max(1, len(clip))
         duration_score = max(0.0, 1.0 - abs(duration - 5.0) / 8.0)
         loudness_score = max(0.0, min(1.0, (clip.dBFS + 50.0) / 35.0)) if clip.dBFS != float("-inf") else 0.0
-        penalty = 0.5 if segment.get("speaker_boundary_ambiguous") else 0.0
-        return 2.0 * speech_ratio + duration_score + loudness_score - penalty
+        confidence = float(segment.get("speaker_assignment_confidence", 1.0) or 0.0)
+        boundary_penalty = 0.35 if "speaker_boundary" in (
+            segment.get("segment_split_reasons") or []
+        ) else 0.0
+        return (
+            2.0 * speech_ratio + duration_score + loudness_score
+            + 0.8 * confidence - boundary_penalty
+        )
 
     def _speaker_references(self, segments: List[Dict[str, Any]], vocal_path: str) -> Dict[str, Dict[str, str]]:
         from pydub import AudioSegment
         full_audio = AudioSegment.from_wav(vocal_path)
         references: Dict[str, Dict[str, str]] = {}
+        manifest = {"version": 2, "policy": "single_contiguous_pure_reference", "speakers": {}}
         speakers = sorted({str(segment.get("speaker", "SPEAKER_00")) for segment in segments})
         for speaker in speakers:
             candidates = []
             for index, segment in enumerate(segments):
                 if str(segment.get("speaker", "SPEAKER_00")) != speaker:
                     continue
+                source_segments = [segment]
+                if segment.get("speaker_reference_mixed_raw"):
+                    source_segments = list(
+                        segment.get("speaker_reference_components") or []
+                    )
                 # Coarse ASR recovery provides only an outer dialogue window.
                 # Its audio may contain additional words, pauses, or another
                 # turn that are absent from the recovered transcript.  Such a
                 # clip is valid for dubbing, but unsafe as paired reference
                 # audio/text for a voice-cloning model.
-                if not _is_precise_reference_segment(segment):
-                    continue
-                start = max(0, int(round(float(segment["start"]) * 1000)))
-                end = min(len(full_audio), int(round(float(segment["end"]) * 1000)))
-                clip = full_audio[start:end]
-                if len(clip) < 500:
-                    continue
-                candidates.append((self._reference_score(segment, clip), index, segment, clip))
+                for component_index, source_segment in enumerate(source_segments):
+                    source_segment = dict(source_segment)
+                    source_segment["speaker"] = speaker
+                    source_segment.setdefault(
+                        "id", f"{segment.get('id', index)}:{component_index}"
+                    )
+                    if not _is_precise_reference_segment(source_segment):
+                        continue
+                    start = max(0, int(round(float(source_segment["start"]) * 1000)))
+                    end = min(len(full_audio), int(round(float(source_segment["end"]) * 1000)))
+                    clip = full_audio[start:end]
+                    if len(clip) < 500:
+                        continue
+                    candidates.append((
+                        self._reference_score(source_segment, clip),
+                        index,
+                        source_segment,
+                        clip,
+                    ))
             if not candidates:
                 print(
                     f"⚠️ {speaker} 没有可用的精确边界参考音频；"
@@ -439,34 +487,63 @@ class TTSRouter:
                 )
                 continue
             candidates.sort(key=lambda item: (item[0], len(item[3])), reverse=True)
-            chosen = []
-            total_ms = 0
-            # Prefer complete short ASR spans: F5 clips references above 12s,
-            # which otherwise leaves the full transcript paired with half audio.
-            bounded = [candidate for candidate in candidates if len(candidate[3]) <= 10000]
-            for candidate in bounded or candidates:
-                if chosen and total_ms + len(candidate[3]) > 10000:
-                    continue
-                chosen.append(candidate)
-                total_ms += len(candidate[3])
-                if total_ms >= 10000:
-                    break
-            chosen.sort(key=lambda item: float(item[2]["start"]))
-            audio = AudioSegment.empty()
-            texts = []
-            for _, _, segment, clip in chosen:
-                audio += clip
-                source_text = str(segment.get("original_text") or segment.get("qwen3_raw_text") or segment.get("text") or "").strip()
-                if source_text:
-                    texts.append(source_text)
+            confident = [
+                item for item in candidates
+                if float(item[2].get("speaker_assignment_confidence", 1.0) or 0.0)
+                >= 0.72
+            ]
+            selection_pool = confident or candidates
+            # Never concatenate separate utterances: a mistaken global cluster
+            # could otherwise mix two real people into one cloning reference.
+            preferred = [item for item in selection_pool if 2500 <= len(item[3]) <= 8000]
+            bounded = [item for item in selection_pool if len(item[3]) <= 10000]
+            chosen = (preferred or bounded or selection_pool)[0]
+            score, source_index, source_segment, audio = chosen
+            source_text = str(
+                source_segment.get("original_text")
+                or source_segment.get("qwen3_raw_text")
+                or source_segment.get("text")
+                or ""
+            ).strip()
             safe_speaker = _safe_id(speaker)
             ref_path = self.root / "references" / f"ref_{safe_speaker}.wav"
             txt_path = ref_path.with_suffix(".txt")
             ref_path.parent.mkdir(parents=True, exist_ok=True)
             audio.export(ref_path, format="wav")
-            txt_path.write_text(" ".join(texts), encoding="utf-8")
-            references[speaker] = {"audio": str(ref_path), "text": " ".join(texts)}
-            print(f"参考音频 {speaker}: 候选 {len(candidates)}，选中 {len(chosen)}，{len(audio)/1000.0:.2f}s")
+            txt_path.write_text(source_text, encoding="utf-8")
+            references[speaker] = {
+                "audio": str(ref_path),
+                "text": source_text,
+                "source_segment_id": str(source_segment.get("id", source_index)),
+                "purity_score": round(float(score), 4),
+            }
+            manifest["speakers"][speaker] = {
+                "candidate_count": len(candidates),
+                "confident_candidate_count": len(confident),
+                "selected_segment_id": source_segment.get("id", source_index),
+                "start": float(source_segment["start"]),
+                "end": float(source_segment["end"]),
+                "duration": round(len(audio) / 1000.0, 3),
+                "score": round(float(score), 4),
+                "assignment_confidence": source_segment.get("speaker_assignment_confidence"),
+                "confidence_degraded": not bool(confident),
+                "boundary_ambiguous": bool(source_segment.get("speaker_boundary_ambiguous")),
+                "concatenated": False,
+                "candidates": [
+                    {
+                        "segment_id": item[2].get("id", item[1]),
+                        "start": float(item[2]["start"]),
+                        "end": float(item[2]["end"]),
+                        "score": round(float(item[0]), 4),
+                        "assignment_confidence": item[2].get(
+                            "speaker_assignment_confidence"
+                        ),
+                    }
+                    for item in candidates
+                ],
+            }
+            print(f"参考音频 {speaker}: 候选 {len(candidates)}，选中单段 ID={source_segment.get('id', source_index)}，{len(audio)/1000.0:.2f}s")
+        _atomic_json(self.root / "reference_manifest.json", manifest)
         return references
 
     def run(self, segments: Iterable[Dict[str, Any]], vocal_path: str, *, force: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -516,6 +593,12 @@ class TTSRouter:
                     print(f"⚠️ segment={segment_id} saved_engine={model} expected={expected} legacy_fallback={missing}")
             else:
                 model = "indextts2" if self.scheme=="baseline" else select_tts_model(self.config.target_lang, emotion)
+            placement_source = "segment_start"
+            if placement_start != float(segment["start"]):
+                placement_source = (
+                    segment.get("recovery_timing_method")
+                    or "word_aligned_speech_window"
+                )
             job = {
                 "segment_id": segment_id, "text": text, "planned_text": text,
                 "language": _language_code(target_raw) if model=="omnivoice" else target,
@@ -524,12 +607,11 @@ class TTSRouter:
                 "emotion": emotion, "emotion_score": segment.get("emotion_score"),
                 "speaker": speaker, "ref_audio": references[speaker]["audio"],
                 "ref_text": references[speaker]["text"], "target_duration": duration,
+                "reference_segment_id": references[speaker].get("source_segment_id"),
+                "reference_purity_score": references[speaker].get("purity_score"),
                 "start": placement_start, "model": model, "tts_engine": model,
-                "placement_source": (
-                    segment.get("recovery_timing_method")
-                    if placement_start != float(segment["start"])
-                    else "segment_start"
-                ),
+                "end": placement_start + duration,
+                "placement_source": placement_source,
                 "planned_engine": model, "fallback_count": 0, "fallback_reason": "",
                 "translations_candidates": segment.get("translations_candidates", []),
                 "attempted_engines": [model], "attempted_texts": [text],
@@ -621,14 +703,21 @@ class TTSRouter:
                             planned_request_fingerprint=item["planned_request_fingerprint"],
                             request_fingerprint=item["request_fingerprint"], target_duration=item["target_duration"],
                             generation_request={k:item[k] for k in ("text","language","target_language","emotion",
-                                               "speaker","ref_audio","ref_text","target_duration","start","model")},
+                                               "speaker","ref_audio","ref_text","target_duration","start","model",
+                                               "reference_segment_id","reference_purity_score")},
                             placement_start=item["start"],
+                            placement_end=item["end"],
                             placement_source=item.get("placement_source", "segment_start"),
                             speaker=item["speaker"], emotion=item["emotion"],
+                            reference_manifest_path=str(
+                                self.root / "reference_manifest.json"
+                            ),
+                            reference_segment_id=item.get("reference_segment_id"),
+                            reference_purity_score=item.get("reference_purity_score"),
                             source_language=item["source_language"], target_language=item["target_language"],
                             target_language_raw=item["target_language_raw"])
             if metadata.get("status")=="success":
-                clips.append({"segment_id":sid, "start":item["start"], "file":metadata["file"],
+                clips.append({"segment_id":sid, "start":item["start"], "end":item["end"], "file":metadata["file"],
                               "tts_engine":item["model"], "request_fingerprint":item["request_fingerprint"]})
             output_rows.append(metadata)
             previous[sid] = metadata
@@ -708,11 +797,17 @@ class TTSRouter:
                         if metadata["atempo_capped"] and metadata["duration_quality"]=="failed":
                             metadata["duration_quality_note"] = "atempo capped: duration mismatch accepted to avoid unnatural speed"
                         metadata.update(electricity_quality(Path(item["final_path"])))
+                        metadata.update(voice_consistency_quality(
+                            Path(item["ref_audio"]), Path(item["final_path"])
+                        ))
                         # 电音检测：block policy turns a detected artifact into a
                         # failure so the fallback chain can try another engine.
                         if (metadata.get("electricity_quality")=="failed" and
                                 os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY","warn").strip().lower()=="block"):
                             metadata.update(status="failed", error=metadata.get("electricity_reason","electric artifact detected"))
+                        elif (metadata.get("voice_consistency_quality")=="failed" and
+                                os.getenv("AUTODUB_TTS_VOICE_CONSISTENCY_POLICY","warn").strip().lower()=="block"):
+                            metadata.update(status="failed", error=metadata.get("voice_consistency_reason","voice consistency check failed"))
                         elif metadata["duration_quality"]=="failed":
                             # Keep the best generated clip instead of dropping
                             # the sentence.  The mismatch remains auditable and

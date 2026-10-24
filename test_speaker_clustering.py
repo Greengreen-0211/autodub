@@ -1,6 +1,9 @@
 import unittest
 import tempfile
 from pathlib import Path
+import sys
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import run_step2_wespeaker as wespeaker_module
 
@@ -30,6 +33,7 @@ from run_step2_wespeaker import (
     _soft_continuity_threshold,
     _temporal_assignment_context,
     attach_speaker_confidence,
+    build_clustering_comparison,
     reassemble_final_speaker_segments,
     update_dialogue_identity_diagnostics,
     _timestamp_items,
@@ -716,6 +720,47 @@ class SpeakerClusteringEvidenceTests(unittest.TestCase):
 
 
 class SpeakerAlignmentFallbackTests(unittest.TestCase):
+    @unittest.skipIf(np is None, "numpy is required")
+    def test_pairwise_baseline_writes_labels_from_shared_embeddings(self):
+        class Reader:
+            def __init__(self, spec):
+                self.spec = spec
+
+            def __enter__(self):
+                return iter([
+                    ("video-000", np.array([1.0, 0.0])),
+                    ("video-001", np.array([0.9, 0.1])),
+                    ("video-002", np.array([0.0, 1.0])),
+                ])
+
+            def __exit__(self, *args):
+                return False
+
+        class Clusterer:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def fit_predict(self, values):
+                self.values = values
+                return np.array([0, 0, 1])
+
+        sklearn = ModuleType("sklearn")
+        cluster = ModuleType("sklearn.cluster")
+        cluster.AgglomerativeClustering = Clusterer
+        sklearn.cluster = cluster
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            sys.modules, {"sklearn": sklearn, "sklearn.cluster": cluster}
+        ), patch.object(
+            wespeaker_module,
+            "kaldiio",
+            SimpleNamespace(ReadHelper=Reader),
+        ), patch.object(wespeaker_module, "WORK_DIR", directory):
+            output = Path(directory) / "labels_pairwise"
+            wespeaker_module.run_wespeaker_pairwise_clustering(str(output))
+            self.assertEqual(output.read_text(encoding="utf-8").splitlines(), [
+                "video-000 0", "video-001 0", "video-002 1"
+            ])
+
     def test_clustering_diagnostics_round_trip_from_disk(self):
         with tempfile.TemporaryDirectory() as directory:
             original_path = wespeaker_module.CLUSTERING_DIAGNOSTICS_PATH
@@ -861,6 +906,69 @@ class SpeakerAlignmentFallbackTests(unittest.TestCase):
              "text": "Second sentence.", "speaker": "SPEAKER_00"},
         ]
         self.assertEqual(len(merge_adjacent_speaker_turns(segments)), 2)
+
+    def test_long_word_gap_is_a_hard_render_boundary(self):
+        segments = [{
+            "id": 0, "start": 0.0, "end": 4.0,
+            "text": "First line Second line",
+            "qwen3_time_stamps": [
+                {"text": "First", "start": 0.2, "end": 0.6},
+                {"text": "line", "start": 0.65, "end": 1.0},
+                {"text": "Second", "start": 2.0, "end": 2.4},
+                {"text": "line", "start": 2.45, "end": 2.9},
+            ],
+        }]
+        result = align_segments_with_rttm(
+            segments,
+            [{"start": 0.0, "end": 4.0, "speaker": "SPEAKER_00"}],
+        )
+        self.assertEqual(len(result), 2)
+        self.assertTrue(result[0]["hard_silence_after"])
+        self.assertTrue(result[1]["hard_silence_before"])
+        self.assertEqual(result[0]["mix_start"], 0.1)
+        self.assertEqual(result[0]["mix_end"], 1.08)
+        self.assertEqual(result[1]["mix_start"], 1.9)
+        self.assertEqual(result[1]["mix_end"], 2.98)
+        self.assertEqual(len(merge_adjacent_speaker_turns(result)), 2)
+
+    def test_persistent_word_ownership_keeps_b_opening_words_out_of_a(self):
+        segments = [{
+            "id": 0, "start": 0.0, "end": 3.0,
+            "text": "A speaks B starts now",
+            "qwen3_time_stamps": [
+                {"text": "A", "start": 0.1, "end": 0.45},
+                {"text": "speaks", "start": 0.45, "end": 1.0},
+                {"text": "B", "start": 1.0, "end": 1.35},
+                {"text": "starts", "start": 1.35, "end": 1.85},
+                {"text": "now", "start": 1.85, "end": 2.4},
+            ],
+        }]
+        spans = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"},
+            {"start": 1.0, "end": 3.0, "speaker": "SPEAKER_01"},
+        ]
+        result = align_segments_with_rttm(segments, spans)
+        self.assertEqual([item["text"] for item in result], [
+            "A speaks", "B starts now"
+        ])
+        self.assertEqual([item["speaker"] for item in result], [
+            "SPEAKER_00", "SPEAKER_01"
+        ])
+        self.assertIn("speaker_boundary", result[0]["segment_split_reasons"])
+
+    def test_clustering_comparison_is_label_invariant(self):
+        repaired = [
+            {"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"},
+            {"start": 2.0, "end": 4.0, "speaker": "SPEAKER_01"},
+        ]
+        pairwise = [
+            {"start": 0.0, "end": 2.0, "speaker": "SPEAKER_09"},
+            {"start": 2.0, "end": 4.0, "speaker": "SPEAKER_04"},
+        ]
+        report = build_clustering_comparison(repaired, pairwise)
+        self.assertEqual(report["duration_weighted_label_agreement"], 1.0)
+        self.assertEqual(report["repaired"]["speaker_count"], 2)
+        self.assertEqual(report["wespeaker_pairwise"]["speaker_count"], 2)
 
     def test_short_real_island_is_not_erased_at_point_four_seconds(self):
         spans = [
