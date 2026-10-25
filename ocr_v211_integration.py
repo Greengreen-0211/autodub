@@ -11,7 +11,7 @@ import re
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple, Type
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type
 from urllib.parse import urlsplit, urlunsplit
 
 from autodub_ocr_runtime import VERSION as OCR_OPTIMIZED_VERSION
@@ -146,6 +146,141 @@ def _source_language(config: Any, text: str) -> str:
     if language in {"zh&en", "en&zh", ""}:
         return "zh" if any("\u3400" <= char <= "\u9fff" for char in text) else "en"
     return language if language in {"zh", "en"} else "unsupported"
+
+
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?。！？])\s+")
+_NO_TEXT_MARKERS = {"图片中没有文字。", "图片中没有文字"}
+
+
+def _ocr_frames_by_segment(config: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """读回逐帧 OCR 缓存，按粗片段 id 分组为带时间戳的文本。
+
+    仅在调用方没有传入内存版 ``frame_records`` 时作为兜底使用；
+    主流程会直接把 ``OCRV211Client.frame_records_by_segment`` 传进来，
+    避免缓存里可能残留的历史视频条目混入。
+    """
+    cache_path = _runtime_dir(config) / "ocr_frames.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    frames: Dict[str, List[Dict[str, Any]]] = {}
+    for record in cache.values():
+        if not isinstance(record, dict) or record.get("status") != "ok":
+            continue
+        text = str(record.get("text") or "").strip()
+        if not text or text in _NO_TEXT_MARKERS:
+            continue
+        try:
+            timestamp = float(record["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        segment_id = str(record.get("segment_id", ""))
+        frames.setdefault(segment_id, []).append({"timestamp": timestamp, "text": text})
+    for entries in frames.values():
+        entries.sort(key=lambda item: item["timestamp"])
+    return frames
+
+
+def _split_segment_sentences(segment: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """把粗 ASR 片段切成句子片段，携带精确的字符偏移。
+
+    优先使用强制对齐器生成的 ``qwen3_sentence_candidates``；没有时间戳时退化
+    为标点切分。每个片段的 ``text`` 都等于 ``text[char_start:char_end]``，
+    这样纠错后的句子能原样拼接回去而不破坏句间分隔符。
+    """
+    text = str(segment.get("text") or "")
+    seg_start = float(segment.get("start", 0.0))
+    seg_end = float(segment.get("end", seg_start))
+    if not text.strip():
+        return [{"text": "", "start": seg_start, "end": seg_end, "char_start": 0, "char_end": 0}]
+
+    candidates = segment.get("qwen3_sentence_candidates") or []
+    spans: List[Dict[str, Any]] = []
+    for index, candidate in enumerate(candidates):
+        char_start = candidate.get("char_start")
+        if not isinstance(char_start, int) or char_start < 0:
+            spans = []
+            break
+        next_start = candidates[index + 1].get("char_start") if index + 1 < len(candidates) else None
+        if next_start is not None and not isinstance(next_start, int):
+            spans = []
+            break
+        raw_end = next_start if next_start is not None else len(text)
+        raw_end = min(len(text), max(char_start, int(raw_end)))
+        stripped = text[char_start:raw_end].rstrip()
+        if not stripped:
+            continue
+        spans.append({
+            "text": stripped,
+            "start": float(candidate.get("start", seg_start)),
+            "end": float(candidate.get("end", seg_end)),
+            "char_start": char_start,
+            "char_end": char_start + len(stripped),
+        })
+    if not spans:
+        spans = _split_text_sentences(text, seg_start, seg_end)
+    return spans
+
+
+def _split_text_sentences(text: str, start: float, end: float) -> List[Dict[str, Any]]:
+    """没有词时间戳时按标点切分的兜底方案。"""
+    matches = list(_SENTENCE_BOUNDARY_RE.finditer(text))
+    if not matches:
+        stripped = text.rstrip()
+        return [{"text": stripped, "start": start, "end": end,
+                 "char_start": 0, "char_end": len(stripped)}]
+    spans: List[Dict[str, Any]] = []
+    cursor = 0
+    for match in matches:
+        stripped = text[cursor:match.end()].rstrip()
+        if stripped:
+            spans.append({"text": stripped, "start": start, "end": end,
+                          "char_start": cursor, "char_end": cursor + len(stripped)})
+        cursor = match.end()
+    tail = text[cursor:].rstrip()
+    if tail:
+        spans.append({"text": tail, "start": start, "end": end,
+                      "char_start": cursor, "char_end": cursor + len(tail)})
+    return spans
+
+
+def _merge_sentence_decisions(
+    text: str,
+    sentences: List[Dict[str, Any]],
+    decisions: Dict[str, Dict[str, Any]],
+    segment_id: str,
+) -> Dict[str, Any]:
+    """把逐句纠错结果按字符偏移拼回原片段文本。"""
+    parts: List[str] = []
+    changed = False
+    cursor = 0
+    for index, sentence in enumerate(sentences):
+        char_start, char_end = sentence["char_start"], sentence["char_end"]
+        parts.append(text[cursor:char_start])
+        decision = decisions.get(f"{segment_id}::{index}")
+        corrected_text = decision.get("corrected_text") if isinstance(decision, dict) else None
+        accepted = bool(
+            isinstance(decision, dict)
+            and decision.get("accepted")
+            and corrected_text
+            and corrected_text != sentence["text"]
+        )
+        if accepted:
+            parts.append(corrected_text)
+            changed = True
+        else:
+            parts.append(text[char_start:char_end])
+        cursor = char_end
+    parts.append(text[cursor:])
+    new_text = "".join(parts)
+    return {
+        "accepted": changed,
+        "corrected_text": new_text,
+        "reason": "sentence_level_correction" if changed else "no_sentence_correction_accepted",
+    }
 
 
 class OCRV211Client:
@@ -404,6 +539,7 @@ class OCRV211Corrector:
         self,
         segments: List[Dict[str, Any]],
         ocr_texts: Dict[str, str],
+        frame_records: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> List[Dict[str, Any]]:
         mode = _mode()
         if mode == "off":
@@ -420,23 +556,40 @@ class OCRV211Corrector:
                 })
                 for source, changed in zip(segments, legacy)
             ]
+        frames_by_segment = (
+            frame_records if frame_records is not None else _ocr_frames_by_segment(self.config)
+        )
         requests = []
+        sentence_map = {}
         for segment in segments:
-            text = str(segment.get("text") or "")
-            language = _source_language(self.config, text)
-            lines = [] if language == "unsupported" else [
-                {"line_id": f"L{index:03d}", "text": line}
-                for index, line in enumerate(
-                    ocr_texts.get(str(segment["id"]), "").splitlines(), start=1
-                )
-                if line.strip()
-            ]
-            requests.append({
-                "id": str(segment["id"]),
-                "source_language": language if language != "unsupported" else "en",
-                "qwen_asr": text,
-                "ocr_candidates": lines,
-            })
+            segment_id = str(segment["id"])
+            sentences = _split_segment_sentences(segment)
+            sentence_map[segment_id] = sentences
+            for index, sentence in enumerate(sentences):
+                language = _source_language(self.config, sentence["text"])
+                lines = []
+                if language != "unsupported":
+                    window_start = float(sentence["start"]) - 0.5
+                    window_end = float(sentence["end"]) + 0.5
+                    for frame in frames_by_segment.get(segment_id, []):
+                        try:
+                            timestamp = float(frame.get("timestamp"))
+                        except (TypeError, ValueError):
+                            continue
+                        frame_text = str(frame.get("text") or "").strip()
+                        if not frame_text or frame_text in _NO_TEXT_MARKERS:
+                            continue
+                        if window_start <= timestamp <= window_end:
+                            lines.append({
+                                "line_id": f"L{len(lines):03d}",
+                                "text": frame_text,
+                            })
+                requests.append({
+                    "id": f"{segment_id}::{index}",
+                    "source_language": language if language != "unsupported" else "en",
+                    "qwen_asr": sentence["text"],
+                    "ocr_candidates": lines,
+                })
         try:
             engine = FrozenBOCREngine(
                 _runtime_dir(self.config) / "classifier",
@@ -452,15 +605,27 @@ class OCRV211Corrector:
             decisions = engine.run(requests)
         except Exception as exc:
             print(f"⚠️ 冻结 B OCR 纠错器失败，保留原 ASR: {type(exc).__name__}: {exc}")
-            decisions = {
-                str(segment["id"]): _ocr_keep(
-                    segment["text"], f"runtime_fallback:{type(exc).__name__}:{exc}"
+            _ocr_atomic_json(
+                _runtime_dir(self.config) / "fallback.json",
+                {"reason": f"{type(exc).__name__}: {exc}", "action": "preserve_asr"},
+            )
+            return [
+                _ocr_update_segment(
+                    segment,
+                    _ocr_keep(str(segment.get("text") or ""), f"runtime_fallback:{type(exc).__name__}:{exc}"),
                 )
                 for segment in segments
-            }
-            _ocr_atomic_json(_runtime_dir(self.config) / "fallback.json", decisions)
+            ]
         corrected = [
-            _ocr_update_segment(segment, decisions[str(segment["id"])])
+            _ocr_update_segment(
+                segment,
+                _merge_sentence_decisions(
+                    str(segment.get("text") or ""),
+                    sentence_map[str(segment["id"])],
+                    decisions,
+                    str(segment["id"]),
+                ),
+            )
             for segment in segments
         ]
         accepted = sum(before["text"] != after["text"] for before, after in zip(segments, corrected))
@@ -988,6 +1153,7 @@ def run_step_1b_optimized(
     })
     enabled = not disable_ocr and config.ocr_enabled and _mode() != "off"
     ocr_texts: Dict[str, str] = {}
+    frame_records_by_segment: Dict[str, List[Dict[str, Any]]] = {}
     (
         deferred_regions,
         initial_uncovered_regions,
@@ -1027,6 +1193,7 @@ def run_step_1b_optimized(
                     for segment_id, records in client.frame_records_by_segment.items()
                     for record in records
                 ]
+                frame_records_by_segment = client.frame_records_by_segment
             finally:
                 client.session.close()
         except Exception as exc:
@@ -1037,7 +1204,7 @@ def run_step_1b_optimized(
                 _runtime_dir(config) / "ocr_service_fallback.json",
                 {"reason": f"{type(exc).__name__}: {exc}", "action": "preserve_asr"},
             )
-        segments = OCRV211Corrector(config, legacy_corrector_cls).correct(raw_segments, ocr_texts)
+        segments = OCRV211Corrector(config, legacy_corrector_cls).correct(raw_segments, ocr_texts, frame_records_by_segment)
     else:
         print("⚠️ OCR 已关闭，跳过 HunyuanOCR 辅助。")
         segments = [
