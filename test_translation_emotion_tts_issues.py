@@ -883,6 +883,47 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(results[0]["tts_text"], "natural answer")
         self.assertEqual(len(selected_payloads[0]), 3)
 
+    def test_generation_attempt_budget_is_global_per_sentence(self):
+        calls = []
+        rewrites = iter(["rewrite one", "rewrite two", "rewrite three"])
+        def worker(_model, plan, result, force=False):
+            data = json.loads(Path(result).read_text())
+            for item in json.loads(Path(plan).read_text())["items"]:
+                calls.append(item["text"])
+                wav(item["raw_path"], 0.65)
+                data[item["segment_id"]].update(status="success")
+            Path(result).write_text(json.dumps(data))
+            return 0
+        def postprocess(src, dst, target, **_kwargs):
+            shutil.copy2(src, dst)
+            actual = tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration": actual,
+                "post_trim_duration": actual,
+                "actual_duration": actual,
+                "atempo_factor": 1.0,
+                "atempo_raw_factor": actual / target,
+                "atempo_capped": False,
+                **tts_router.duration_adaptation_safety(actual, target),
+            }
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AUTODUB_TTS_MAX_GENERATION_ATTEMPTS": "2"}
+        ), patch("tts_router.preflight_models"), patch(
+            "tts_router._run_worker", side_effect=worker
+        ), patch("tts_router._postprocess", side_effect=postprocess), patch(
+            "tts_router.electricity_quality", return_value={}
+        ), patch("tts_router.voice_consistency_quality", return_value={}):
+            router = self.setup_router(tmp, disabled=True)
+            router.duration_rewriter = lambda *_a, **_k: {
+                "text": next(rewrites)
+            }
+            _, results = router.run([
+                dict(source(text="natural answer"), tts_engine="f5tts")
+            ], "unused")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(results[0]["generation_attempt_count"], 2)
+        self.assertEqual(results[0]["generation_attempt_limit"], 2)
+
 
 class QualityTests(unittest.TestCase):
     def mix(self,tmp):
@@ -1129,6 +1170,89 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(mixed),1)
             self.assertEqual(Path(mixed[0][1]), ref)
             self.assertIn("只保留伴奏/静音",captured.getvalue())
+
+    def test_failed_tts_never_restores_source_vocal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vocals = root / "vocals.wav"
+            accomp = root / "accomp.wav"
+            wav(vocals, 2.0)
+            with wave.open(str(accomp), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(1000)
+                stream.writeframes(b"\x00\x00" * 2000)
+            state = {
+                "segments_step3": [dict(
+                    source(), translation_status="success"
+                )],
+                "audio_clips": [],
+                "tts_router_results": [{
+                    "segment_id": "0", "status": "failed"
+                }],
+                "vocals_path": str(vocals),
+                "accomp_path": str(accomp),
+            }
+            functions = self.functions({"restore_skipped_vocals"}, {})
+            output = functions["restore_skipped_vocals"](
+                state, SimpleNamespace(temp_dir=tmp)
+            )
+            self.assertEqual(Path(output), accomp)
+            self.assertEqual(Path(output).read_bytes(), accomp.read_bytes())
+
+    def test_step5_quality_failure_degrades_and_still_mixes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "reference.wav"
+            wav(ref, 2.0)
+            state = {
+                "segments_step3": [dict(
+                    source(), translation_status="success"
+                )],
+                "audio_clips": [],
+                "tts_router_results": [{
+                    "segment_id": "0", "status": "failed"
+                }],
+                "vocals_path": str(ref),
+                "accomp_path": str(ref),
+                "duration": 2.0,
+                "tts_backend": "scheme3",
+            }
+            class Manager:
+                def __init__(self, _config): pass
+                def load(self): return state
+                def save(self, values): state.update(values)
+            mixed = []
+            class Mixer:
+                def __init__(self, _config): pass
+                def run(self, *args): mixed.append(args)
+            functions = self.functions(
+                {"run_step_5", "restore_skipped_vocals"},
+                {
+                    "StateManager": Manager,
+                    "Mixer": Mixer,
+                    "run_step_4": lambda *_args, **_kwargs: None,
+                },
+            )
+            issues = [
+                "0:missing or unsuccessful WAV",
+                "incomplete Step4: 0/1 dubbing segments",
+            ]
+            config = SimpleNamespace(
+                temp_dir=tmp, tts_backend="scheme3"
+            )
+            with patch(
+                "tts_quality.validate_mix_state", return_value=issues
+            ):
+                functions["run_step_5"](config, "unused.mp4")
+            self.assertEqual(len(mixed), 1)
+            self.assertEqual(
+                state["agent_delivery_report"]["failed_tts_segment_ids"],
+                ["0"],
+            )
+            self.assertEqual(
+                state["agent_delivery_report"]["fallback"],
+                "no_audible_generated_candidate",
+            )
 
     def test_routing_report_summarizes_emotion_coverage(self):
         neutral=dict(source(0),text="hello",emotion="neutral",emotion_reliable=False,

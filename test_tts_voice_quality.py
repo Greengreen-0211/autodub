@@ -17,6 +17,7 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import tts_router
@@ -75,6 +76,120 @@ class ContentCompletenessTests(unittest.TestCase):
     def test_missing_expected_particle_still_fails(self):
         result = content_completeness_quality("把手给我", "手给我", "zh")
         self.assertEqual(result["content_completeness_quality"], "failed")
+
+    def test_content_policy_has_separate_fingerprint_from_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "candidate.wav"
+            write_wav(audio, 1.0, sample=tone())
+            item = {
+                "text": "你好，杰克。",
+                "language": "zh",
+                "target_language": "zh",
+                "emotion": "neutral",
+                "speaker": "A",
+                "target_duration": 1.0,
+                "model": "f5tts",
+                "final_path": str(audio),
+            }
+            metadata = {
+                "file": str(audio),
+                "audio_sha256": tts_router._file_sha256(audio),
+            }
+            with patch.dict(os.environ, {
+                "AUTODUB_TTS_CONTENT_ASR_MIN_SIMILARITY": "0.72"
+            }):
+                generation_a = tts_router._request_fingerprint(item)
+                audit_a = tts_router._content_audit_fingerprint(item, metadata)
+            with patch.dict(os.environ, {
+                "AUTODUB_TTS_CONTENT_ASR_MIN_SIMILARITY": "0.80"
+            }):
+                generation_b = tts_router._request_fingerprint(item)
+                audit_b = tts_router._content_audit_fingerprint(item, metadata)
+            self.assertEqual(generation_a, generation_b)
+            self.assertNotEqual(audit_a, audit_b)
+
+    def test_legacy_audio_migrates_only_when_generation_request_matches(self):
+        item = {
+            "text": "你好，杰克。",
+            "language": "zh",
+            "target_language": "zh",
+            "emotion": "neutral",
+            "speaker": "A",
+            "ref_audio": "speaker.wav",
+            "ref_text": "reference",
+            "target_duration": 0.8,
+            "start": 7.71,
+            "model": "cosyvoice3",
+            "reference_segment_id": 4,
+            "reference_purity_score": 0.9,
+            "translation_selection_source": "standard",
+        }
+        metadata = {
+            "generation_request": {
+                key: item.get(key)
+                for key in tts_router.GENERATION_REQUEST_KEYS
+            }
+        }
+        self.assertTrue(
+            tts_router._legacy_generation_request_matches(item, metadata)
+        )
+        changed = dict(item, text="完全不同的文本")
+        self.assertFalse(
+            tts_router._legacy_generation_request_matches(changed, metadata)
+        )
+
+    def test_agent_fallback_uses_best_generated_candidate_not_source_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            weak = Path(tmp) / "weak.wav"
+            complete = Path(tmp) / "complete.wav"
+            write_wav(weak, 1.0, sample=tone(freq=330.0))
+            write_wav(complete, 1.0, sample=tone(freq=550.0))
+            item = {
+                "segment_id": "0",
+                "text": "你好，杰克。",
+                "planned_text": "你好，杰克。",
+                "language": "zh",
+                "target_language": "zh",
+                "emotion": "neutral",
+                "speaker": "A",
+                "ref_audio": "speaker.wav",
+                "ref_text": "reference",
+                "target_duration": 1.0,
+                "start": 7.71,
+                "model": "f5tts",
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            router._remember_candidate(item, {
+                "file": str(weak),
+                "actual_duration": 1.0,
+                "audible_speech_quality": "passed",
+                "content_completeness_quality": "failed",
+                "voice_consistency_quality": "passed",
+                "error": "content mismatch",
+            }, "content_audit")
+            router._remember_candidate(item, {
+                "file": str(complete),
+                "actual_duration": 1.0,
+                "audible_speech_quality": "passed",
+                "content_completeness_quality": "passed",
+                "voice_consistency_quality": "passed",
+                "error": "strict duration policy",
+            }, "content_audit")
+            item["start"] = 9.25
+            adopted = router._adopt_best_generated_candidate(item)
+            self.assertIsNotNone(adopted)
+            self.assertTrue(adopted["agent_degraded_candidate"])
+            self.assertEqual(adopted["status"], "success")
+            self.assertEqual(item["start"], 9.25)
+            self.assertEqual(
+                tts_router._file_sha256(Path(adopted["file"])),
+                tts_router._file_sha256(complete),
+            )
 
 
 def write_wav(path, duration_s, rate=16000, sample=None):

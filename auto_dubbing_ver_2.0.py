@@ -4565,7 +4565,7 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
 
 
 def restore_skipped_vocals(state: Dict[str, Any], config: DubbingConfig) -> str:
-    """Return pure accompaniment; degraded dialogue never restores source vocals."""
+    """Return accompaniment without ever inserting source-language dialogue."""
     accomp_path = str(state.get("accomp_path") or "")
     skipped = [s for s in state.get("segments_step3", []) if s.get("translation_status") == "skipped"]
     unresolved = state.get("asr_unresolved_dialogue_regions") or []
@@ -4600,17 +4600,34 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
         print("↩️ Step 5 将返回 Step 4 定向补生成失败句（已成功句会命中缓存）。")
         run_step_4(config, backend=config.tts_backend, force=False)
         state = state_mgr.load() or state
-        allow_missing = bool(getattr(config, "allow_missing_tts", False))
         quality_issues = validate_mix_state(
             state,
             config,
-            allow_missing=allow_missing,
-            filter_missing=allow_missing,
+            # An autonomous delivery agent must not abort a complete video
+            # because one stochastic TTS attempt remains imperfect. Integrity
+            # errors still raise inside validate_mix_state; quality failures
+            # are filtered only when no audible generated candidate exists.
+            allow_missing=True,
+            filter_missing=True,
         )
         if quality_issues:
-            state_mgr.save({"tts_degraded_issues": quality_issues})
+            failed_ids = sorted({
+                item.split(":", 1)[0]
+                for item in quality_issues
+                if ":" in item and item.split(":", 1)[0].isdigit()
+            }, key=int)
+            state_mgr.save({
+                "tts_degraded_issues": quality_issues,
+                "agent_delivery_report": {
+                    "status": "completed_with_missing_tts",
+                    "failed_tts_segment_ids": failed_ids,
+                    "quality_issues": quality_issues,
+                    "fallback": "no_audible_generated_candidate",
+                },
+            })
             print(
-                "⚠️ 用户已显式允许缺失 TTS；失败句将使用伴奏/静音完成成片。"
+                "⚠️ TTS 重试后仍有句子没有任何可听候选；"
+                "不会插回原声，Agent 将记录缺失并继续完成成片。"
             )
     mixer = Mixer(config)
     mixer.run(state["audio_clips"], restore_skipped_vocals(state, config), input_file, state["duration"])

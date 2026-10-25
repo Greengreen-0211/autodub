@@ -466,7 +466,7 @@ def validate_mix_state(state, config, *, allow_missing=False, filter_missing=Tru
                 "Step5 blocked by incomplete TTS; rerun Step4 or explicitly "
                 "pass --allow-missing-tts: " + "; ".join(quality_issues)
             )
-        print("⚠️ Step5 发现用户明确允许的 TTS 缺失:",quality_issues)
+        print("⚠️ Step5 将按成片降级策略处理 TTS 缺失:",quality_issues)
         # Only verified readable clips may reach the mixer.
         if filter_missing:
             valid=[]

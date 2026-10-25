@@ -52,6 +52,22 @@ MODEL_ENVS = {
     "omnivoice": "omnivoice",
 }
 MODEL_ORDER = ("f5tts", "indextts2", "cosyvoice3", "confucius4", "omnivoice")
+GENERATION_REQUEST_KEYS = (
+    "text", "language", "target_language", "emotion", "speaker",
+    "ref_audio", "ref_text", "target_duration", "start", "model",
+    "reference_segment_id", "reference_purity_score",
+    "measure_natural_duration",
+    "translation_selection_source",
+)
+
+
+def _generation_attempt_limit() -> int:
+    """Hard per-sentence synthesis budget for interactive Agent latency."""
+    try:
+        configured = int(os.getenv("AUTODUB_TTS_MAX_GENERATION_ATTEMPTS", "5"))
+    except ValueError:
+        configured = 5
+    return max(1, min(5, configured))
 
 
 def _is_precise_reference_segment(segment: Dict[str, Any]) -> bool:
@@ -186,13 +202,10 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
             "measure_natural_duration", "translation_selection_source",
         )
     }
-    payload["version"] = "tts-request-v2.8.0-pronounceable-window-reference-fallback"
+    payload["version"] = "tts-request-v2.9.0-generation-only"
     payload["worker_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_worker.py").read_bytes()).hexdigest()
     payload["policy_sha256"] = hashlib.sha256(Path(__file__).with_name("scheme3_policy.py").read_bytes()).hexdigest()
     payload["quality_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_quality.py").read_bytes()).hexdigest()
-    payload["content_verifier_sha256"] = hashlib.sha256(
-        Path(__file__).with_name("tts_content_verifier.py").read_bytes()
-    ).hexdigest()
     configuration_keys = {
         "f5tts":("F5TTS_REPO","F5TTS_MODEL_PATH","F5TTS_VOCODER_LOCAL_PATH"),
         "indextts2":("INDEX_TTS_ROOT","INDEX_TTS_MODEL_DIR"),
@@ -223,10 +236,6 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         "minimum_voice_consistency": os.getenv(
             "AUTODUB_TTS_MIN_VOICE_CONSISTENCY", "0.45"
         ),
-        "content_asr_enabled": os.getenv("AUTODUB_TTS_CONTENT_ASR_ENABLED", "auto"),
-        "content_asr_min_similarity": os.getenv(
-            "AUTODUB_TTS_CONTENT_ASR_MIN_SIMILARITY", "language_default"
-        ),
     }
     ref_audio = Path(str(item.get("ref_audio") or ""))
     if ref_audio.is_file():
@@ -239,6 +248,64 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         payload["ref_audio_sha256"] = ""
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _content_audit_fingerprint(item: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+    """Fingerprint post-generation content checks without invalidating audio.
+
+    Changing ASR verification policy must re-audit an existing WAV, not cause
+    every stochastic TTS backend to synthesize the whole project again.
+    """
+    path = Path(str(metadata.get("file") or item.get("final_path") or ""))
+    audio_sha = str(metadata.get("audio_sha256") or "")
+    if not audio_sha and path.is_file():
+        audio_sha = _file_sha256(path)
+    payload = {
+        "version": "tts-content-audit-v1",
+        "audio_sha256": audio_sha,
+        "expected_text": str(item.get("text") or ""),
+        "language": str(item.get("target_language") or ""),
+        "verifier_sha256": hashlib.sha256(
+            Path(__file__).with_name("tts_content_verifier.py").read_bytes()
+        ).hexdigest(),
+        "enabled": os.getenv("AUTODUB_TTS_CONTENT_ASR_ENABLED", "auto"),
+        "minimum_similarity": os.getenv(
+            "AUTODUB_TTS_CONTENT_ASR_MIN_SIMILARITY", "language_default"
+        ),
+        "short_minimum_similarity": os.getenv(
+            "AUTODUB_TTS_CONTENT_ASR_SHORT_MIN_SIMILARITY", "0.90"
+        ),
+        "safe_extra_ratio": os.getenv(
+            "AUTODUB_TTS_CONTENT_ASR_MAX_SAFE_EXTRA_RATIO", "0.25"
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _legacy_generation_request_matches(
+    item: Dict[str, Any], metadata: Dict[str, Any]
+) -> bool:
+    """Safely migrate audio made before audit/generation fingerprints split."""
+    saved = metadata.get("generation_request")
+    if not isinstance(saved, dict):
+        return False
+    for key in GENERATION_REQUEST_KEYS:
+        current = item.get(key)
+        previous = saved.get(key)
+        if key in {"target_duration", "start", "reference_purity_score"}:
+            try:
+                if current is None and previous is None:
+                    continue
+                if abs(float(current) - float(previous)) > 1e-6:
+                    return False
+                continue
+            except (TypeError, ValueError):
+                return False
+        if current != previous:
+            return False
+    return True
 
 
 def _tts_timing(segment: Dict[str, Any]) -> tuple[float, float]:
@@ -648,8 +715,202 @@ class TTSRouter:
         self.final_dir = self.root / "final"
         self.plan_path = self.root / "plan.json"
         self.result_path = self.root / "results.json"
+        self.candidate_dir = self.root / "candidate_vault"
+        self.candidate_path = self.root / "candidate_vault.json"
         self.duration_rewriter = duration_rewriter
         self.duration_candidate_selector = duration_candidate_selector
+
+    def _remember_candidate(
+        self, item: Dict[str, Any], metadata: Dict[str, Any], stage: str
+    ) -> None:
+        """Persist every audible synthesis so later retries cannot erase it."""
+        source = Path(str(metadata.get("file") or item.get("final_path") or ""))
+        if not source.is_file() or not source.stat().st_size:
+            return
+        measured = dict(metadata)
+        if not measured.get("audible_speech_quality"):
+            measured.update(
+                audible_speech_quality(source, expected_text=item.get("text", ""))
+            )
+        if measured.get("audible_speech_quality") != "passed":
+            return
+        audio_sha = str(measured.get("audio_sha256") or _file_sha256(source))
+        reference = Path(str(item.get("ref_audio") or ""))
+        reference_sha = _file_sha256(reference) if reference.is_file() else ""
+        sid = str(item["segment_id"])
+        self.candidate_dir.mkdir(parents=True, exist_ok=True)
+        archived = self.candidate_dir / f"segment_{_safe_id(sid)}_{audio_sha[:16]}.wav"
+        if not archived.is_file():
+            shutil.copy2(source, archived)
+        try:
+            registry = json.loads(self.candidate_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            registry = {}
+        rows = list(registry.get(sid) or [])
+        record = {
+            **measured,
+            "segment_id": sid,
+            "file": str(archived),
+            "audio_sha256": audio_sha,
+            "candidate_stage": stage,
+            "candidate_text": str(item.get("text") or ""),
+            "planned_text": str(item.get("planned_text") or ""),
+            "reference_audio_sha256": reference_sha,
+            "generation_request": {
+                key: item.get(key) for key in GENERATION_REQUEST_KEYS
+            },
+            "request_fingerprint": item.get("request_fingerprint"),
+        }
+        replaced = False
+        for index, existing in enumerate(rows):
+            if str(existing.get("audio_sha256")) == audio_sha:
+                rows[index] = {**existing, **record}
+                replaced = True
+                break
+        if not replaced:
+            rows.append(record)
+        registry[sid] = rows
+        _atomic_json(self.candidate_path, registry)
+
+    @staticmethod
+    def _candidate_score(candidate: Dict[str, Any], target: float) -> tuple:
+        """Rank semantics and audibility before duration convenience."""
+        content_rank = {
+            "passed": 0,
+            "degraded": 1,
+            "": 2,
+            "failed": 3,
+        }.get(str(candidate.get("content_completeness_quality") or ""), 2)
+        semantic_selection_rank = int(
+            candidate.get("duration_selected_attempt") is None
+        )
+        voice_rank = {
+            "passed": 0,
+            "degraded": 1,
+            "": 1,
+            "failed": 2,
+        }.get(str(candidate.get("voice_consistency_quality") or ""), 1)
+        electricity_rank = int(candidate.get("electricity_quality") == "failed")
+        duration = float(
+            candidate.get("post_trim_duration")
+            or candidate.get("actual_duration")
+            or 0.0
+        )
+        if duration <= 0.0 or target <= 0.0:
+            distance = float("inf")
+        else:
+            import math
+            distance = abs(math.log(duration / target))
+        return (
+            content_rank,
+            semantic_selection_rank,
+            voice_rank,
+            electricity_rank,
+            distance,
+        )
+
+    def _adopt_best_generated_candidate(
+        self, item: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Promote the best audible generated clip as the final Agent fallback."""
+        try:
+            registry = json.loads(self.candidate_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        current_text = str(item.get("planned_text") or item.get("text") or "")
+        current_reference = Path(str(item.get("ref_audio") or ""))
+        current_reference_sha = (
+            _file_sha256(current_reference) if current_reference.is_file() else ""
+        )
+        compatible = []
+        for candidate in registry.get(str(item["segment_id"]), []) or []:
+            path = Path(str(candidate.get("file") or ""))
+            if not path.is_file() or not path.stat().st_size:
+                continue
+            if current_text not in {
+                str(candidate.get("planned_text") or ""),
+                str(candidate.get("candidate_text") or ""),
+            }:
+                continue
+            generation = dict(candidate.get("generation_request") or {})
+            if str(generation.get("target_language") or "") != str(
+                item.get("target_language") or ""
+            ):
+                continue
+            if str(generation.get("speaker") or "") != str(
+                item.get("speaker") or ""
+            ):
+                continue
+            if str(generation.get("emotion") or "") != str(
+                item.get("emotion") or ""
+            ):
+                continue
+            if str(candidate.get("reference_audio_sha256") or "") != (
+                current_reference_sha
+            ):
+                continue
+            compatible.append(candidate)
+        if not compatible:
+            return None
+        chosen = min(
+            compatible,
+            key=lambda row: self._candidate_score(
+                row, float(item.get("target_duration") or 0.0)
+            ),
+        )
+        generation = dict(chosen.get("generation_request") or {})
+        # Adopt the generated voice/text, but keep the current timeline and
+        # target window.  A stale candidate must never move a sentence back to
+        # an older timestamp merely because its waveform was better.
+        for key in ("text", "model", "language"):
+            if key in generation:
+                item[key] = generation[key]
+        item["tts_engine"] = item["model"]
+        destination = self.final_dir / (
+            f"segment_{_safe_id(item['segment_id'])}_{item['model']}_best_available.wav"
+        )
+        source = Path(str(chosen["file"]))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        fit = {}
+        actual = _wav_duration(destination)
+        target = float(item.get("target_duration") or 0.0)
+        if target > 0.04 and actual > target + 0.01:
+            fit = _apply_atempo_exact(destination, destination, target)
+            actual = _wav_duration(destination)
+        item["final_path"] = str(destination)
+        item["request_fingerprint"] = _request_fingerprint(item)
+        result = dict(chosen)
+        original_error = str(result.get("error") or "strict quality checks failed")
+        result.update(
+            status="success",
+            file=str(destination),
+            preview_file=str(destination),
+            preview_available=True,
+            adoption_recommended=True,
+            agent_degraded_candidate=True,
+            agent_degraded_reason=original_error,
+            error="",
+            duration_quality="degraded",
+            duration_degraded_reason="agent_best_generated_candidate",
+            actual_duration=actual,
+            audio_sha256=_file_sha256(destination),
+            request_fingerprint=item["request_fingerprint"],
+            generation_request={
+                key: item.get(key) for key in GENERATION_REQUEST_KEYS
+            },
+            generation_attempt_count=int(
+                item.get("generation_attempt_count") or 0
+            ),
+            generation_attempt_limit=_generation_attempt_limit(),
+            **fit,
+        )
+        print(
+            f"[TTS degraded] segment={item['segment_id']} 严格验收全部失败；"
+            f"采用最佳已生成候选继续成片: {item['model']} "
+            f"{actual:.2f}/{target:.2f}s"
+        )
+        return result
 
     def _content_asr_enabled(self) -> bool:
         configured = os.getenv("AUTODUB_TTS_CONTENT_ASR_ENABLED")
@@ -668,10 +929,11 @@ class TTSRouter:
             metadata = updated.get(item["segment_id"], {})
             if metadata.get("status") != "success":
                 continue
+            audit_fingerprint = _content_audit_fingerprint(item, metadata)
             if (
                 metadata.get("content_completeness_quality") == "passed"
                 and metadata.get("content_asr_request_fingerprint")
-                == item.get("request_fingerprint")
+                == audit_fingerprint
             ):
                 continue
             path = Path(str(metadata.get("file") or item.get("final_path") or ""))
@@ -682,6 +944,7 @@ class TTSRouter:
                     "language": item["target_language"],
                     "file": str(path),
                     "request_fingerprint": item["request_fingerprint"],
+                    "content_audit_fingerprint": audit_fingerprint,
                 })
         if not pending:
             return updated
@@ -710,7 +973,7 @@ class TTSRouter:
                 raise RuntimeError(f"TTS content ASR omitted segment {sid}")
             metadata.update(audit)
             metadata["content_asr_request_fingerprint"] = row[
-                "request_fingerprint"
+                "content_audit_fingerprint"
             ]
             if audit.get("content_completeness_quality") != "passed":
                 metadata.update(
@@ -724,6 +987,11 @@ class TTSRouter:
                     adoption_recommended=False,
                 )
             updated[sid] = metadata
+            matching = next(
+                (item for item in items if item["segment_id"] == sid), None
+            )
+            if matching is not None:
+                self._remember_candidate(matching, metadata, "content_audit")
         _atomic_json(self.result_path, updated)
         return updated
 
@@ -1127,6 +1395,7 @@ class TTSRouter:
                 ),
                 "duration_attempt": 0,
                 "measure_natural_duration": self.duration_rewriter is not None,
+                "generation_attempt_count": 0,
             }
             self._job_paths(job)
             job["request_fingerprint"] = _request_fingerprint(job)
@@ -1245,10 +1514,49 @@ class TTSRouter:
         active = []
         for item in items:
             known = previous.get(item["segment_id"], {})
+            item["generation_attempt_count"] = max(
+                int(item.get("generation_attempt_count") or 0),
+                int(known.get("generation_attempt_count") or 0),
+            )
             reused = False
+            saved_generation = known.get("generation_request")
+            if not isinstance(saved_generation, dict):
+                saved_generation = {}
+            # A fallback engine or a duration-directed rewrite may differ from
+            # the original Step 3 plan.  It is safe to migrate that successful
+            # waveform only while the Step 3 source text itself is unchanged.
+            # Otherwise an old tts_text must not hide a newly edited sentence.
+            current_text = str(item.get("text") or "")
+            planned_text_unchanged = (
+                str(known.get("planned_text") or "") == current_text
+                or (
+                    int(known.get("duration_translation_attempts") or 0) > 0
+                    and str(known.get("tts_text") or "") == current_text
+                )
+            )
+            migration_probe = dict(item)
+            if planned_text_unchanged:
+                migration_probe.update(
+                    model=known.get("actual_engine", item["model"]),
+                    text=known.get("tts_text", item["text"]),
+                )
+                if "measure_natural_duration" in saved_generation:
+                    migration_probe["measure_natural_duration"] = (
+                        saved_generation["measure_natural_duration"]
+                    )
+            migration_probe["language"] = (
+                _language_code(migration_probe["target_language_raw"])
+                if migration_probe["model"] == "omnivoice"
+                else migration_probe["target_language"]
+            )
+            legacy_generation_match = (
+                planned_text_unchanged
+                and _legacy_generation_request_matches(migration_probe, known)
+            )
             planned_compatible = (
                 known.get("planned_request_fingerprint")
                 == item["planned_request_fingerprint"]
+                or legacy_generation_match
                 or (
                     int(known.get("duration_translation_attempts") or 0) > 0
                     and str(known.get("tts_text") or "") == str(item["text"])
@@ -1260,13 +1568,23 @@ class TTSRouter:
                     planned_compatible):
                 resumed = dict(item, model=known.get("actual_engine", item["model"]),
                                text=known.get("tts_text", item["text"]))
-                if known.get("native_duration_control"):
+                if legacy_generation_match and "measure_natural_duration" in saved_generation:
+                    # Preserve the exact historical generation request while
+                    # migrating its metadata.  No worker runs on this path.
+                    resumed["measure_natural_duration"] = saved_generation[
+                        "measure_natural_duration"
+                    ]
+                elif known.get("native_duration_control"):
                     resumed["measure_natural_duration"] = False
                 resumed["language"] = _language_code(resumed["target_language_raw"]) if resumed["model"]=="omnivoice" else resumed["target_language"]
                 self._job_paths(resumed)
                 resumed["request_fingerprint"] = _request_fingerprint(resumed)
                 try:
-                    valid = known.get("request_fingerprint")==resumed["request_fingerprint"]
+                    valid = (
+                        known.get("request_fingerprint")
+                        == resumed["request_fingerprint"]
+                        or legacy_generation_match
+                    )
                     actual = _wav_duration(Path(known["file"])) if valid else 0
                     measured_quality = duration_quality(actual, item["target_duration"])["duration_quality"]
                     saved_quality = str(known.get("duration_quality", ""))
@@ -1278,6 +1596,26 @@ class TTSRouter:
                             )):
                         item.update(resumed, fallback_count=known.get("fallback_count",0),
                                     fallback_reason=known.get("fallback_reason",""))
+                        if (
+                            known.get("request_fingerprint")
+                            != resumed["request_fingerprint"]
+                        ):
+                            # The waveform request is identical; only the old
+                            # fingerprint incorrectly included audit policy.
+                            # Migrate metadata in place and let content ASR run
+                            # again under its independent fingerprint.
+                            known = dict(known)
+                            known["request_fingerprint"] = resumed[
+                                "request_fingerprint"
+                            ]
+                            known["planned_request_fingerprint"] = item[
+                                "planned_request_fingerprint"
+                            ]
+                            known["generation_request"] = {
+                                key: resumed.get(key)
+                                for key in GENERATION_REQUEST_KEYS
+                            }
+                            known.pop("content_asr_request_fingerprint", None)
                         previous[item["segment_id"]] = dict(known)
                         reused = True
                 except Exception:
@@ -1308,6 +1646,10 @@ class TTSRouter:
                     result = previous.get(item["segment_id"], {})
                     if result.get("status")=="success":
                         continue
+                    if int(item.get("generation_attempt_count") or 0) >= (
+                        _generation_attempt_limit()
+                    ):
+                        continue
                     chain = self._fallback_chain(item["planned_engine"], item["target_language"])
                     model = next((m for m in chain if m not in item["attempted_engines"]), None)
                     if model is None:
@@ -1326,6 +1668,7 @@ class TTSRouter:
                     retry.append(item)
                 if not retry:
                     if any(previous.get(i["segment_id"],{}).get("status")!="success" and
+                           int(i.get("generation_attempt_count") or 0) < _generation_attempt_limit() and
                            any(m not in i["attempted_engines"] for m in self._fallback_chain(i["planned_engine"],i["target_language"])) for i in items):
                         continue
                     break
@@ -1334,6 +1677,18 @@ class TTSRouter:
                 if self.duration_rewriter is not None:
                     previous = self._run_duration_retranslation(retry, previous)
                 previous = self._run_content_asr_audit(retry, previous)
+
+        # Strict checks guide retries, but they must not make an autonomous
+        # Agent abandon the whole deliverable.  Promote the best audible TTS
+        # candidate only after every configured engine/rewrite has failed.
+        for item in items:
+            sid = item["segment_id"]
+            if previous.get(sid, {}).get("status") == "success":
+                continue
+            adopted = self._adopt_best_generated_candidate(item)
+            if adopted is not None:
+                previous[sid] = adopted
+        _atomic_json(self.result_path, previous)
 
         clips, output_rows = [], []
         for item in items:
@@ -1356,11 +1711,14 @@ class TTSRouter:
                             target_duration_floor_applied=bool(
                                 item.get("target_duration_floor_applied", False)
                             ),
-                            generation_request={k:item[k] for k in ("text","language","target_language","emotion",
-                                               "speaker","ref_audio","ref_text","target_duration","start","model",
-                                               "reference_segment_id","reference_purity_score",
-                                               "measure_natural_duration",
-                                               "translation_selection_source")},
+                            generation_attempt_count=int(
+                                item.get("generation_attempt_count") or 0
+                            ),
+                            generation_attempt_limit=_generation_attempt_limit(),
+                            generation_request={
+                                key: item.get(key)
+                                for key in GENERATION_REQUEST_KEYS
+                            },
                             placement_start=item["start"],
                             placement_end=item["end"],
                             placement_source=item.get("placement_source", "segment_start"),
@@ -1453,6 +1811,10 @@ class TTSRouter:
             if current_candidate is None:
                 continue
             for rewrite_index in range(1, maximum_rewrites + 1):
+                if int(item.get("generation_attempt_count") or 0) >= (
+                    _generation_attempt_limit()
+                ):
+                    break
                 if current_candidate["fit"]["natural_duration_fit"] == "passed":
                     break
                 try:
@@ -1573,6 +1935,8 @@ class TTSRouter:
                 and chosen["fit"]["natural_duration_fit"] != "passed"
                 and chosen_safety["safe_to_force_fit"]
                 and not chosen_safety["duration_anomaly"]
+                and int(item.get("generation_attempt_count") or 0)
+                < _generation_attempt_limit()
             ):
                 native_item = dict(item)
                 native_item["measure_natural_duration"] = False
@@ -1756,6 +2120,9 @@ class TTSRouter:
                     error=f"final duration selection failed: {exc}",
                 )
             updated_results[sid] = final_metadata
+            self._remember_candidate(
+                item, final_metadata, "duration_selection"
+            )
             print(
                 f"[TTS duration] segment={sid} attempts={len(valid)} "
                 f"selected={chosen['attempt']} natural="
@@ -1794,8 +2161,28 @@ class TTSRouter:
         # Each worker receives ONLY its pending jobs; raw reuse must match fingerprints.
         results = _load_results(self.result_path)
         for model in MODEL_ORDER:
-            pending = [item for item in items if item["model"]==model]
+            model_items = [item for item in items if item["model"]==model]
+            exhausted = [
+                item for item in model_items
+                if int(item.get("generation_attempt_count") or 0)
+                >= _generation_attempt_limit()
+            ]
+            for item in exhausted:
+                results[item["segment_id"]] = {
+                    **dict(results.get(item["segment_id"], {})),
+                    "segment_id": item["segment_id"],
+                    "status": "failed",
+                    "error": "generation_attempt_budget_exhausted",
+                    "request_fingerprint": item["request_fingerprint"],
+                    "generation_attempt_count": int(
+                        item.get("generation_attempt_count") or 0
+                    ),
+                    "generation_attempt_limit": _generation_attempt_limit(),
+                }
+            pending = [item for item in model_items if item not in exhausted]
             if not pending:
+                if exhausted:
+                    _atomic_json(self.result_path, results)
                 continue
             try:
                 preflight_models([model])
@@ -1809,11 +2196,17 @@ class TTSRouter:
                     }
                 _atomic_json(self.result_path, results)
                 continue
+            for item in pending:
+                item["generation_attempt_count"] = (
+                    int(item.get("generation_attempt_count") or 0) + 1
+                )
             _atomic_json(self.plan_path, {"items":pending})
             for item in pending:
                 results[item["segment_id"]] = {
                     "segment_id":item["segment_id"],"status":"pending","error":"",
                     "request_fingerprint":item["request_fingerprint"],
+                    "generation_attempt_count":item["generation_attempt_count"],
+                    "generation_attempt_limit":_generation_attempt_limit(),
                 }
             _atomic_json(self.result_path, results)
             code = _run_worker(model, self.plan_path, self.result_path, force=force)
@@ -1821,6 +2214,12 @@ class TTSRouter:
             for item in pending:
                 sid = item["segment_id"]
                 metadata = dict(results.get(sid, {}))
+                metadata.update(
+                    generation_attempt_count=int(
+                        item.get("generation_attempt_count") or 0
+                    ),
+                    generation_attempt_limit=_generation_attempt_limit(),
+                )
                 if metadata.get("status")=="pending":
                     metadata.update(status="failed",error=f"{model} worker exited with {code}")
                 if metadata.get("status")=="success":
@@ -1900,4 +2299,5 @@ class TTSRouter:
                     except Exception as exc:
                         metadata.update(status="failed",error=f"duration adaptation failed: {exc}")
                 results[sid] = metadata
+                self._remember_candidate(item, metadata, "engine_generation")
             _atomic_json(self.result_path, results)
