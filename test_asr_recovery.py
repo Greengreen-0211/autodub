@@ -380,6 +380,43 @@ class OCRTimelineTests(unittest.TestCase):
         )
         self.assertEqual(refined[0]["tts_leading_slack_used"], 0.0)
 
+    def test_ambiguous_long_pause_anchors_complete_sentence_to_dominant_island(self):
+        segment = {
+            "id": 7, "start": 43.49, "end": 49.61,
+            "text": "Now hold on to the railing.",
+            "timestamp_precision": "word",
+            "speaker_boundary_ambiguous": True,
+            "qwen3_time_stamps": [
+                {"text": "Now", "start": 43.49, "end": 43.73},
+                {"text": "hold", "start": 48.13, "end": 48.45},
+                {"text": "on", "start": 48.45, "end": 48.69},
+                {"text": "the", "start": 48.69, "end": 48.77},
+                {"text": "railing", "start": 48.77, "end": 49.17},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(43.47, 43.75), (48.11, 49.19)]
+        )
+        row = refined[0]
+        self.assertEqual(
+            row["tts_timing_reason"],
+            "ambiguous_long_pause_dominant_island",
+        )
+        self.assertAlmostEqual(row["tts_original_placement_start"], 43.49)
+        self.assertAlmostEqual(row["tts_placement_start"], 48.07)
+        self.assertAlmostEqual(row["tts_aligned_speech_end"], 49.25)
+        self.assertEqual(row["tts_hard_end"], 49.61)
+        self.assertAlmostEqual(row["tts_target_duration"], 1.42)
+        self.assertEqual(row["tts_internal_pauses"], [[43.73, 48.13]])
+        self.assertEqual(
+            row["tts_dominant_word_island"],
+            {"index": 1, "start": 48.13, "end": 49.17, "duration": 1.04},
+        )
+        self.assertEqual(
+            audit[0]["dominant_word_island"],
+            row["tts_dominant_word_island"],
+        )
+
     def test_ambiguous_implausible_word_span_uses_local_ratio_guard(self):
         segment = {
             "id": 7, "start": 43.49, "end": 49.61,

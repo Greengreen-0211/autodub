@@ -4133,7 +4133,7 @@ def _refine_step3_timing(state: Dict[str, Any]) -> tuple[List[Dict[str, Any]], D
     segments, precise_audit = attach_precise_tts_placement(segments, fused)
     return segments, {
         "status": "ok",
-        "policy": "word_alignment_plus_dual_track_activity_v2_leading_slack",
+        "policy": "word_alignment_plus_dual_track_activity_v3_pause_islands",
         "primary_diagnostics": primary_diagnostics,
         "secondary_diagnostics": secondary_diagnostics,
         "fused_speech_regions": [

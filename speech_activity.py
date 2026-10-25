@@ -176,6 +176,22 @@ def attach_precise_tts_placement(
         if not word_ranges:
             output.append(segment)
             continue
+        internal_pause_threshold = max(
+            float(word_gap_seconds),
+            float(os.getenv(
+                "AUTODUB_TTS_DOMINANT_ISLAND_MIN_PAUSE_SECONDS", "1.00"
+            )),
+        )
+        internal_pauses = [
+            [round(left[1], 3), round(right[0], 3)]
+            for left, right in zip(word_ranges, word_ranges[1:])
+            if right[0] - left[1] > float(word_gap_seconds)
+        ]
+        long_internal_pauses = [
+            (left, right)
+            for left, right in zip(word_ranges, word_ranges[1:])
+            if right[0] - left[1] >= internal_pause_threshold
+        ]
         word_start = word_ranges[0][0]
         word_end = word_ranges[-1][1]
         acoustic = intersect_ranges(active, [(word_start - 0.25, word_end + 0.25)])
@@ -202,6 +218,31 @@ def attach_precise_tts_placement(
         )
         original_onset = onset
         leading_slack_used = 0.0
+        dominant_word_island = None
+        dominant_island_mode = bool(ambiguous and long_internal_pauses)
+        if dominant_island_mode:
+            # The enclosing word span is not spoken continuously.  Keep the
+            # complete semantic sentence, but anchor its single TTS clip to
+            # the largest lexical island instead of centring it inside a long
+            # silent gap.  Effective duration below still counts every word
+            # island, never the silence between them.
+            dominant_index, dominant_range = max(
+                enumerate(word_ranges),
+                key=lambda indexed: (
+                    indexed[1][1] - indexed[1][0],
+                    indexed[0],
+                ),
+            )
+            dominant_start, dominant_end = dominant_range
+            onset = max(outer_start, dominant_start - float(pre_roll))
+            aligned_end = min(outer_end, dominant_end + float(post_roll))
+            hard_end = aligned_end
+            dominant_word_island = {
+                "index": dominant_index,
+                "start": round(dominant_start, 3),
+                "end": round(dominant_end, 3),
+                "duration": round(dominant_end - dominant_start, 3),
+            }
         # A complete short sentence can own useful silence before its first
         # aligned word.  When the remaining slot is shorter than a conservative
         # pronunciation prior, borrow only the amount required, stay inside
@@ -226,8 +267,14 @@ def attach_precise_tts_placement(
                 max(0.0, onset - outer_start),
             )
             onset -= leading_slack_used
-        speech_islands = intersect_ranges(active, [(onset, aligned_end)]) or word_ranges
-        timing_reason = "word_vad_consensus"
+        speech_islands = intersect_ranges(active, [(onset, aligned_end)]) or (
+            [tuple(word_ranges[dominant_word_island["index"]])]
+            if dominant_word_island is not None else word_ranges
+        )
+        timing_reason = (
+            "ambiguous_long_pause_dominant_island"
+            if dominant_island_mode else "word_vad_consensus"
+        )
         ratio_guard = None
         word_span = max(0.0, word_end - word_start)
         # Speaker ambiguity means the inherited word skeleton may still be
@@ -235,7 +282,7 @@ def attach_precise_tts_placement(
         # When its span is implausible for the sentence, retain the median word
         # anchor but limit it to a local acoustic window.  Public sentence
         # bounds remain untouched.
-        if ambiguous and word_span > duration_ceiling:
+        if ambiguous and word_span > duration_ceiling and not dominant_island_mode:
             midpoints = sorted((start + end) / 2.0 for start, end in items)
             word_centre = midpoints[len(midpoints) // 2]
             guarded_duration = min(
@@ -294,8 +341,12 @@ def attach_precise_tts_placement(
         # of the complete sentence (especially unvoiced consonants and one-word
         # turns).  It remains a natural-duration target, not permission to
         # overlap the next turn.
+        minimum_basis = (
+            word_effective + float(pre_roll) + float(post_roll)
+            if dominant_island_mode else duration_centre
+        )
         minimum_pronounceable = min(
-            max(0.1, duration_centre),
+            max(0.1, minimum_basis),
             max(0.1, outer_end - onset),
         )
         effective = max(effective + pre_roll + post_roll, minimum_pronounceable)
@@ -304,11 +355,6 @@ def attach_precise_tts_placement(
         # The chronological collision pass in TTSRouter remains authoritative
         # and will reduce this to the next onset when necessary.
         hard_end = outer_end
-        internal_pauses = [
-            [round(left[1], 3), round(right[0], 3)]
-            for left, right in zip(word_ranges, word_ranges[1:])
-            if right[0] - left[1] > float(word_gap_seconds)
-        ]
         segment.update({
             "tts_placement_start": round(onset, 3),
             "tts_hard_end": round(hard_end, 3),
@@ -323,6 +369,7 @@ def attach_precise_tts_placement(
                 "bounded_sentence_internal_leading_slack"
                 if leading_slack_used > 0.0 else "not_needed"
             ),
+            "tts_dominant_word_island": dominant_word_island,
             "tts_speech_islands": [
                 [round(start, 3), round(end, 3)] for start, end in speech_islands
             ],
@@ -332,6 +379,8 @@ def attach_precise_tts_placement(
                 (
                     0.58
                     if timing_reason == "ambiguous_word_span_ratio_guard"
+                    else 0.68
+                    if timing_reason == "ambiguous_long_pause_dominant_island"
                     else (
                         0.72 if ambiguous
                         else min(
@@ -354,6 +403,7 @@ def attach_precise_tts_placement(
             "target_speech_duration": round(effective, 3),
             "original_placement_start": round(original_onset, 3),
             "leading_slack_used": round(leading_slack_used, 3),
+            "dominant_word_island": dominant_word_island,
             "speech_islands": segment["tts_speech_islands"],
             "internal_pauses": internal_pauses,
             "timing_reason": timing_reason,
