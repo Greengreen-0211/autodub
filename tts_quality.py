@@ -10,10 +10,34 @@ from pathlib import Path
 def duration_quality(actual: float, target: float) -> dict:
     absolute=abs(actual-target)
     ratio=actual/target if target>0 else 0.0
-    limit=max(float(os.getenv("AUTODUB_TTS_MAX_DURATION_ERROR", "0.6")),
-              target*float(os.getenv("AUTODUB_TTS_MAX_DURATION_RATIO_ERROR", "0.25")))
+    # A fixed 0.6 s allowance is enormous for sub-second dialogue: a 0.45 s
+    # fragment used to pass a 0.70 s slot.  Judge short clips by percentage and
+    # reserve the absolute allowance for longer sentences where it is useful.
+    if target < 1.0:
+        lower = float(os.getenv("AUTODUB_TTS_FINAL_MIN_RATIO_TINY", "0.78"))
+        upper = float(os.getenv("AUTODUB_TTS_FINAL_MAX_RATIO_TINY", "1.22"))
+        passed = actual > 0 and target > 0 and lower <= ratio <= upper
+        rule = "tiny_ratio"
+        limit = target * max(1.0 - lower, upper - 1.0)
+    elif target < 2.0:
+        lower = float(os.getenv("AUTODUB_TTS_FINAL_MIN_RATIO_SHORT", "0.80"))
+        upper = float(os.getenv("AUTODUB_TTS_FINAL_MAX_RATIO_SHORT", "1.20"))
+        passed = actual > 0 and target > 0 and lower <= ratio <= upper
+        rule = "short_ratio"
+        limit = target * max(1.0 - lower, upper - 1.0)
+    else:
+        lower = 0.0
+        upper = float("inf")
+        limit=max(float(os.getenv("AUTODUB_TTS_MAX_DURATION_ERROR", "0.6")),
+                  target*float(os.getenv("AUTODUB_TTS_MAX_DURATION_RATIO_ERROR", "0.25")))
+        passed = actual>0 and target>0 and absolute<=limit
+        rule = "absolute_or_ratio"
     return {"duration_error":actual-target,"duration_ratio":ratio,
-            "duration_quality":"passed" if actual>0 and target>0 and absolute<=limit else "failed"}
+            "duration_quality":"passed" if passed else "failed",
+            "duration_quality_rule": rule,
+            "duration_quality_lower_ratio": lower,
+            "duration_quality_upper_ratio": upper,
+            "duration_quality_limit_seconds": limit}
 
 
 def duration_adaptation_safety(actual: float, target: float) -> dict:
@@ -80,8 +104,8 @@ def natural_duration_fit(actual: float, target: float, provenance: str = "") -> 
         upper = float(os.getenv("AUTODUB_TTS_OCR_NATURAL_MAX_RATIO", "1.35"))
         rule = "trusted_ocr_ratio"
     elif target < 1.0:
-        lower = float(os.getenv("AUTODUB_TTS_NATURAL_MIN_RATIO_TINY", "0.60"))
-        upper = float(os.getenv("AUTODUB_TTS_NATURAL_MAX_RATIO_TINY", "1.40"))
+        lower = float(os.getenv("AUTODUB_TTS_NATURAL_MIN_RATIO_TINY", "0.78"))
+        upper = float(os.getenv("AUTODUB_TTS_NATURAL_MAX_RATIO_TINY", "1.25"))
         rule = "tiny_ratio"
     elif target < 2.0:
         lower = float(os.getenv("AUTODUB_TTS_NATURAL_MIN_RATIO_SHORT", "0.75"))
@@ -111,6 +135,77 @@ def natural_duration_fit(actual: float, target: float, provenance: str = "") -> 
         "duration_rewrite_direction": direction,
         "duration_log_distance": distance,
     }
+
+
+def audible_speech_quality(path, *, expected_text: str = "") -> dict:
+    """Reject silent, near-silent and implausibly tiny synthesized clips.
+
+    Worker success only proves that a WAV was written.  It does not prove that
+    the WAV contains audible speech.  This lightweight gate deliberately uses
+    signal evidence available in every TTS environment; optional ASR/content
+    verification can be layered on top without weakening this baseline.
+    """
+    try:
+        from pydub import AudioSegment, silence
+        clip = AudioSegment.from_file(str(path))
+    except Exception as exc:
+        return {
+            "audible_speech_quality": "failed",
+            "audible_speech_reason": f"unreadable_audio:{type(exc).__name__}",
+        }
+    duration = len(clip) / 1000.0
+    dbfs = float(clip.dBFS) if clip.dBFS != float("-inf") else -120.0
+    threshold = max(
+        float(os.getenv("AUTODUB_TTS_AUDIBLE_ABSOLUTE_DBFS", "-48")),
+        dbfs - float(os.getenv("AUTODUB_TTS_AUDIBLE_RELATIVE_DB", "18")),
+    )
+    ranges = silence.detect_nonsilent(
+        clip,
+        min_silence_len=int(os.getenv("AUTODUB_TTS_AUDIBLE_MIN_SILENCE_MS", "80")),
+        silence_thresh=threshold,
+    )
+    voiced_ms = sum(max(0, end - start) for start, end in ranges)
+    voiced = voiced_ms / 1000.0
+    voiced_ratio = voiced / duration if duration > 0 else 0.0
+    lexical = "".join(
+        char for char in str(expected_text or "").strip()
+        if char.isalnum() or "\u4e00" <= char <= "\u9fff"
+    )
+    # This is intentionally only a gross fragment detector, not a speaking-rate
+    # judge.  The duration ratio gate remains the primary timing decision.
+    min_voiced = max(
+        float(os.getenv("AUTODUB_TTS_MIN_VOICED_SECONDS", "0.16")),
+        min(0.55, len(lexical) * float(os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_SYMBOL", "0.055"))),
+    )
+    min_ratio = float(os.getenv("AUTODUB_TTS_MIN_VOICED_RATIO", "0.35"))
+    min_dbfs = float(os.getenv("AUTODUB_TTS_MIN_DBFS", "-42"))
+    reasons = []
+    if duration <= 0.0:
+        reasons.append("empty_audio")
+    if dbfs < min_dbfs:
+        reasons.append(f"near_silent_dbfs:{dbfs:.2f}")
+    if voiced < min_voiced:
+        reasons.append(f"voiced_too_short:{voiced:.3f}<{min_voiced:.3f}")
+    if voiced_ratio < min_ratio:
+        reasons.append(f"voiced_ratio_low:{voiced_ratio:.3f}<{min_ratio:.3f}")
+    return {
+        "audible_speech_quality": "failed" if reasons else "passed",
+        "audible_speech_reason": ";".join(reasons),
+        "audio_dbfs": round(dbfs, 3),
+        "audio_duration": round(duration, 4),
+        "voiced_duration": round(voiced, 4),
+        "voiced_ratio": round(voiced_ratio, 4),
+        "minimum_voiced_duration": round(min_voiced, 4),
+    }
+
+
+def voice_reference_similarity(left_path, right_path):
+    """Return the conservative MFCC proxy similarity used by reference reuse."""
+    left = _voice_proxy_embedding(left_path)
+    right = _voice_proxy_embedding(right_path)
+    if left is None or right is None:
+        return None
+    return float(left @ right)
 
 
 def electricity_metrics(path):
@@ -280,7 +375,7 @@ def stage_fingerprint(state, config, backend):
         if path.is_file():
             info=path.stat()
             media[key]={"path":str(path.resolve()),"size":info.st_size,"mtime_ns":info.st_mtime_ns}
-    payload={"version":"tts-stage-v2.5.0-context-ratio-overlap","segments":segments,"media":media,"backend":backend,
+    payload={"version":"tts-stage-v2.6.0-audible-semantic-voice-identity","segments":segments,"media":media,"backend":backend,
              "input_file":state.get("input_file"),
              "target_lang":str(config.target_lang).lower(),
              "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs")))}
@@ -316,6 +411,12 @@ def validate_mix_state(state, config, *, allow_missing=False, filter_missing=Tru
         path=Path(str(clip.get("file") or ""))
         if result.get("status")!="success" or not path.is_file() or not path.stat().st_size:
             quality_issues.append(f"{sid}:missing or unsuccessful WAV")
+            continue
+        if result.get("audible_speech_quality") != "passed":
+            quality_issues.append(
+                f"{sid}:audible speech audit failed or missing "
+                f"({result.get('audible_speech_reason', 'not audited')})"
+            )
             continue
         try:
             if _wav_duration(path)<=0:

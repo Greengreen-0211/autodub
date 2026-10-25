@@ -297,6 +297,21 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertEqual(len(refined[0]["tts_internal_pauses"]), 1)
         self.assertEqual(audit[0]["precision"], "word_vad_consensus")
 
+    def test_precise_vad_cannot_delay_past_first_word_onset(self):
+        segment = {
+            "id": 3, "start": 7.71, "end": 8.53,
+            "text": "Hello, Jack.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Hello", "start": 7.76, "end": 8.05},
+                {"text": "Jack", "start": 8.08, "end": 8.48},
+            ],
+        }
+        refined, _ = attach_precise_tts_placement(
+            [segment], [(7.84, 8.50)]
+        )
+        self.assertLessEqual(refined[0]["tts_placement_start"], 7.76)
+        self.assertGreaterEqual(refined[0]["tts_target_duration"], 0.70)
+
     def test_ambiguous_implausible_word_span_uses_local_ratio_guard(self):
         segment = {
             "id": 7, "start": 43.49, "end": 49.61,

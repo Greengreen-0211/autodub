@@ -26,6 +26,7 @@ from emotion_recognizer import apply_emotion_reliability
 from scheme3_policy import build_scheme3_segments, describe_scheme3_decision
 import tts_router
 from tts_quality import (
+    audible_speech_quality,
     duration_quality,
     natural_duration_fit,
     stage_fingerprint,
@@ -40,7 +41,9 @@ def wav(path, duration=1.0):
     Path(path).parent.mkdir(parents=True,exist_ok=True)
     with wave.open(str(path),"wb") as h:
         h.setnchannels(1); h.setsampwidth(2); h.setframerate(1000)
-        h.writeframes(b"\x00\x00"*int(duration*1000))
+        # Audible deterministic fixture. Tests that need silence create it
+        # explicitly so the formal audible-speech gate remains meaningful.
+        h.writeframes(b"\x10\x27"*int(duration*1000))
 
 
 def source(sid=0,text="This is a full sentence."):
@@ -575,7 +578,7 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(rows[0]["actual_engine"],"indextts2")
             self.assertIn("missing Vocos",rows[0]["fallback_reason"])
 
-    def test_duration_violation_keeps_upstream_best_candidate(self):
+    def test_implausibly_short_audio_is_not_kept_as_success(self):
         calls=[]
         def worker(model,plan,result,force=False):
             calls.append(model)
@@ -589,10 +592,11 @@ class RouterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp,patch("tts_router.preflight_models"),patch("tts_router._run_worker",side_effect=worker),patch("tts_router._apply_atempo",side_effect=adapt):
             router=self.setup_router(tmp)
             clips,results=router.run([dict(source(text="short"),tts_engine="f5tts",translations_candidates=[{"text":"short"},{"text":"a longer candidate"}])],"unused")
-            self.assertEqual(results[0]["status"],"success")
-            self.assertEqual(results[0]["duration_quality"],"degraded")
+            self.assertEqual(results[0]["status"],"failed")
+            self.assertEqual(clips, [])
+            self.assertEqual(results[0]["audible_speech_quality"],"failed")
             self.assertEqual(results[0]["tts_text"],"short")
-            self.assertEqual(len(calls),1)
+            self.assertGreaterEqual(len(calls),1)
 
     def test_unsafe_overlength_generation_uses_engine_fallback(self):
         calls=[]
@@ -763,12 +767,57 @@ class RouterTests(unittest.TestCase):
             "f5_native_duration_final_pass",
         )
 
+    def test_duration_candidate_selector_can_preserve_contextual_wording(self):
+        rewrites = iter(["awkward longer one", "awkward longer two"])
+        durations = {
+            "natural answer": 0.65,
+            "awkward longer one": 0.68,
+            "awkward longer two": 0.70,
+        }
+        def worker(_model, plan, result, force=False):
+            data = json.loads(Path(result).read_text())
+            for item in json.loads(Path(plan).read_text())["items"]:
+                wav(item["raw_path"], durations[item["text"]])
+                data[item["segment_id"]].update(status="success")
+            Path(result).write_text(json.dumps(data))
+            return 0
+        def postprocess(src, dst, target, **_kwargs):
+            shutil.copy2(src, dst)
+            actual = tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration": actual, "post_trim_duration": actual,
+                "actual_duration": actual, "atempo_factor": 1.0,
+                "atempo_raw_factor": actual / target, "atempo_capped": False,
+                **tts_router.duration_adaptation_safety(actual, target),
+            }
+        selected_payloads = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ), patch("tts_router._run_worker", side_effect=worker), patch(
+            "tts_router._postprocess", side_effect=postprocess
+        ), patch("tts_router.electricity_quality", return_value={}), patch(
+            "tts_router.voice_consistency_quality", return_value={}
+        ):
+            router = self.setup_router(tmp, disabled=True)
+            router.duration_rewriter = lambda *_a, **_k: {"text": next(rewrites)}
+            router.duration_candidate_selector = lambda _segment, candidates: (
+                selected_payloads.append(candidates)
+                or {"selected_attempt": 0, "reason": "context is more natural"}
+            )
+            _, results = router.run([
+                dict(source(text="natural answer"), tts_engine="f5tts")
+            ], "unused")
+        self.assertEqual(results[0]["duration_selected_attempt"], 0)
+        self.assertEqual(results[0]["tts_text"], "natural answer")
+        self.assertEqual(len(selected_payloads[0]), 3)
+
 
 class QualityTests(unittest.TestCase):
     def mix(self,tmp):
         p=Path(tmp)/"a.wav";wav(p)
         state={"segments_step3":[source()],"audio_clips":[{"segment_id":"0","file":str(p),"request_fingerprint":"fp"}],
-               "tts_router_results":[{"segment_id":"0","status":"success","request_fingerprint":"fp"}],"tts_backend":"scheme3"}
+               "tts_router_results":[{"segment_id":"0","status":"success","request_fingerprint":"fp",
+                                      "audible_speech_quality":"passed"}],"tts_backend":"scheme3"}
         request={"text":source()["text"],"language":"en","target_language":"en","emotion":"neutral",
                  "speaker":"A","ref_audio":str(p),"ref_text":"source","target_duration":1,"model":"f5tts"}
         fp=tts_router._request_fingerprint(request)
@@ -791,9 +840,12 @@ class QualityTests(unittest.TestCase):
     def test_duration_gate(self):
         self.assertEqual(duration_quality(2.49,5.68)["duration_quality"],"failed")
         self.assertEqual(duration_quality(5.6,5.68)["duration_quality"],"passed")
+        self.assertEqual(duration_quality(0.45,0.70)["duration_quality"],"failed")
+        self.assertEqual(duration_quality(0.60,0.70)["duration_quality"],"passed")
 
     def test_natural_duration_fit_uses_percentage_rules(self):
-        self.assertEqual(natural_duration_fit(0.7, 0.5)["natural_duration_fit"], "passed")
+        self.assertEqual(natural_duration_fit(0.7, 0.5)["natural_duration_fit"], "failed")
+        self.assertEqual(natural_duration_fit(0.4, 0.5)["natural_duration_fit"], "passed")
         self.assertEqual(natural_duration_fit(2.5, 2.0)["duration_rewrite_direction"], "compress")
         self.assertEqual(natural_duration_fit(1.5, 2.0)["duration_rewrite_direction"], "expand")
 
@@ -805,6 +857,18 @@ class QualityTests(unittest.TestCase):
         trusted = natural_duration_fit(2.6, 2.0, "ocr_direct")
         self.assertEqual(trusted["natural_duration_fit"], "passed")
         self.assertEqual(trusted["natural_duration_rule"], "trusted_ocr_ratio")
+
+    def test_silent_wav_fails_audible_speech_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "silent.wav"
+            with wave.open(str(path), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(1000)
+                stream.writeframes(b"\x00\x00" * 800)
+            result = audible_speech_quality(path, expected_text="把手给我")
+            self.assertEqual(result["audible_speech_quality"], "failed")
+            self.assertIn("near_silent", result["audible_speech_reason"])
 
     def test_light_duration_fit_is_ratio_based_and_ocr_aware(self):
         standard = LightTTSSelector._duration_fit(2.6, 2.0, 3.0, "standard")

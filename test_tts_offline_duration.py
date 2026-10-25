@@ -144,6 +144,34 @@ class DurationTests(unittest.TestCase):
             )
             self.assertFalse(manifest["speakers"]["A"]["concatenated"])
 
+    def test_voice_identity_reuse_does_not_change_sentence_speaker_labels(self):
+        class FakeAudio:
+            dBFS = -20.0
+            def __init__(self, length=10000): self.length = int(length)
+            def __len__(self): return self.length
+            def __getitem__(self, item):
+                return FakeAudio(max(0, int(item.stop) - int(item.start or 0)))
+            def export(self, path, format="wav"): Path(path).write_bytes(b"RIFF")
+
+        fake_pydub = ModuleType("pydub")
+        fake_pydub.AudioSegment = SimpleNamespace(from_wav=lambda _path: FakeAudio())
+        fake_pydub.silence = SimpleNamespace(detect_nonsilent=lambda *_a, **_k: [[0, 1000]])
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            sys.modules, {"pydub": fake_pydub}
+        ), patch("tts_router.voice_reference_similarity", return_value=0.96):
+            router = tts_router.TTSRouter(SimpleNamespace(temp_dir=tmp), scheme="scheme3")
+            router._reference_score = lambda _segment, clip: len(clip) / 1000.0
+            segments = [
+                {"id": 0, "start": 0.0, "end": 1.0, "speaker": "A", "text": "one"},
+                {"id": 1, "start": 2.0, "end": 5.0, "speaker": "B", "text": "two"},
+            ]
+            references = router._speaker_references(segments, "unused.wav")
+            self.assertEqual([row["speaker"] for row in segments], ["A", "B"])
+            self.assertEqual(references["A"]["voice_identity"], "B")
+            self.assertTrue(references["A"]["voice_identity_reused"])
+            manifest = json.loads((router.root / "reference_manifest.json").read_text())
+            self.assertEqual(manifest["voice_identity_map"]["A"], "B")
+
     def test_reference_precision_gate_only_rejects_coarse_recovery(self):
         self.assertTrue(tts_router._is_precise_reference_segment({}))
         self.assertTrue(tts_router._is_precise_reference_segment({

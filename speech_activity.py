@@ -183,7 +183,10 @@ def attach_precise_tts_placement(
         if acoustic:
             first_acoustic = acoustic[0][0]
             if abs(first_acoustic - word_start) <= 0.25:
-                onset = max(onset, first_acoustic - 0.03)
+                # Energy VAD frequently starts after an unvoiced consonant.
+                # It may refine a loose pre-roll but must never push dubbing
+                # past the first aligned word onset and make a short line late.
+                onset = min(word_start, max(onset, first_acoustic - 0.03))
         speech_islands = intersect_ranges(active, [(onset, hard_end)]) or word_ranges
         ambiguous = bool(segment.get("speaker_boundary_ambiguous"))
         timing_reason = "word_vad_consensus"

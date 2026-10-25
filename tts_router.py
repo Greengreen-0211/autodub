@@ -26,11 +26,13 @@ from scheme3_policy import (
 )
 from tts_preflight import cache_environment, offline_mode, preflight_models
 from tts_quality import (
+    audible_speech_quality,
     duration_adaptation_safety,
     duration_quality,
     electricity_quality,
     natural_duration_fit,
     voice_consistency_quality,
+    voice_reference_similarity,
 )
 
 
@@ -567,6 +569,15 @@ def synthesize(
                 requires_duration_resolution=False,
             )
     metadata.update(electricity_quality(destination))
+    metadata.update(audible_speech_quality(destination, expected_text=text))
+    if metadata.get("audible_speech_quality") == "failed":
+        metadata.update(
+            adoption_recommended=False,
+            warning={
+                "code": "TTS_AUDIO_NOT_RELIABLY_AUDIBLE",
+                "message": metadata.get("audible_speech_reason", "audio quality failed"),
+            },
+        )
     results["0"] = metadata
     _atomic_json(result, results)
     return metadata
@@ -579,6 +590,9 @@ class TTSRouter:
         *,
         scheme: str = "scheme2",
         duration_rewriter: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
+        duration_candidate_selector: Optional[
+            Callable[..., Optional[Dict[str, Any]]]
+        ] = None,
     ):
         if scheme not in {"baseline", "scheme2", "scheme3"}:
             raise ValueError(f"unsupported TTS scheme: {scheme}")
@@ -592,6 +606,7 @@ class TTSRouter:
         self.plan_path = self.root / "plan.json"
         self.result_path = self.root / "results.json"
         self.duration_rewriter = duration_rewriter
+        self.duration_candidate_selector = duration_candidate_selector
 
     @staticmethod
     def _reference_score(segment: Dict[str, Any], clip: Any) -> float:
@@ -693,6 +708,7 @@ class TTSRouter:
                 "end": float(source_segment["end"]),
                 "source_segment_id": str(source_segment.get("id", source_index)),
                 "purity_score": round(float(score), 4),
+                "duration": round(len(audio) / 1000.0, 3),
             }
             manifest["speakers"][speaker] = {
                 "candidate_count": len(candidates),
@@ -720,6 +736,110 @@ class TTSRouter:
                 ],
             }
             print(f"参考音频 {speaker}: 候选 {len(candidates)}，选中单段 ID={source_segment.get('id', source_index)}，{len(audio)/1000.0:.2f}s")
+        # Step 2 speaker labels remain untouched: they define dialogue turns and
+        # timestamps.  For voice cloning only, conservatively reuse a stronger
+        # reference when two labels have near-identical acoustic proxies.  This
+        # reduces voice drift caused by an over-split diarization without ever
+        # joining sentences or changing their boundaries.
+        similarity_threshold = float(os.getenv(
+            "AUTODUB_TTS_REFERENCE_IDENTITY_SIMILARITY", "0.90"
+        ))
+        minimum_reliable = float(os.getenv(
+            "AUTODUB_TTS_MIN_RELIABLE_REFERENCE_SECONDS", "1.50"
+        ))
+        similarities = []
+        similarity_by_pair = {}
+        reference_names = sorted(references)
+        for left_index, left in enumerate(reference_names):
+            for right in reference_names[left_index + 1:]:
+                similarity = voice_reference_similarity(
+                    references[left]["audio"], references[right]["audio"]
+                )
+                if similarity is None:
+                    continue
+                similarity_by_pair[frozenset((left, right))] = similarity
+                similarities.append({
+                    "left": left,
+                    "right": right,
+                    "similarity": round(similarity, 6),
+                    "merged": False,
+                })
+
+        # Reliable references are immutable anchors. A short label may attach
+        # directly to its single closest anchor, but anchors are never merged
+        # with each other and short-to-short transitive chains are forbidden.
+        # This avoids collapsing two same-gender actors through an accidental
+        # A~B~C similarity bridge.
+        anchors = [
+            name for name in reference_names
+            if float(references[name].get("duration", 0.0)) >= minimum_reliable
+        ]
+        voice_identity_map = {name: name for name in reference_names}
+        for speaker in reference_names:
+            if speaker in anchors:
+                continue
+            matches = [
+                (similarity_by_pair.get(frozenset((speaker, anchor))), anchor)
+                for anchor in anchors
+            ]
+            matches = [
+                (similarity, anchor) for similarity, anchor in matches
+                if similarity is not None and similarity >= similarity_threshold
+            ]
+            if matches:
+                _, best_anchor = max(
+                    matches,
+                    key=lambda item: (
+                        item[0],
+                        float(references[item[1]].get("purity_score", 0.0)),
+                    ),
+                )
+                voice_identity_map[speaker] = best_anchor
+                for row in similarities:
+                    if {row["left"], row["right"]} == {speaker, best_anchor}:
+                        row["merged"] = True
+                        break
+
+        for speaker in reference_names:
+            canonical = voice_identity_map[speaker]
+            canonical_reference = dict(references[canonical])
+            original = references[speaker]
+            reused = speaker != canonical
+            references[speaker] = {
+                **canonical_reference,
+                "requested_speaker": speaker,
+                "voice_identity": canonical,
+                "voice_identity_reused": reused,
+                "original_reference_segment_id": original.get(
+                    "source_segment_id"
+                ),
+                "original_reference_duration": original.get("duration"),
+                "reference_reliability": (
+                    "reliable" if float(canonical_reference.get("duration", 0.0))
+                    >= minimum_reliable else "short_degraded"
+                ),
+            }
+            manifest["speakers"][speaker].update({
+                "voice_identity": canonical,
+                "voice_identity_reused": reused,
+                "selected_voice_reference_segment_id": canonical_reference.get(
+                    "source_segment_id"
+                ),
+                "selected_voice_reference_duration": canonical_reference.get(
+                    "duration"
+                ),
+                "reference_reliability": references[speaker][
+                    "reference_reliability"
+                ],
+            })
+        manifest.update({
+            "version": 3,
+            "policy": "sentence_boundaries_preserved_voice_identity_reuse_v1",
+            "minimum_reliable_reference_seconds": minimum_reliable,
+            "voice_identity_similarity_threshold": similarity_threshold,
+            "voice_identity_map": voice_identity_map,
+            "voice_identity_similarities": similarities,
+        })
         _atomic_json(self.root / "reference_manifest.json", manifest)
         return references
 
@@ -827,6 +947,10 @@ class TTSRouter:
                 "ref_text": reference["text"], "target_duration": duration,
                 "reference_segment_id": reference.get("source_segment_id"),
                 "reference_purity_score": reference.get("purity_score"),
+                "reference_duration": reference.get("duration"),
+                "reference_reliability": reference.get("reference_reliability", "reliable"),
+                "voice_identity": reference.get("voice_identity", speaker),
+                "voice_identity_reused": bool(reference.get("voice_identity_reused", False)),
                 "reference_fallback": reference_fallback_speaker is not None,
                 "reference_fallback_speaker": reference_fallback_speaker,
                 "reference_fallback_reason": reference_fallback_reason,
@@ -919,6 +1043,7 @@ class TTSRouter:
                 )
             )
             if (not force and known.get("status")=="success" and
+                    known.get("audible_speech_quality")=="passed" and
                     not (getattr(self.config,"disable_tts_fallback",False) and known.get("actual_engine")!=item["planned_engine"]) and
                     planned_compatible):
                 resumed = dict(item, model=known.get("actual_engine", item["model"]),
@@ -1020,8 +1145,12 @@ class TTSRouter:
                             reference_manifest_path=str(
                                 self.root / "reference_manifest.json"
                             ),
-                            reference_segment_id=item.get("reference_segment_id"),
-                            reference_purity_score=item.get("reference_purity_score"),
+                             reference_segment_id=item.get("reference_segment_id"),
+                             reference_purity_score=item.get("reference_purity_score"),
+                             reference_duration=item.get("reference_duration"),
+                             reference_reliability=item.get("reference_reliability"),
+                             voice_identity=item.get("voice_identity", item["speaker"]),
+                             voice_identity_reused=item.get("voice_identity_reused", False),
                             reference_fallback=item.get("reference_fallback", False),
                             reference_fallback_speaker=item.get("reference_fallback_speaker"),
                             reference_fallback_reason=item.get("reference_fallback_reason", ""),
@@ -1147,14 +1276,55 @@ class TTSRouter:
                 candidate for candidate in valid
                 if candidate["fit"]["natural_duration_fit"] == "passed"
             ]
-            chosen = (passing or valid)
-            chosen = min(
-                chosen,
-                key=lambda candidate: (
-                    float(candidate["fit"]["duration_log_distance"]),
-                    int(candidate["attempt"]),
-                ),
-            )
+            selection_pool = passing or valid
+            chosen = None
+            selector_result = None
+            if self.duration_candidate_selector is not None and len(valid) > 1:
+                try:
+                    selector_result = self.duration_candidate_selector(
+                        dict(item.get("source_segment") or {}),
+                        [
+                            {
+                                "attempt": candidate["attempt"],
+                                "text": candidate["text"],
+                                **candidate["fit"],
+                                "rewrite_audit": candidate.get("rewrite") or {},
+                            }
+                            for candidate in valid
+                        ],
+                    )
+                    selected_attempt = int(
+                        (selector_result or {}).get("selected_attempt")
+                    )
+                    chosen = next(
+                        (
+                            candidate for candidate in selection_pool
+                            if int(candidate["attempt"]) == selected_attempt
+                        ),
+                        None,
+                    )
+                except Exception as exc:
+                    print(
+                        f"⚠️ segment={sid} 译文上下文终选失败，使用本地排序: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            if chosen is None:
+                if selector_result is not None:
+                    selector_result = None
+                # Rewrites are not intrinsically better than the original.
+                # Prefer an explicitly context-approved rewrite; otherwise
+                # preserve the earlier/native wording before using duration as
+                # the final tie-breaker.
+                chosen = min(
+                    selection_pool,
+                    key=lambda candidate: (
+                        -int(bool((candidate.get("rewrite") or {}).get(
+                            "preferred_for_context", False
+                        ))),
+                        0 if int(candidate["attempt"]) == 0 else 1,
+                        float(candidate["fit"]["duration_log_distance"]),
+                    ),
+                )
             item.update({
                 "text": chosen["text"],
                 "model": chosen["model"],
@@ -1267,6 +1437,20 @@ class TTSRouter:
                         )
                 actual = float(final_metadata["actual_duration"])
                 final_metadata.update(duration_quality(actual, item["target_duration"]))
+                final_metadata.update(audible_speech_quality(
+                    Path(item["final_path"]), expected_text=item["text"]
+                ))
+                if final_metadata.get("audible_speech_quality") == "failed":
+                    final_metadata.update(
+                        status="failed",
+                        error=(
+                            "generated WAV has no reliable audible speech: "
+                            + str(final_metadata.get("audible_speech_reason") or "unknown")
+                        ),
+                        preview_file=item["final_path"],
+                        preview_available=True,
+                        adoption_recommended=False,
+                    )
                 if (
                     final_metadata.get("status") != "failed"
                     and final_metadata.get("duration_quality") == "failed"
@@ -1278,6 +1462,31 @@ class TTSRouter:
                         ),
                     )
                 final_metadata.update(chosen["fit"])
+                if (
+                    final_metadata.get("status") != "failed"
+                    and chosen["fit"]["natural_duration_fit"] != "passed"
+                    and chosen_safety.get("unsafe_duration_slowdown")
+                ):
+                    # A severely under-length natural generation often means
+                    # swallowed syllables or an incomplete utterance.  Small
+                    # atempo stretching can make its file length look valid but
+                    # cannot restore missing words, so let the engine fallback
+                    # chain regenerate the sentence instead.
+                    final_metadata.update(
+                        status="failed",
+                        duration_quality="failed",
+                        duration_degraded_reason=(
+                            "implausibly_short_natural_generation"
+                        ),
+                        error=(
+                            "natural TTS output is too short to trust; possible "
+                            "swallowed or missing speech: "
+                            f"ratio={chosen['fit']['natural_duration_ratio']:.3f}"
+                        ),
+                        preview_file=item["final_path"],
+                        preview_available=True,
+                        adoption_recommended=False,
+                    )
                 final_metadata.update(
                     file=item["final_path"],
                     audio_sha256=_file_sha256(Path(item["final_path"])),
@@ -1288,10 +1497,14 @@ class TTSRouter:
                     duration_selection_reason=(
                         "f5_native_duration_final_pass"
                         if native_duration_control else (
-                            "first_natural_fit" if passing
-                            else "closest_of_three_valid_translations"
+                            "context_native_candidate_selection"
+                            if selector_result else (
+                                "semantic_first_natural_fit" if passing
+                                else "semantic_first_best_available_translation"
+                            )
                         )
                     ),
+                    duration_candidate_selector=selector_result or {},
                     native_duration_control=bool(native_duration_control),
                     duration_attempt_history=[
                         {
@@ -1307,6 +1520,7 @@ class TTSRouter:
                             "direction": candidate["fit"][
                                 "duration_rewrite_direction"
                             ],
+                            "rewrite_audit": candidate.get("rewrite") or {},
                         }
                         for candidate in candidates
                     ],
@@ -1408,12 +1622,26 @@ class TTSRouter:
                         if metadata["atempo_capped"] and metadata["duration_quality"]=="failed":
                             metadata["duration_quality_note"] = "atempo capped: duration mismatch accepted to avoid unnatural speed"
                         metadata.update(electricity_quality(Path(item["final_path"])))
+                        metadata.update(audible_speech_quality(
+                            Path(item["final_path"]), expected_text=item["text"]
+                        ))
                         metadata.update(voice_consistency_quality(
                             Path(item["ref_audio"]), Path(item["final_path"])
                         ))
                         # 电音检测：block policy turns a detected artifact into a
                         # failure so the fallback chain can try another engine.
-                        if (metadata.get("electricity_quality")=="failed" and
+                        if metadata.get("audible_speech_quality") == "failed":
+                            metadata.update(
+                                status="failed",
+                                error=(
+                                    "generated WAV has no reliable audible speech: "
+                                    + str(metadata.get("audible_speech_reason") or "unknown")
+                                ),
+                                preview_file=item["final_path"],
+                                preview_available=True,
+                                adoption_recommended=False,
+                            )
+                        elif (metadata.get("electricity_quality")=="failed" and
                                 os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY","warn").strip().lower()=="block"):
                             metadata.update(status="failed", error=metadata.get("electricity_reason","electric artifact detected"))
                         elif (metadata.get("voice_consistency_quality")=="failed" and
