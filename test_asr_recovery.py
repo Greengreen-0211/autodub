@@ -329,6 +329,57 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertGreaterEqual(row["tts_target_duration"], 0.35)
         self.assertEqual(audit[0]["hard_end"], 21.2)
 
+    def test_short_sentence_borrows_bounded_leading_slack_before_next_turn(self):
+        segment = {
+            "id": 6, "start": 41.97, "end": 43.49,
+            "text": "Step up.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Step", "start": 42.93, "end": 43.33},
+                {"text": "up", "start": 43.33, "end": 43.49},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(42.83, 43.49)]
+        )
+        row = refined[0]
+        self.assertAlmostEqual(row["tts_original_placement_start"], 42.87)
+        self.assertAlmostEqual(row["tts_placement_start"], 42.69)
+        self.assertAlmostEqual(row["tts_leading_slack_used"], 0.18)
+        self.assertAlmostEqual(row["tts_target_duration"], 0.80)
+        self.assertEqual(row["tts_hard_end"], 43.49)
+        self.assertAlmostEqual(audit[0]["leading_slack_used"], 0.18)
+
+    def test_leading_slack_is_capped_and_never_crosses_sentence_start(self):
+        segment = {
+            "id": 9, "start": 10.0, "end": 10.5,
+            "text": "A complete longer sentence.",
+            "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "sentence", "start": 10.42, "end": 10.5},
+            ],
+        }
+        refined, _ = attach_precise_tts_placement(
+            [segment], [(10.40, 10.5)]
+        )
+        row = refined[0]
+        self.assertGreaterEqual(row["tts_placement_start"], row["start"])
+        self.assertLessEqual(row["tts_leading_slack_used"], 0.35)
+
+    def test_ambiguous_boundary_does_not_borrow_leading_slack(self):
+        segment = {
+            "id": 10, "start": 30.0, "end": 31.0,
+            "text": "Step up.", "timestamp_precision": "word",
+            "speaker_boundary_ambiguous": True,
+            "qwen3_time_stamps": [
+                {"text": "Step", "start": 30.70, "end": 30.85},
+                {"text": "up", "start": 30.85, "end": 31.0},
+            ],
+        }
+        refined, _ = attach_precise_tts_placement(
+            [segment], [(30.68, 31.0)]
+        )
+        self.assertEqual(refined[0]["tts_leading_slack_used"], 0.0)
+
     def test_ambiguous_implausible_word_span_uses_local_ratio_guard(self):
         segment = {
             "id": 7, "start": 43.49, "end": 49.61,

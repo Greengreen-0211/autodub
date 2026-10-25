@@ -8,6 +8,7 @@ SAD mask.  It never creates sentence boundaries by itself.
 from __future__ import annotations
 
 import math
+import os
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
@@ -195,14 +196,40 @@ def attach_precise_tts_placement(
                 # It may refine a loose pre-roll but must never push dubbing
                 # past the first aligned word onset and make a short line late.
                 onset = min(word_start, max(onset, first_acoustic - 0.03))
-        speech_islands = intersect_ranges(active, [(onset, aligned_end)]) or word_ranges
         ambiguous = bool(segment.get("speaker_boundary_ambiguous"))
-        timing_reason = "word_vad_consensus"
-        ratio_guard = None
-        word_span = max(0.0, word_end - word_start)
         duration_centre, duration_ceiling = _spoken_duration_prior(
             segment.get("text", "")
         )
+        original_onset = onset
+        leading_slack_used = 0.0
+        # A complete short sentence can own useful silence before its first
+        # aligned word.  When the remaining slot is shorter than a conservative
+        # pronunciation prior, borrow only the amount required, stay inside
+        # the immutable sentence boundary, and cap the advance.  Ambiguous
+        # speaker boundaries never receive this adjustment.
+        available_after_onset = max(0.0, outer_end - onset)
+        needed_leading_slack = max(
+            0.0,
+            min(duration_centre, outer_end - outer_start)
+            - available_after_onset,
+        )
+        if not ambiguous and needed_leading_slack > 0.0:
+            maximum_leading_slack = max(
+                0.0,
+                float(os.getenv(
+                    "AUTODUB_TTS_MAX_LEADING_SLACK_SECONDS", "0.35"
+                )),
+            )
+            leading_slack_used = min(
+                needed_leading_slack,
+                maximum_leading_slack,
+                max(0.0, onset - outer_start),
+            )
+            onset -= leading_slack_used
+        speech_islands = intersect_ranges(active, [(onset, aligned_end)]) or word_ranges
+        timing_reason = "word_vad_consensus"
+        ratio_guard = None
+        word_span = max(0.0, word_end - word_start)
         # Speaker ambiguity means the inherited word skeleton may still be
         # structurally valid while owning activity from a neighbouring turn.
         # When its span is implausible for the sentence, retain the median word
@@ -290,6 +317,12 @@ def attach_precise_tts_placement(
             "tts_minimum_pronounceable_duration": round(
                 minimum_pronounceable, 3
             ),
+            "tts_original_placement_start": round(original_onset, 3),
+            "tts_leading_slack_used": round(leading_slack_used, 3),
+            "tts_leading_slack_policy": (
+                "bounded_sentence_internal_leading_slack"
+                if leading_slack_used > 0.0 else "not_needed"
+            ),
             "tts_speech_islands": [
                 [round(start, 3), round(end, 3)] for start, end in speech_islands
             ],
@@ -301,7 +334,12 @@ def attach_precise_tts_placement(
                     if timing_reason == "ambiguous_word_span_ratio_guard"
                     else (
                         0.72 if ambiguous
-                        else min(0.98, 0.82 + (0.12 if acoustic else 0.0))
+                        else min(
+                            0.98,
+                            0.82
+                            + (0.12 if acoustic else 0.0)
+                            - (0.06 if leading_slack_used > 0.0 else 0.0),
+                        )
                     )
                 ), 4
             ),
@@ -314,6 +352,8 @@ def attach_precise_tts_placement(
             "placement_start": round(onset, 3),
             "hard_end": round(hard_end, 3),
             "target_speech_duration": round(effective, 3),
+            "original_placement_start": round(original_onset, 3),
+            "leading_slack_used": round(leading_slack_used, 3),
             "speech_islands": segment["tts_speech_islands"],
             "internal_pauses": internal_pauses,
             "timing_reason": timing_reason,
