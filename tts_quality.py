@@ -16,6 +16,49 @@ def duration_quality(actual: float, target: float) -> dict:
             "duration_quality":"passed" if actual>0 and target>0 and absolute<=limit else "failed"}
 
 
+def duration_adaptation_safety(actual: float, target: float) -> dict:
+    """Describe whether a generated clip can be time-scaled without abuse.
+
+    ``actual / target`` is deliberately the single source of truth.  A very
+    long utterance is often more than a timing problem: it can contain model
+    babble, copied reference speech, or added words.  Hiding that evidence
+    behind a 5-10x ``atempo`` chain produces an apparently valid WAV whose
+    content is no longer intelligible.  Such a result must be retried or
+    exposed as a degraded preview, never silently force-fitted.
+    """
+    actual = float(actual or 0.0)
+    target = float(target or 0.0)
+    ratio = actual / target if actual > 0.0 and target > 0.0 else 0.0
+    maximum_compression = max(
+        1.0,
+        float(os.getenv("AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO", "1.50")),
+    )
+    maximum_slowdown = max(
+        1.0,
+        float(os.getenv("AUTODUB_TTS_MAX_SAFE_SLOWDOWN_RATIO", "1.25")),
+    )
+    required_speed = ratio
+    required_slowdown = (1.0 / ratio) if ratio > 0.0 else 0.0
+    compression_safe = 0.0 < ratio <= maximum_compression
+    slowdown_safe = ratio > 0.0 and required_slowdown <= maximum_slowdown
+    return {
+        "duration_ratio": ratio,
+        "required_atempo_factor": required_speed,
+        "required_slowdown_factor": required_slowdown,
+        "maximum_safe_compression_ratio": maximum_compression,
+        "maximum_safe_slowdown_ratio": maximum_slowdown,
+        "safe_to_force_fit": bool(compression_safe and slowdown_safe),
+        "unsafe_duration_compression": bool(ratio > maximum_compression),
+        "unsafe_duration_slowdown": bool(
+            ratio > 0.0 and required_slowdown > maximum_slowdown
+        ),
+        "duration_anomaly": bool(
+            ratio
+            > float(os.getenv("AUTODUB_TTS_GENERATION_ANOMALY_RATIO", "2.00"))
+        ),
+    }
+
+
 def natural_duration_fit(actual: float, target: float, provenance: str = "") -> dict:
     """Judge unwarped, silence-trimmed TTS against the source speech window.
 

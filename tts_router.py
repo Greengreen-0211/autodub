@@ -26,6 +26,7 @@ from scheme3_policy import (
 )
 from tts_preflight import cache_environment, offline_mode, preflight_models
 from tts_quality import (
+    duration_adaptation_safety,
     duration_quality,
     electricity_quality,
     natural_duration_fit,
@@ -165,6 +166,12 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         "force_fit": os.getenv("AUTODUB_TTS_FORCE_FIT", "1"),
         "force_fit_tolerance": os.getenv(
             "AUTODUB_TTS_FORCE_FIT_TOLERANCE", "0.03"
+        ),
+        "maximum_safe_compression_ratio": os.getenv(
+            "AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO", "1.50"
+        ),
+        "maximum_safe_slowdown_ratio": os.getenv(
+            "AUTODUB_TTS_MAX_SAFE_SLOWDOWN_RATIO", "1.25"
         ),
     }
     payload["quality_policy"] = {
@@ -407,6 +414,7 @@ def _postprocess(
         factor, capped, raw = _atempo_factor(post_trim, target_duration)
         _apply_atempo(trimmed, destination, target_duration)
         forced = {}
+        adaptation = duration_adaptation_safety(post_trim, target_duration)
         natural_duration = _wav_duration(destination)
         force_fit = _env_bool("AUTODUB_TTS_FORCE_FIT", True)
         tolerance = float(os.getenv("AUTODUB_TTS_FORCE_FIT_TOLERANCE", "0.03"))
@@ -419,7 +427,14 @@ def _postprocess(
             and target_duration > 0.04
             and natural_duration > target_duration + max(0.005, tolerance)
         ):
-            forced = _apply_atempo_exact(trimmed, destination, target_duration)
+            if adaptation["unsafe_duration_compression"]:
+                forced = {
+                    "forced_duration_fit": False,
+                    "force_fit_skipped": True,
+                    "force_fit_skip_reason": "unsafe_compression_ratio",
+                }
+            else:
+                forced = _apply_atempo_exact(trimmed, destination, target_duration)
     finally:
         if trimmed.exists():
             trimmed.unlink(missing_ok=True)
@@ -430,6 +445,7 @@ def _postprocess(
         "atempo_raw_factor": round(raw, 6),
         "atempo_capped": bool(capped),
         "actual_duration": _wav_duration(destination),
+        **adaptation,
         **forced,
     }
 
@@ -523,7 +539,35 @@ def synthesize(
     metadata["file"] = str(destination)
     metadata["target_duration"] = float(target_duration or 0.0)
     metadata["duration_error"] = metadata["actual_duration"] - metadata["target_duration"] if target_duration else None
+    if target_duration:
+        metadata.update(duration_quality(
+            metadata["actual_duration"], metadata["target_duration"]
+        ))
+        if metadata["duration_quality"] == "failed":
+            # A one-off/trial synthesis did produce playable media.  Preserve
+            # it for diagnosis and comparison instead of converting a timing
+            # rejection into the misleading message "synthesis failed".
+            metadata.update(
+                status="success",
+                duration_quality="degraded",
+                adoption_recommended=False,
+                requires_duration_resolution=True,
+                warning={
+                    "code": "TTS_DURATION_OUT_OF_RANGE",
+                    "message": (
+                        "Audio was generated, but its duration is outside the "
+                        "safe range for this sentence. Preview is available; "
+                        "retry/rewrite before adopting it."
+                    ),
+                },
+            )
+        else:
+            metadata.update(
+                adoption_recommended=True,
+                requires_duration_resolution=False,
+            )
     metadata.update(electricity_quality(destination))
+    results["0"] = metadata
     _atomic_json(result, results)
     return metadata
 
@@ -879,6 +923,8 @@ class TTSRouter:
                     planned_compatible):
                 resumed = dict(item, model=known.get("actual_engine", item["model"]),
                                text=known.get("tts_text", item["text"]))
+                if known.get("native_duration_control"):
+                    resumed["measure_natural_duration"] = False
                 resumed["language"] = _language_code(resumed["target_language_raw"]) if resumed["model"]=="omnivoice" else resumed["target_language"]
                 self._job_paths(resumed)
                 resumed["request_fingerprint"] = _request_fingerprint(resumed)
@@ -907,9 +953,17 @@ class TTSRouter:
             self._execute(active, force=force)
             previous = _load_results(self.result_path)
 
+        # Decide whether the planned engine can produce a naturally usable
+        # utterance before treating it as a successful routing result.  This
+        # lets an unsafe duration outcome enter the same fallback chain as a
+        # worker/quality failure instead of being hidden by extreme atempo.
+        if self.duration_rewriter is not None:
+            previous = self._run_duration_retranslation(items, previous)
+
         if not getattr(self.config, "disable_tts_fallback", False):
-            # Planned engine plus at most two fallback engines. Duration
-            # mismatch is not an engine failure and never enters this loop.
+            # Planned engine plus at most two fallback engines. A moderate
+            # mismatch remains a degraded success, while a result requiring
+            # unsafe compression is an engine-quality failure and retries.
             for _ in range(2):
                 retry = []
                 for item in items:
@@ -926,6 +980,7 @@ class TTSRouter:
                     item["attempted_engines"].append(model)
                     item["model"] = model
                     item["tts_engine"] = model
+                    item["duration_attempt"] = 0
                     item["language"] = _language_code(item["target_language_raw"]) if model=="omnivoice" else item["target_language"]
                     self._job_paths(item)
                     item["request_fingerprint"] = _request_fingerprint(item)
@@ -938,9 +993,8 @@ class TTSRouter:
                     break
                 self._execute(retry, force=True)
                 previous = _load_results(self.result_path)
-
-        if self.duration_rewriter is not None:
-            previous = self._run_duration_retranslation(items, previous)
+                if self.duration_rewriter is not None:
+                    previous = self._run_duration_retranslation(retry, previous)
 
         clips, output_rows = [], []
         for item in items:
@@ -1111,6 +1165,56 @@ class TTSRouter:
                 "duration_attempt": chosen["attempt"],
             })
             final_metadata = dict(chosen["metadata"])
+            native_duration_control = False
+            chosen_safety = duration_adaptation_safety(
+                chosen["fit"]["natural_duration"], item["target_duration"]
+            )
+            # F5 can control output duration inside the acoustic model.  Use
+            # that as the preferred final pass after selecting the best text,
+            # but only when the unconstrained result is already close enough
+            # to be credible.  A huge duration anomaly may contain babble or
+            # reference leakage and must fall back to another engine instead
+            # of being hidden inside native duration control.
+            if (
+                item["model"] == "f5tts"
+                and chosen["fit"]["natural_duration_fit"] != "passed"
+                and chosen_safety["safe_to_force_fit"]
+                and not chosen_safety["duration_anomaly"]
+            ):
+                native_item = dict(item)
+                native_item["measure_natural_duration"] = False
+                safe = _safe_id(native_item["segment_id"])
+                attempt_suffix = (
+                    f"_duration_{native_item['duration_attempt']}"
+                    if int(native_item.get("duration_attempt", 0) or 0) else ""
+                )
+                native_item["raw_path"] = str(
+                    self.raw_dir
+                    / f"segment_{safe}_f5tts{attempt_suffix}_native.wav"
+                )
+                native_item["final_path"] = str(
+                    self.final_dir
+                    / f"segment_{safe}_f5tts{attempt_suffix}_native.wav"
+                )
+                native_item["request_fingerprint"] = _request_fingerprint(native_item)
+                native_item["force_regenerate"] = True
+                self._execute([native_item], force=True)
+                native_metadata = dict(
+                    _load_results(self.result_path).get(sid, {})
+                )
+                if native_metadata.get("status") == "success":
+                    native_duration = float(
+                        native_metadata.get("post_trim_duration")
+                        or native_metadata.get("actual_duration")
+                        or 0.0
+                    )
+                    native_safety = duration_adaptation_safety(
+                        native_duration, item["target_duration"]
+                    )
+                    if not native_safety["unsafe_duration_compression"]:
+                        item.update(native_item)
+                        final_metadata = native_metadata
+                        native_duration_control = True
             try:
                 post = _postprocess(
                     Path(item["raw_path"]), Path(item["final_path"]),
@@ -1124,20 +1228,49 @@ class TTSRouter:
                     hard_duration > 0.04
                     and float(post["actual_duration"]) > hard_duration + 0.01
                 ):
-                    forced = _apply_atempo_exact(
-                        Path(item["final_path"]), Path(item["final_path"]),
+                    collision_safety = duration_adaptation_safety(
+                        float(post.get("post_trim_duration") or post["actual_duration"]),
                         hard_duration,
                     )
-                    final_metadata.update(forced)
-                    final_metadata["forced_duration_reason"] = (
-                        "exceeds_collision_window_after_three_translations"
-                    )
-                    final_metadata["actual_duration"] = _wav_duration(
-                        Path(item["final_path"])
-                    )
+                    final_metadata.update({
+                        f"collision_{key}": value
+                        for key, value in collision_safety.items()
+                    })
+                    if collision_safety["unsafe_duration_compression"]:
+                        final_metadata.update(
+                            status="failed",
+                            duration_quality="failed",
+                            duration_degraded_reason=(
+                                "unsafe_compression_after_duration_retries"
+                            ),
+                            error=(
+                                "generated audio requires unsafe compression: "
+                                f"{collision_safety['duration_ratio']:.3f}x > "
+                                f"{collision_safety['maximum_safe_compression_ratio']:.3f}x"
+                            ),
+                            file=item["final_path"],
+                            preview_file=item["final_path"],
+                            preview_available=True,
+                            adoption_recommended=False,
+                        )
+                    else:
+                        forced = _apply_atempo_exact(
+                            Path(item["final_path"]), Path(item["final_path"]),
+                            hard_duration,
+                        )
+                        final_metadata.update(forced)
+                        final_metadata["forced_duration_reason"] = (
+                            "exceeds_collision_window_after_three_translations"
+                        )
+                        final_metadata["actual_duration"] = _wav_duration(
+                            Path(item["final_path"])
+                        )
                 actual = float(final_metadata["actual_duration"])
                 final_metadata.update(duration_quality(actual, item["target_duration"]))
-                if final_metadata.get("duration_quality") == "failed":
+                if (
+                    final_metadata.get("status") != "failed"
+                    and final_metadata.get("duration_quality") == "failed"
+                ):
                     final_metadata.update(
                         duration_quality="degraded",
                         duration_degraded_reason=(
@@ -1146,7 +1279,6 @@ class TTSRouter:
                     )
                 final_metadata.update(chosen["fit"])
                 final_metadata.update(
-                    status="success",
                     file=item["final_path"],
                     audio_sha256=_file_sha256(Path(item["final_path"])),
                     request_fingerprint=item["request_fingerprint"],
@@ -1154,9 +1286,13 @@ class TTSRouter:
                     duration_rewrite_count=max(0, len(valid) - 1),
                     duration_selected_attempt=chosen["attempt"],
                     duration_selection_reason=(
-                        "first_natural_fit" if passing
-                        else "closest_of_three_valid_translations"
+                        "f5_native_duration_final_pass"
+                        if native_duration_control else (
+                            "first_natural_fit" if passing
+                            else "closest_of_three_valid_translations"
+                        )
                     ),
+                    native_duration_control=bool(native_duration_control),
                     duration_attempt_history=[
                         {
                             "attempt": candidate["attempt"],
@@ -1175,6 +1311,8 @@ class TTSRouter:
                         for candidate in candidates
                     ],
                 )
+                if final_metadata.get("status") != "failed":
+                    final_metadata["status"] = "success"
             except Exception as exc:
                 final_metadata.update(
                     status="failed",
@@ -1281,6 +1419,21 @@ class TTSRouter:
                         elif (metadata.get("voice_consistency_quality")=="failed" and
                                 os.getenv("AUTODUB_TTS_VOICE_CONSISTENCY_POLICY","warn").strip().lower()=="block"):
                             metadata.update(status="failed", error=metadata.get("voice_consistency_reason","voice consistency check failed"))
+                        elif (
+                            metadata.get("unsafe_duration_compression")
+                            and self.duration_rewriter is None
+                        ):
+                            metadata.update(
+                                status="failed",
+                                error=(
+                                    "generated audio requires unsafe compression: "
+                                    f"{float(metadata.get('duration_ratio') or 0):.3f}x > "
+                                    f"{float(metadata.get('maximum_safe_compression_ratio') or 0):.3f}x"
+                                ),
+                                preview_file=item["final_path"],
+                                preview_available=True,
+                                adoption_recommended=False,
+                            )
                         elif metadata["duration_quality"]=="failed":
                             # Keep the best generated clip instead of dropping
                             # the sentence.  The mismatch remains auditable and

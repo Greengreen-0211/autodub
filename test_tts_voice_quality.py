@@ -20,7 +20,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import tts_router
-from tts_quality import electricity_quality, voice_consistency_quality
+from tts_quality import (
+    duration_adaptation_safety,
+    electricity_quality,
+    voice_consistency_quality,
+)
 
 HAS_LIBROSA = importlib.util.find_spec("librosa") is not None
 
@@ -133,18 +137,18 @@ class PostprocessTests(unittest.TestCase):
             self.assertIn("atempo_capped", post)
             self.assertTrue(dst.is_file())
 
-    def test_postprocess_force_fits_overlength_audio_instead_of_truncating(self):
+    def test_postprocess_force_fits_only_moderate_overlength_audio(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "raw.wav"
             dst = Path(tmp) / "final.wav"
-            write_wav(src, 3.0, sample=tone())
+            write_wav(src, 1.4, sample=tone())
 
             def exact(source, destination, target):
                 write_wav(destination, target, sample=tone())
                 return {
                     "forced_duration_fit": True,
-                    "forced_atempo_factor": 3.0,
-                    "forced_atempo_chain": "atempo=2,atempo=1.5",
+                    "forced_atempo_factor": 1.4,
+                    "forced_atempo_chain": "atempo=1.4",
                 }
 
             with patch(
@@ -158,6 +162,31 @@ class PostprocessTests(unittest.TestCase):
                 post = tts_router._postprocess(src, dst, 1.0)
             self.assertTrue(post["forced_duration_fit"])
             self.assertAlmostEqual(post["actual_duration"], 1.0, delta=0.05)
+
+    def test_postprocess_keeps_preview_and_skips_unsafe_force_fit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "raw.wav"
+            dst = Path(tmp) / "final.wav"
+            write_wav(src, 3.0, sample=tone())
+            with patch(
+                "tts_router._trim_silence",
+                side_effect=lambda source, destination: shutil.copy2(
+                    source, destination
+                ),
+            ), patch("tts_router._apply_atempo", side_effect=copy_adapt), patch(
+                "tts_router._apply_atempo_exact"
+            ) as exact:
+                post = tts_router._postprocess(src, dst, 1.0)
+            exact.assert_not_called()
+            self.assertTrue(post["force_fit_skipped"])
+            self.assertTrue(post["unsafe_duration_compression"])
+            self.assertAlmostEqual(post["actual_duration"], 3.0, delta=0.05)
+
+    def test_confucius_example_exceeds_safe_compression_limit(self):
+        result = duration_adaptation_safety(5.35, 3.44)
+        self.assertAlmostEqual(result["duration_ratio"], 5.35 / 3.44)
+        self.assertTrue(result["unsafe_duration_compression"])
+        self.assertFalse(result["safe_to_force_fit"])
 
 
 @unittest.skipUnless(HAS_LIBROSA, "librosa not installed")

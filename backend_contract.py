@@ -139,13 +139,67 @@ def serialize_trial(
     media = trial.get("audio_artifact_id")
     if media is None:
         media = trial.get("file", trial.get("audio_file"))
+    actual_duration = _optional_number(trial.get("actual_duration"))
+    target_duration = _optional_number(
+        trial.get("target_duration", trial.get("planned_duration"))
+    )
+    duration_ratio = _optional_number(trial.get("duration_ratio"))
+    if (
+        duration_ratio is None
+        and actual_duration is not None
+        and target_duration is not None
+        and target_duration > 0
+    ):
+        duration_ratio = actual_duration / target_duration
+    raw_quality = _string(trial.get("duration_quality"), "unmeasured")
+    raw_status = _string(trial.get("status"), "queued")
+    generated_media = media not in (None, "") and bool(
+        actual_duration is not None and actual_duration > 0
+    )
+    raw_error = _error(trial.get("error"), "TTS_TRIAL_FAILED")
+    error_text = _string((raw_error or {}).get("message")).lower()
+    measured_duration_rejected = bool(
+        actual_duration is not None
+        and target_duration is not None
+        and actual_duration > 0
+        and target_duration > 0
+        and abs(actual_duration - target_duration)
+        > max(0.6, target_duration * 0.25)
+    )
+    duration_rejected = (
+        raw_quality in {"failed", "degraded"}
+        or measured_duration_rejected
+        or (
+            raw_status == "failed"
+            and any(
+                token in error_text for token in ("duration", "时长", "too long")
+            )
+        )
+    )
+    # Generation success and timing acceptance are two separate facts.  A
+    # playable result must remain available even when it is too long to adopt
+    # directly; otherwise the UI incorrectly reports a model failure and
+    # prevents the user from hearing what the model actually produced.
+    recovered_preview = generated_media and duration_rejected
+    status = "success" if recovered_preview else raw_status
+    duration_quality = "degraded" if recovered_preview else raw_quality
+    warning = trial.get("warning")
+    if warning in (None, "") and recovered_preview:
+        warning = {
+            "code": "TTS_DURATION_OUT_OF_RANGE",
+            "message": (
+                "Audio was generated successfully, but its duration is outside "
+                "the safe sentence window. It can be previewed but should be "
+                "retried or rewritten before adoption."
+            ),
+        }
     return {
         "trial_id": _string(trial.get("trial_id")),
         "segment_id": _string(trial.get("segment_id")),
         "revision": _integer(trial.get("revision")),
         "engine": _string(trial.get("engine")),
         "actual_engine": _optional_string(trial.get("actual_engine")),
-        "status": _string(trial.get("status"), "queued"),
+        "status": status,
         "stale": bool(trial.get("stale", False)),
         "input_fingerprint": _string(
             trial.get("input_fingerprint", trial.get("request_fingerprint"))
@@ -157,12 +211,25 @@ def serialize_trial(
             if trial.get("audio_artifact_id") is not None
             else _artifact_id(media, artifact_resolver)
         ),
-        "actual_duration": _optional_number(trial.get("actual_duration")),
+        "target_duration": target_duration,
+        "actual_duration": actual_duration,
+        "duration_ratio": duration_ratio,
         "duration_error": _optional_number(trial.get("duration_error")),
-        "duration_quality": _string(trial.get("duration_quality"), "unmeasured"),
+        "duration_quality": duration_quality,
+        "preview_available": generated_media,
+        "adoption_recommended": bool(
+            trial.get(
+                "adoption_recommended",
+                generated_media and duration_quality == "passed",
+            )
+        ),
+        "requires_duration_resolution": bool(
+            trial.get("requires_duration_resolution", recovered_preview)
+        ),
+        "warning": _error(warning, "TTS_TRIAL_WARNING"),
         "inference_seconds": _optional_number(trial.get("inference_seconds")),
         "rtf": _optional_number(trial.get("rtf")),
-        "error": _error(trial.get("error"), "TTS_TRIAL_FAILED"),
+        "error": None if recovered_preview else raw_error,
         "mock": bool(trial.get("mock", False)),
         "created_at": _string(trial.get("created_at")),
     }
@@ -288,8 +355,23 @@ def serialize_segment(
         "duration_error": _optional_number(
             segment.get("tts_duration_error", tts_result.get("duration_error"))
         ),
+        "duration_ratio": _optional_number(
+            segment.get("duration_ratio", tts_result.get("duration_ratio"))
+        ),
         "duration_quality": _optional_string(
             segment.get("tts_duration_quality", tts_result.get("duration_quality"))
+        ),
+        "native_duration_control": bool(
+            segment.get(
+                "tts_native_duration_control",
+                tts_result.get("native_duration_control", False),
+            )
+        ),
+        "unsafe_duration_compression": bool(
+            segment.get(
+                "tts_unsafe_duration_compression",
+                tts_result.get("unsafe_duration_compression", False),
+            )
         ),
         "inference_seconds": _optional_number(
             segment.get("tts_inference_seconds", tts_result.get("inference_seconds"))

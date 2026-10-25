@@ -4360,6 +4360,18 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
                     "tts_forced_atempo_factor": metadata.get(
                         "forced_atempo_factor"
                     ),
+                    "tts_native_duration_control": metadata.get(
+                        "native_duration_control", False
+                    ),
+                    "tts_unsafe_duration_compression": metadata.get(
+                        "unsafe_duration_compression", False
+                    ),
+                    "tts_maximum_safe_compression_ratio": metadata.get(
+                        "maximum_safe_compression_ratio"
+                    ),
+                    "tts_duration_anomaly": metadata.get(
+                        "duration_anomaly", False
+                    ),
                 })
                 selected_tts_text = str(metadata.get("tts_text") or "").strip()
                 if selected_tts_text:

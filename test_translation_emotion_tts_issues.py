@@ -594,6 +594,44 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(results[0]["tts_text"],"short")
             self.assertEqual(len(calls),1)
 
+    def test_unsafe_overlength_generation_uses_engine_fallback(self):
+        calls=[]
+        def worker(model,plan,result,force=False):
+            calls.append(model)
+            data=json.loads(Path(result).read_text())
+            for item in json.loads(Path(plan).read_text())["items"]:
+                duration=2.0 if model=="confucius4" else 1.0
+                wav(item["raw_path"],duration)
+                data[item["segment_id"]].update(status="success",generated_duration=duration)
+            Path(result).write_text(json.dumps(data)); return 0
+        def postprocess(src,dst,target,**_kwargs):
+            shutil.copy2(src,dst)
+            actual=tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration":actual,
+                "post_trim_duration":actual,
+                "actual_duration":actual,
+                "atempo_factor":1.0,
+                "atempo_raw_factor":actual/target,
+                "atempo_capped":actual>target,
+                **tts_router.duration_adaptation_safety(actual,target),
+            }
+        with tempfile.TemporaryDirectory() as tmp,patch(
+            "tts_router.preflight_models"
+        ),patch("tts_router._run_worker",side_effect=worker),patch(
+            "tts_router._postprocess",side_effect=postprocess
+        ),patch("tts_router.electricity_quality",return_value={}),patch(
+            "tts_router.voice_consistency_quality",return_value={}
+        ):
+            router=self.setup_router(tmp)
+            _,results=router.run([
+                dict(source(),tts_engine="confucius4")
+            ],"unused")
+        self.assertEqual(calls,["confucius4","f5tts"])
+        self.assertEqual(results[0]["status"],"success")
+        self.assertEqual(results[0]["actual_engine"],"f5tts")
+        self.assertIn("unsafe compression",results[0]["fallback_reason"])
+
     def test_formal_tts_can_request_two_targeted_retranslations(self):
         calls = []
         rewrites = iter(["rewrite one", "rewrite two"])
@@ -683,6 +721,47 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(results[0]["duration_selected_attempt"], 2)
         self.assertEqual(len(results[0]["duration_attempt_history"]), 3)
         self.assertEqual(len(clips), 1)
+
+    def test_f5_uses_native_duration_for_credible_near_miss(self):
+        calls=[]
+        def worker(model,plan,result,force=False):
+            data=json.loads(Path(result).read_text())
+            for item in json.loads(Path(plan).read_text())["items"]:
+                calls.append(bool(item.get("measure_natural_duration")))
+                duration=1.3 if item.get("measure_natural_duration") else 1.0
+                wav(item["raw_path"],duration)
+                data[item["segment_id"]].update(status="success",generated_duration=duration)
+            Path(result).write_text(json.dumps(data)); return 0
+        def postprocess(src,dst,target,**_kwargs):
+            shutil.copy2(src,dst)
+            actual=tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration":actual,"post_trim_duration":actual,
+                "actual_duration":actual,"atempo_factor":1.0,
+                "atempo_raw_factor":actual/target,"atempo_capped":False,
+                **tts_router.duration_adaptation_safety(actual,target),
+            }
+        with tempfile.TemporaryDirectory() as tmp,patch(
+            "tts_router.preflight_models"
+        ),patch("tts_router._run_worker",side_effect=worker),patch(
+            "tts_router._postprocess",side_effect=postprocess
+        ),patch("tts_router.electricity_quality",return_value={}),patch(
+            "tts_router.voice_consistency_quality",return_value={}
+        ):
+            router=self.setup_router(tmp)
+            router.duration_rewriter=lambda *_args,**_kwargs:None
+            segment=dict(source(),tts_engine="f5tts")
+            _,results=router.run([segment],"unused")
+            first_calls=list(calls)
+            calls.clear()
+            router.run([segment],"unused")
+        self.assertEqual(first_calls,[True,False])
+        self.assertEqual(calls,[])
+        self.assertTrue(results[0]["native_duration_control"])
+        self.assertEqual(
+            results[0]["duration_selection_reason"],
+            "f5_native_duration_final_pass",
+        )
 
 
 class QualityTests(unittest.TestCase):
