@@ -57,6 +57,25 @@ class ContentCompletenessTests(unittest.TestCase):
         )
         self.assertEqual(result["content_completeness_quality"], "failed")
 
+    def test_safe_chinese_particle_is_not_mistaken_for_missing_content(self):
+        result = content_completeness_quality("手给我", "把手给我", "zh")
+        self.assertEqual(result["content_completeness_quality"], "passed")
+        self.assertEqual(
+            result["content_completeness_match_rule"],
+            "expected_contained_with_safe_particles",
+        )
+        self.assertEqual(result["content_completeness_warnings"], [
+            "tts_asr_safe_extra=把"
+        ])
+
+    def test_added_negation_is_not_treated_as_a_safe_particle(self):
+        result = content_completeness_quality("给我", "别给我", "zh")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+
+    def test_missing_expected_particle_still_fails(self):
+        result = content_completeness_quality("把手给我", "手给我", "zh")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+
 
 def write_wav(path, duration_s, rate=16000, sample=None):
     """Write a mono 16-bit PCM WAV. `sample(i)` returns float in [-1, 1]."""

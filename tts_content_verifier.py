@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -41,7 +42,33 @@ def content_completeness_quality(
         threshold = max(threshold, float(os.getenv(
             "AUTODUB_TTS_CONTENT_ASR_SHORT_MIN_SIMILARITY", "0.90"
         )))
+    match_rule = "similarity"
+    warnings = []
     passed = bool(expected and recognized and ratio >= threshold)
+
+    # This verifier is a *completeness* gate, not a second translator.  Chinese
+    # ASR commonly restores a short grammatical particle that the translation
+    # omitted (for example expected ``手给我`` vs recognized ``把手给我``).
+    # Rejecting that as swallowed speech discards a complete, natural clip and
+    # needlessly sends it to a slower fallback model.  Permit only a small,
+    # explicit set of harmless boundary particles; missing expected characters,
+    # negation and arbitrary extra content remain blocking.
+    safe_extra = "把请啊呀吧呢了的嘛哦嗯哈哎"
+    if not passed and _language_code(language) == "zh" and expected:
+        position = recognized.find(expected)
+        if position >= 0:
+            extra = recognized[:position] + recognized[position + len(expected):]
+            max_extra = max(1, min(2, math.ceil(len(expected) * float(
+                os.getenv("AUTODUB_TTS_CONTENT_ASR_MAX_SAFE_EXTRA_RATIO", "0.25")
+            ))))
+            if (
+                extra
+                and len(extra) <= max_extra
+                and all(char in safe_extra for char in extra)
+            ):
+                passed = True
+                match_rule = "expected_contained_with_safe_particles"
+                warnings.append(f"tts_asr_safe_extra={extra}")
     return {
         "content_completeness_quality": "passed" if passed else "failed",
         "content_completeness_similarity": round(ratio, 6),
@@ -49,6 +76,8 @@ def content_completeness_quality(
         "content_expected_normalized": expected,
         "content_recognized_normalized": recognized,
         "content_asr_text": str(recognized_text or "").strip(),
+        "content_completeness_match_rule": match_rule,
+        "content_completeness_warnings": warnings,
         "content_completeness_reason": "" if passed else (
             f"tts_asr_similarity={ratio:.3f}<{threshold:.3f}"
         ),
