@@ -399,7 +399,7 @@ def stage_fingerprint(state, config, backend):
         if path.is_file():
             info=path.stat()
             media[key]={"path":str(path.resolve()),"size":info.st_size,"mtime_ns":info.st_mtime_ns}
-    payload={"version":"tts-stage-v2.7.0-strict-completeness-voice-lock","segments":segments,"media":media,"backend":backend,
+    payload={"version":"tts-stage-v2.8.0-pronounceable-window-reference-fallback","segments":segments,"media":media,"backend":backend,
              "input_file":state.get("input_file"),
              "target_lang":str(config.target_lang).lower(),
              "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs")))}

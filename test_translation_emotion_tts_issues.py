@@ -538,7 +538,7 @@ class RouterTests(unittest.TestCase):
                 clips,_=router.run(rows,"unused",force=True)
             self.assertEqual(clips[0]["allowed_overlap_seconds"],0.0)
 
-    def test_missing_speaker_reference_fails_instead_of_borrowing_another_voice(self):
+    def test_missing_speaker_reference_uses_marked_reliable_fallback(self):
         calls = []
         def postprocess(source_path, destination, target_duration):
             shutil.copy2(source_path, destination)
@@ -558,19 +558,18 @@ class RouterTests(unittest.TestCase):
                 side_effect=self.worker(calls, set()),
             ):
                 clips, results = router.run([segment], "unused")
-        self.assertEqual(clips, [])
-        self.assertEqual(results[0]["status"], "failed")
-        self.assertEqual(
-            results[0]["error"], "no_safe_reference_audio_for_speaker"
-        )
-        self.assertEqual(calls, [])
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(results[0]["status"], "success")
+        self.assertTrue(results[0]["reference_fallback"])
+        self.assertEqual(results[0]["reference_fallback_speaker"], "A")
+        self.assertEqual(calls, ["f5tts"])
 
-    def test_cross_speaker_reference_is_explicit_legacy_opt_in(self):
+    def test_cross_speaker_reference_can_be_explicitly_disabled(self):
         calls = []
         with tempfile.TemporaryDirectory() as tmp, patch(
             "tts_router.preflight_models"
         ), patch.dict(os.environ, {
-            "AUTODUB_TTS_ALLOW_CROSS_SPEAKER_REFERENCE": "1"
+            "AUTODUB_TTS_ALLOW_CROSS_SPEAKER_REFERENCE": "0"
         }):
             router = self.setup_router(tmp)
             with patch(
@@ -579,9 +578,35 @@ class RouterTests(unittest.TestCase):
                 clips, results = router.run([
                     dict(source(), speaker="B", tts_engine="f5tts")
                 ], "unused")
+        self.assertEqual(clips, [])
+        self.assertEqual(results[0]["status"], "failed")
+        self.assertEqual(
+            results[0]["error"], "no_safe_reference_audio_for_speaker"
+        )
+        self.assertEqual(calls, [])
+
+    def test_target_text_floor_expands_collapsed_timing_inside_hard_window(self):
+        calls = []
+        captured = []
+
+        def worker(model, plan, result, force=False):
+            payload = json.loads(Path(plan).read_text())["items"]
+            captured.extend(payload)
+            return self.worker(calls, set())(model, plan, result, force)
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ), patch("tts_router._run_worker", side_effect=worker):
+            router = self.setup_router(tmp)
+            segment = dict(
+                source(text="把手给我"), end=1.2, tts_engine="f5tts",
+                target_lang="zh", tts_placement_start=0.0,
+                tts_target_duration=0.15, tts_hard_end=1.2,
+            )
+            clips, results = router.run([segment], "unused")
         self.assertEqual(len(clips), 1)
-        self.assertTrue(results[0]["reference_fallback"])
-        self.assertEqual(results[0]["reference_fallback_speaker"], "A")
+        self.assertAlmostEqual(captured[0]["target_duration"], 0.72)
+        self.assertTrue(results[0]["target_duration_floor_applied"])
 
     def test_same_voice_identity_uses_one_dominant_engine(self):
         calls = []

@@ -179,7 +179,15 @@ def attach_precise_tts_placement(
         word_end = word_ranges[-1][1]
         acoustic = intersect_ranges(active, [(word_start - 0.25, word_end + 0.25)])
         onset = max(outer_start, word_start - float(pre_roll))
-        hard_end = min(outer_end, word_end + float(post_roll))
+        # ``aligned_end`` is evidence for how long the source actually spoke;
+        # it is not the physical end of the dubbing slot.  Keeping those two
+        # concepts in one variable used to collapse a short interjection to a
+        # 0.15 s hard window even when the sentence owned trailing silence.
+        # The router will still clip the physical window at the next dub onset,
+        # so exposing the remainder of this sentence cannot create a new
+        # collision.
+        aligned_end = min(outer_end, word_end + float(post_roll))
+        hard_end = aligned_end
         if acoustic:
             first_acoustic = acoustic[0][0]
             if abs(first_acoustic - word_start) <= 0.25:
@@ -187,7 +195,7 @@ def attach_precise_tts_placement(
                 # It may refine a loose pre-roll but must never push dubbing
                 # past the first aligned word onset and make a short line late.
                 onset = min(word_start, max(onset, first_acoustic - 0.03))
-        speech_islands = intersect_ranges(active, [(onset, hard_end)]) or word_ranges
+        speech_islands = intersect_ranges(active, [(onset, aligned_end)]) or word_ranges
         ambiguous = bool(segment.get("speaker_boundary_ambiguous"))
         timing_reason = "word_vad_consensus"
         ratio_guard = None
@@ -234,6 +242,7 @@ def attach_precise_tts_placement(
                 onset, hard_end = guarded_start, guarded_end
                 speech_islands = [(guarded_start, guarded_end)]
             timing_reason = "ambiguous_word_span_ratio_guard"
+            aligned_end = hard_end
             ratio_guard = {
                 "word_span": round(word_span, 3),
                 "text_duration_centre": round(duration_centre, 3),
@@ -254,7 +263,20 @@ def attach_precise_tts_placement(
             )
         else:
             effective = max(effective, word_effective)
-        effective = min(max(0.1, effective + pre_roll + post_roll), hard_end - onset)
+        # A word/VAD span may be shorter than a humanly pronounceable version
+        # of the complete sentence (especially unvoiced consonants and one-word
+        # turns).  It remains a natural-duration target, not permission to
+        # overlap the next turn.
+        minimum_pronounceable = min(
+            max(0.1, duration_centre),
+            max(0.1, outer_end - onset),
+        )
+        effective = max(effective + pre_roll + post_roll, minimum_pronounceable)
+        effective = min(max(0.1, effective), max(0.1, outer_end - onset))
+        # Make trailing silence owned by the sentence available for fitting.
+        # The chronological collision pass in TTSRouter remains authoritative
+        # and will reduce this to the next onset when necessary.
+        hard_end = outer_end
         internal_pauses = [
             [round(left[1], 3), round(right[0], 3)]
             for left, right in zip(word_ranges, word_ranges[1:])
@@ -264,6 +286,10 @@ def attach_precise_tts_placement(
             "tts_placement_start": round(onset, 3),
             "tts_hard_end": round(hard_end, 3),
             "tts_target_duration": round(effective, 3),
+            "tts_aligned_speech_end": round(aligned_end, 3),
+            "tts_minimum_pronounceable_duration": round(
+                minimum_pronounceable, 3
+            ),
             "tts_speech_islands": [
                 [round(start, 3), round(end, 3)] for start, end in speech_islands
             ],

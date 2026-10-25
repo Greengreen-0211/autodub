@@ -312,6 +312,23 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertLessEqual(refined[0]["tts_placement_start"], 7.76)
         self.assertGreaterEqual(refined[0]["tts_target_duration"], 0.70)
 
+    def test_precise_short_word_keeps_trailing_silence_as_physical_window(self):
+        segment = {
+            "id": 4, "start": 20.0, "end": 21.2,
+            "text": "Go.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Go", "start": 20.10, "end": 20.25},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(20.08, 20.28)]
+        )
+        row = refined[0]
+        self.assertEqual(row["tts_aligned_speech_end"], 20.33)
+        self.assertEqual(row["tts_hard_end"], 21.2)
+        self.assertGreaterEqual(row["tts_target_duration"], 0.35)
+        self.assertEqual(audit[0]["hard_end"], 21.2)
+
     def test_ambiguous_implausible_word_span_uses_local_ratio_guard(self):
         segment = {
             "id": 7, "start": 43.49, "end": 49.61,
@@ -333,7 +350,14 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertEqual(
             row["tts_timing_reason"], "ambiguous_word_span_ratio_guard"
         )
-        self.assertLess(row["tts_hard_end"] - row["tts_placement_start"], 3.6)
+        # The ambiguous word span still controls the natural speech target,
+        # while the sentence's trailing silence remains a separate physical
+        # fitting window.
+        self.assertLess(
+            row["tts_aligned_speech_end"] - row["tts_placement_start"],
+            3.6,
+        )
+        self.assertEqual(row["tts_hard_end"], row["end"])
         self.assertLess(row["tts_target_duration"], 3.6)
         self.assertLess(row["tts_timing_confidence"], 0.7)
         self.assertIsNotNone(audit[0]["ratio_guard"])

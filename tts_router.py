@@ -142,6 +142,41 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _minimum_pronounceable_duration(text: Any, language: Any = "") -> float:
+    """Return a conservative lower speech budget for complete target text.
+
+    This is deliberately a floor rather than a duration predictor.  It keeps
+    a collapsed ASR/VAD span from asking a TTS model to pronounce a complete
+    line in an impossible fraction of a second, while the hard collision
+    window remains the final upper bound.
+    """
+    value = str(text or "").strip()
+    cjk = len(re.findall(r"[\u3400-\u9fff]", value))
+    words = len(re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", value))
+    clauses = len([
+        part for part in re.split(r"[，,。.!！？?；;：:]+", value)
+        if any(char.isalnum() or "\u3400" <= char <= "\u9fff" for char in part)
+    ])
+    if cjk:
+        seconds = cjk * float(
+            os.getenv("AUTODUB_TTS_MIN_TARGET_SECONDS_PER_CJK", "0.18")
+        )
+    elif words:
+        seconds = words * float(
+            os.getenv("AUTODUB_TTS_MIN_TARGET_SECONDS_PER_WORD", "0.22")
+        )
+    else:
+        seconds = len(value) * 0.08
+    if clauses > 1:
+        seconds += (clauses - 1) * float(
+            os.getenv("AUTODUB_TTS_MIN_TARGET_SECONDS_PER_EXTRA_CLAUSE", "0.10")
+        )
+    return max(
+        float(os.getenv("AUTODUB_TTS_MIN_TARGET_UTTERANCE_SECONDS", "0.35")),
+        seconds,
+    )
+
+
 def _request_fingerprint(item: Dict[str, Any]) -> str:
     payload = {
         key: item.get(key)
@@ -151,7 +186,7 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
             "measure_natural_duration", "translation_selection_source",
         )
     }
-    payload["version"] = "tts-request-v2.7.0-strict-completeness-voice-lock"
+    payload["version"] = "tts-request-v2.8.0-pronounceable-window-reference-fallback"
     payload["worker_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_worker.py").read_bytes()).hexdigest()
     payload["policy_sha256"] = hashlib.sha256(Path(__file__).with_name("scheme3_policy.py").read_bytes()).hexdigest()
     payload["quality_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_quality.py").read_bytes()).hexdigest()
@@ -949,14 +984,20 @@ class TTSRouter:
         segment: Dict[str, Any], references: Dict[str, Dict[str, Any]]
     ) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
         """Return the temporally nearest precise reference as a no-drop fallback."""
-        if not references:
+        eligible = {
+            speaker: reference
+            for speaker, reference in references.items()
+            if str(reference.get("reference_reliability", "reliable"))
+            == "reliable"
+        }
+        if not eligible:
             return None, None
         center = (
             float(segment.get("start", 0.0))
             + float(segment.get("end", segment.get("start", 0.0)))
         ) / 2.0
         speaker, reference = min(
-            references.items(),
+            eligible.items(),
             key=lambda item: (
                 abs(
                     center
@@ -997,7 +1038,7 @@ class TTSRouter:
             reference_fallback_speaker = None
             reference_fallback_reason = ""
             if reference is None and _env_bool(
-                "AUTODUB_TTS_ALLOW_CROSS_SPEAKER_REFERENCE", False
+                "AUTODUB_TTS_ALLOW_CROSS_SPEAKER_REFERENCE", True
             ):
                 reference_fallback_speaker, reference = self._nearest_safe_reference(
                     segment, references
@@ -1020,14 +1061,22 @@ class TTSRouter:
                     f"⚠️ segment={segment_id} speaker={speaker} 没有安全参考音频；"
                     f"使用最近可靠声纹 {reference_fallback_speaker}，保留整句并标记降级"
                 )
-            placement_start, duration, hard_end = _tts_window(segment)
+            placement_start, source_duration, hard_end = _tts_window(segment)
             raw_emotion = segment.get("raw_emotion", segment.get("emotion_raw", segment.get("emotion")))
             if "emotion_reliable" in segment:
                 emotion = normalize_emotion(segment.get("emotion")) if segment["emotion_reliable"] else "neutral"
             else:
-                emotion = normalize_emotion(raw_emotion, score=segment.get("emotion_score"), duration=duration)
+                emotion = normalize_emotion(raw_emotion, score=segment.get("emotion_score"), duration=source_duration)
             target = normalize_language(segment.get("target_lang", self.config.target_lang))
             target_raw = str(segment.get("target_lang_raw", self.config.target_lang)).lower()
+            hard_duration = max(0.0, hard_end - placement_start)
+            minimum_pronounceable = _minimum_pronounceable_duration(
+                text, target
+            )
+            duration = min(
+                hard_duration,
+                max(source_duration, minimum_pronounceable),
+            )
             if self.scheme == "scheme3":
                 model, expected, missing = resolve_scheme3_engine(segment, target, emotion, text)
                 if missing or model != expected:
@@ -1048,6 +1097,11 @@ class TTSRouter:
                 "emotion": emotion, "emotion_score": segment.get("emotion_score"),
                 "speaker": speaker, "ref_audio": reference["audio"],
                 "ref_text": reference["text"], "target_duration": duration,
+                "source_target_duration": source_duration,
+                "minimum_pronounceable_duration": minimum_pronounceable,
+                "target_duration_floor_applied": (
+                    duration > source_duration + 0.001
+                ),
                 "reference_segment_id": reference.get("source_segment_id"),
                 "reference_purity_score": reference.get("purity_score"),
                 "reference_duration": reference.get("duration"),
@@ -1059,7 +1113,7 @@ class TTSRouter:
                 "reference_fallback_reason": reference_fallback_reason,
                 "start": placement_start, "model": model, "tts_engine": model,
                 "end": hard_end,
-                "hard_duration": max(0.0, hard_end - placement_start),
+                "hard_duration": hard_duration,
                 "allow_overlap": False,
                 "allowed_overlap_seconds": 0.0,
                 "source_overlap_evidence": "none",
@@ -1295,6 +1349,13 @@ class TTSRouter:
                             tts_text=item["text"], planned_text=item["planned_text"],
                             planned_request_fingerprint=item["planned_request_fingerprint"],
                             request_fingerprint=item["request_fingerprint"], target_duration=item["target_duration"],
+                            source_target_duration=item.get("source_target_duration"),
+                            minimum_pronounceable_duration=item.get(
+                                "minimum_pronounceable_duration"
+                            ),
+                            target_duration_floor_applied=bool(
+                                item.get("target_duration_floor_applied", False)
+                            ),
                             generation_request={k:item[k] for k in ("text","language","target_language","emotion",
                                                "speaker","ref_audio","ref_text","target_duration","start","model",
                                                "reference_segment_id","reference_purity_score",
