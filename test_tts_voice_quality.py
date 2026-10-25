@@ -25,6 +25,7 @@ from tts_quality import (
     electricity_quality,
     voice_consistency_quality,
 )
+from tts_content_verifier import content_completeness_quality
 
 HAS_LIBROSA = importlib.util.find_spec("librosa") is not None
 
@@ -37,6 +38,24 @@ class VoiceConsistencyTests(unittest.TestCase):
             result = voice_consistency_quality("missing.wav", "missing.wav")
         self.assertEqual(result["voice_consistency_quality"], "skipped")
         self.assertEqual(result["voice_consistency_policy"], "off")
+
+
+class ContentCompletenessTests(unittest.TestCase):
+    def test_short_chinese_line_rejects_one_swallowed_character(self):
+        result = content_completeness_quality("杰克你好", "杰你好", "zh")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+
+    def test_punctuation_difference_does_not_fail_complete_speech(self):
+        result = content_completeness_quality(
+            "现在闭上眼睛，走吧。", "现在闭上眼睛走吧", "zh"
+        )
+        self.assertEqual(result["content_completeness_quality"], "passed")
+
+    def test_missing_english_word_is_rejected_for_short_line(self):
+        result = content_completeness_quality(
+            "Give me your hand", "Give me hand", "en"
+        )
+        self.assertEqual(result["content_completeness_quality"], "failed")
 
 
 def write_wav(path, duration_s, rate=16000, sample=None):

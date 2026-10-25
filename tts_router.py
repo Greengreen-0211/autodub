@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import wave
 from pathlib import Path
@@ -150,10 +151,13 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
             "measure_natural_duration", "translation_selection_source",
         )
     }
-    payload["version"] = "tts-request-v2.6.0-context-ratio-overlap"
+    payload["version"] = "tts-request-v2.7.0-strict-completeness-voice-lock"
     payload["worker_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_worker.py").read_bytes()).hexdigest()
     payload["policy_sha256"] = hashlib.sha256(Path(__file__).with_name("scheme3_policy.py").read_bytes()).hexdigest()
     payload["quality_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_quality.py").read_bytes()).hexdigest()
+    payload["content_verifier_sha256"] = hashlib.sha256(
+        Path(__file__).with_name("tts_content_verifier.py").read_bytes()
+    ).hexdigest()
     configuration_keys = {
         "f5tts":("F5TTS_REPO","F5TTS_MODEL_PATH","F5TTS_VOCODER_LOCAL_PATH"),
         "indextts2":("INDEX_TTS_ROOT","INDEX_TTS_MODEL_DIR"),
@@ -179,10 +183,14 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
     payload["quality_policy"] = {
         "electricity": os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY", "warn"),
         "voice_consistency": os.getenv(
-            "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY", "warn"
+            "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY", "block"
         ),
         "minimum_voice_consistency": os.getenv(
             "AUTODUB_TTS_MIN_VOICE_CONSISTENCY", "0.45"
+        ),
+        "content_asr_enabled": os.getenv("AUTODUB_TTS_CONTENT_ASR_ENABLED", "auto"),
+        "content_asr_min_similarity": os.getenv(
+            "AUTODUB_TTS_CONTENT_ASR_MIN_SIMILARITY", "language_default"
         ),
     }
     ref_audio = Path(str(item.get("ref_audio") or ""))
@@ -608,6 +616,82 @@ class TTSRouter:
         self.duration_rewriter = duration_rewriter
         self.duration_candidate_selector = duration_candidate_selector
 
+    def _content_asr_enabled(self) -> bool:
+        configured = os.getenv("AUTODUB_TTS_CONTENT_ASR_ENABLED")
+        if configured is not None:
+            return configured.strip().lower() in {"1", "true", "yes", "on"}
+        model_dir = os.getenv("QWEN3_ASR_MODEL_DIR", "").strip()
+        return bool(model_dir and Path(model_dir).is_dir())
+
+    def _run_content_asr_audit(self, items, results):
+        """Batch-transcribe successful TTS and reject swallowed content."""
+        if not self._content_asr_enabled():
+            return results
+        updated = dict(results)
+        pending = []
+        for item in items:
+            metadata = updated.get(item["segment_id"], {})
+            if metadata.get("status") != "success":
+                continue
+            if (
+                metadata.get("content_completeness_quality") == "passed"
+                and metadata.get("content_asr_request_fingerprint")
+                == item.get("request_fingerprint")
+            ):
+                continue
+            path = Path(str(metadata.get("file") or item.get("final_path") or ""))
+            if path.is_file():
+                pending.append({
+                    "segment_id": item["segment_id"],
+                    "text": item["text"],
+                    "language": item["target_language"],
+                    "file": str(path),
+                    "request_fingerprint": item["request_fingerprint"],
+                })
+        if not pending:
+            return updated
+        plan = self.root / "content_asr_plan.json"
+        output = self.root / "content_asr_results.json"
+        _atomic_json(plan, {"items": pending})
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("tts_content_verifier.py")),
+                "--plan", str(plan), "--output", str(output),
+            ],
+            check=False,
+            env=os.environ.copy(),
+        )
+        if completed.returncode != 0 or not output.is_file():
+            raise RuntimeError(
+                "TTS content ASR verification failed; refusing an unchecked final video"
+            )
+        audits = json.loads(output.read_text(encoding="utf-8"))
+        for row in pending:
+            sid = str(row["segment_id"])
+            metadata = dict(updated.get(sid, {}))
+            audit = dict(audits.get(sid) or {})
+            if not audit:
+                raise RuntimeError(f"TTS content ASR omitted segment {sid}")
+            metadata.update(audit)
+            metadata["content_asr_request_fingerprint"] = row[
+                "request_fingerprint"
+            ]
+            if audit.get("content_completeness_quality") != "passed":
+                metadata.update(
+                    status="failed",
+                    error=(
+                        "TTS content incomplete after ASR verification: "
+                        + str(audit.get("content_completeness_reason") or "mismatch")
+                    ),
+                    preview_file=metadata.get("file"),
+                    preview_available=True,
+                    adoption_recommended=False,
+                )
+            updated[sid] = metadata
+        _atomic_json(self.result_path, updated)
+        return updated
+
     @staticmethod
     def _reference_score(segment: Dict[str, Any], clip: Any) -> float:
         from pydub import silence
@@ -709,6 +793,10 @@ class TTSRouter:
                 "source_segment_id": str(source_segment.get("id", source_index)),
                 "purity_score": round(float(score), 4),
                 "duration": round(len(audio) / 1000.0, 3),
+                "assignment_confidence": float(
+                    source_segment.get("speaker_assignment_confidence", 1.0)
+                    or 0.0
+                ),
             }
             manifest["speakers"][speaker] = {
                 "candidate_count": len(candidates),
@@ -747,6 +835,9 @@ class TTSRouter:
         minimum_reliable = float(os.getenv(
             "AUTODUB_TTS_MIN_RELIABLE_REFERENCE_SECONDS", "1.50"
         ))
+        minimum_reference_confidence = float(os.getenv(
+            "AUTODUB_TTS_MIN_RELIABLE_REFERENCE_CONFIDENCE", "0.72"
+        ))
         similarities = []
         similarity_by_pair = {}
         reference_names = sorted(references)
@@ -773,6 +864,8 @@ class TTSRouter:
         anchors = [
             name for name in reference_names
             if float(references[name].get("duration", 0.0)) >= minimum_reliable
+            and float(references[name].get("assignment_confidence", 1.0))
+            >= minimum_reference_confidence
         ]
         voice_identity_map = {name: name for name in reference_names}
         for speaker in reference_names:
@@ -815,8 +908,15 @@ class TTSRouter:
                 ),
                 "original_reference_duration": original.get("duration"),
                 "reference_reliability": (
-                    "reliable" if float(canonical_reference.get("duration", 0.0))
-                    >= minimum_reliable else "short_degraded"
+                    "reliable"
+                    if (
+                        float(canonical_reference.get("duration", 0.0))
+                        >= minimum_reliable
+                        and float(canonical_reference.get(
+                            "assignment_confidence", 1.0
+                        )) >= minimum_reference_confidence
+                    )
+                    else "short_or_low_confidence_degraded"
                 ),
             }
             manifest["speakers"][speaker].update({
@@ -836,6 +936,7 @@ class TTSRouter:
             "version": 3,
             "policy": "sentence_boundaries_preserved_voice_identity_reuse_v1",
             "minimum_reliable_reference_seconds": minimum_reliable,
+            "minimum_reliable_reference_confidence": minimum_reference_confidence,
             "voice_identity_similarity_threshold": similarity_threshold,
             "voice_identity_map": voice_identity_map,
             "voice_identity_similarities": similarities,
@@ -895,7 +996,9 @@ class TTSRouter:
             reference = references.get(speaker)
             reference_fallback_speaker = None
             reference_fallback_reason = ""
-            if reference is None:
+            if reference is None and _env_bool(
+                "AUTODUB_TTS_ALLOW_CROSS_SPEAKER_REFERENCE", False
+            ):
                 reference_fallback_speaker, reference = self._nearest_safe_reference(
                     segment, references
                 )
@@ -903,7 +1006,7 @@ class TTSRouter:
                 failure = {
                     "segment_id": segment_id,
                     "status": "failed",
-                    "error": "no_safe_reference_audio_any_speaker",
+                    "error": "no_safe_reference_audio_for_speaker",
                     "planned_engine": segment.get("tts_engine"),
                     "actual_engine": None,
                     "fallback_count": 0,
@@ -975,6 +1078,61 @@ class TTSRouter:
             job["request_fingerprint"] = _request_fingerprint(job)
             job["planned_request_fingerprint"] = job["request_fingerprint"]
             items.append(job)
+
+        # A per-sentence emotion route can make one character change timbre
+        # every few seconds even when every individual generation is valid.
+        # Keep the rule decision for audit, but use one dominant engine for all
+        # sentences sharing the same acoustic voice identity. Engine fallback
+        # is still available when that dominant engine cannot generate a
+        # complete utterance.
+        if _env_bool("AUTODUB_TTS_SPEAKER_ENGINE_LOCK", True):
+            by_identity: Dict[str, List[Dict[str, Any]]] = {}
+            for item in items:
+                by_identity.setdefault(
+                    str(item.get("voice_identity") or item["speaker"]), []
+                ).append(item)
+            for identity, identity_items in by_identity.items():
+                if len(identity_items) < 2:
+                    continue
+                engine_stats: Dict[str, tuple[int, float]] = {}
+                for item in identity_items:
+                    engine = str(item["planned_engine"])
+                    count, seconds = engine_stats.get(engine, (0, 0.0))
+                    engine_stats[engine] = (
+                        count + 1,
+                        seconds + float(item.get("target_duration") or 0.0),
+                    )
+                locked_engine = max(
+                    engine_stats,
+                    key=lambda engine: (
+                        engine_stats[engine][0],
+                        engine_stats[engine][1],
+                        -MODEL_ORDER.index(engine),
+                    ),
+                )
+                if len(engine_stats) > 1:
+                    print(
+                        f"🔒 voice_identity={identity} 固定 TTS 引擎为 "
+                        f"{locked_engine}；原路由={engine_stats}"
+                    )
+                for item in identity_items:
+                    rule_engine = str(item["planned_engine"])
+                    item["rule_planned_engine"] = rule_engine
+                    item["speaker_engine_locked"] = rule_engine != locked_engine
+                    item["model"] = locked_engine
+                    item["tts_engine"] = locked_engine
+                    item["planned_engine"] = locked_engine
+                    item["attempted_engines"] = [locked_engine]
+                    item["language"] = (
+                        _language_code(item["target_language_raw"])
+                        if locked_engine == "omnivoice"
+                        else item["target_language"]
+                    )
+                    self._job_paths(item)
+                    item["request_fingerprint"] = _request_fingerprint(item)
+                    item["planned_request_fingerprint"] = item[
+                        "request_fingerprint"
+                    ]
 
         # The next dub onset is the final collision boundary. Apply it before
         # synthesis so duration feedback targets a physically usable slot,
@@ -1084,6 +1242,7 @@ class TTSRouter:
         # worker/quality failure instead of being hidden by extreme atempo.
         if self.duration_rewriter is not None:
             previous = self._run_duration_retranslation(items, previous)
+        previous = self._run_content_asr_audit(items, previous)
 
         if not getattr(self.config, "disable_tts_fallback", False):
             # Planned engine plus at most two fallback engines. A moderate
@@ -1120,12 +1279,15 @@ class TTSRouter:
                 previous = _load_results(self.result_path)
                 if self.duration_rewriter is not None:
                     previous = self._run_duration_retranslation(retry, previous)
+                previous = self._run_content_asr_audit(retry, previous)
 
         clips, output_rows = [], []
         for item in items:
             sid = item["segment_id"]
             metadata = dict(previous.get(sid, {}))
             metadata.update(segment_id=sid, planned_engine=item["planned_engine"],
+                            rule_planned_engine=item.get("rule_planned_engine", item["planned_engine"]),
+                            speaker_engine_locked=bool(item.get("speaker_engine_locked", False)),
                             actual_engine=item["model"], tts_engine=item["model"],
                             model_key=item["model"], model=MODEL_DISPLAY[item["model"]],
                             selected_model=MODEL_DISPLAY[item["model"]],
@@ -1645,7 +1807,8 @@ class TTSRouter:
                                 os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY","warn").strip().lower()=="block"):
                             metadata.update(status="failed", error=metadata.get("electricity_reason","electric artifact detected"))
                         elif (metadata.get("voice_consistency_quality")=="failed" and
-                                os.getenv("AUTODUB_TTS_VOICE_CONSISTENCY_POLICY","warn").strip().lower()=="block"):
+                                os.getenv("AUTODUB_TTS_VOICE_CONSISTENCY_POLICY","block").strip().lower()=="block" and
+                                item.get("reference_reliability", "reliable") == "reliable"):
                             metadata.update(status="failed", error=metadata.get("voice_consistency_reason","voice consistency check failed"))
                         elif (
                             metadata.get("unsafe_duration_compression")

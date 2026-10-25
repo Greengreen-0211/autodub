@@ -1,6 +1,6 @@
 import unittest
 
-from mix_timing import plan_mix_windows
+from mix_timing import plan_mix_windows, validate_mix_audit
 
 
 class MixTimingTests(unittest.TestCase):
@@ -34,6 +34,29 @@ class MixTimingTests(unittest.TestCase):
         ], 10.0)
         self.assertEqual(planned[0]["hard_end"], 10.0)
         self.assertEqual(planned[0]["available_ms"], 1500)
+
+    def test_mix_audit_requires_every_verified_clip(self):
+        with self.assertRaisesRegex(RuntimeError, "missing=.*2"):
+            validate_mix_audit(["1", "2"], [{
+                "segment_id": "1", "audible_duration": 1.0,
+                "original_wav_duration": 1.0, "clip_rms": 100,
+                "mix_verified": True,
+            }])
+
+    def test_mix_audit_blocks_tail_truncation_that_can_swallow_words(self):
+        with self.assertRaisesRegex(RuntimeError, "would trim"):
+            validate_mix_audit(["1"], [{
+                "segment_id": "1", "audible_duration": 0.7,
+                "original_wav_duration": 1.0, "clip_rms": 100,
+                "mix_verified": True,
+            }])
+
+    def test_mix_audit_accepts_complete_non_silent_clip(self):
+        validate_mix_audit(["1"], [{
+            "segment_id": "1", "audible_duration": 1.0,
+            "original_wav_duration": 1.0, "clip_rms": 100,
+            "mix_verified": True,
+        }])
 
 
 if __name__ == "__main__":

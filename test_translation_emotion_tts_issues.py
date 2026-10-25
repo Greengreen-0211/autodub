@@ -520,6 +520,10 @@ class RouterTests(unittest.TestCase):
         calls=[]
         with tempfile.TemporaryDirectory() as tmp, patch("tts_router.preflight_models"):
             router=self.setup_router(tmp)
+            reference = router._speaker_references(None, None)["A"]
+            router._speaker_references = lambda *_args: {
+                "A": dict(reference), "B": dict(reference)
+            }
             rows=[
                 dict(source(0), start=0.0, end=2.0, speaker="A", tts_engine="f5tts"),
                 dict(source(1), start=1.6, end=2.6, speaker="B", tts_engine="f5tts"),
@@ -534,7 +538,7 @@ class RouterTests(unittest.TestCase):
                 clips,_=router.run(rows,"unused",force=True)
             self.assertEqual(clips[0]["allowed_overlap_seconds"],0.0)
 
-    def test_missing_speaker_reference_uses_nearest_safe_reference(self):
+    def test_missing_speaker_reference_fails_instead_of_borrowing_another_voice(self):
         calls = []
         def postprocess(source_path, destination, target_duration):
             shutil.copy2(source_path, destination)
@@ -554,10 +558,53 @@ class RouterTests(unittest.TestCase):
                 side_effect=self.worker(calls, set()),
             ):
                 clips, results = router.run([segment], "unused")
+        self.assertEqual(clips, [])
+        self.assertEqual(results[0]["status"], "failed")
+        self.assertEqual(
+            results[0]["error"], "no_safe_reference_audio_for_speaker"
+        )
+        self.assertEqual(calls, [])
+
+    def test_cross_speaker_reference_is_explicit_legacy_opt_in(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ), patch.dict(os.environ, {
+            "AUTODUB_TTS_ALLOW_CROSS_SPEAKER_REFERENCE": "1"
+        }):
+            router = self.setup_router(tmp)
+            with patch(
+                "tts_router._run_worker", side_effect=self.worker(calls, set())
+            ):
+                clips, results = router.run([
+                    dict(source(), speaker="B", tts_engine="f5tts")
+                ], "unused")
         self.assertEqual(len(clips), 1)
-        self.assertEqual(results[0]["status"], "success")
         self.assertTrue(results[0]["reference_fallback"])
         self.assertEqual(results[0]["reference_fallback_speaker"], "A")
+
+    def test_same_voice_identity_uses_one_dominant_engine(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ):
+            router = self.setup_router(tmp)
+            rows = [
+                dict(source(0), tts_engine="f5tts"),
+                dict(source(1), tts_engine="f5tts"),
+                dict(source(2), tts_engine="cosyvoice3"),
+            ]
+            with patch(
+                "tts_router._run_worker", side_effect=self.worker(calls, set())
+            ):
+                _, results = router.run(rows, "unused")
+        self.assertEqual(calls, ["f5tts"])
+        self.assertEqual({row["planned_engine"] for row in results}, {"f5tts"})
+        self.assertEqual(
+            [row["rule_planned_engine"] for row in results],
+            ["f5tts", "f5tts", "cosyvoice3"],
+        )
+        self.assertTrue(results[2]["speaker_engine_locked"])
 
     def test_preflight_precedes_any_worker(self):
         with tempfile.TemporaryDirectory() as tmp, patch("tts_router.preflight_models",side_effect=RuntimeError("missing Vocos")),patch("tts_router._run_worker") as worker:
@@ -833,7 +880,11 @@ class QualityTests(unittest.TestCase):
             state,config=self.mix(tmp);validate_mix_state(state,config)
             with self.assertRaises(RuntimeError):validate_mix_state(state,SimpleNamespace(target_lang="zh"))
             Path(state["audio_clips"][0]["file"]).unlink()
-            issues=validate_mix_state(state,config)
+            with self.assertRaises(RuntimeError):
+                validate_mix_state(state,config)
+            issues=validate_mix_state(
+                state,config,allow_missing=True,filter_missing=True
+            )
             self.assertTrue(issues)
             self.assertEqual(state["audio_clips"],[])
 
@@ -869,6 +920,21 @@ class QualityTests(unittest.TestCase):
             result = audible_speech_quality(path, expected_text="把手给我")
             self.assertEqual(result["audible_speech_quality"], "failed")
             self.assertIn("near_silent", result["audible_speech_reason"])
+
+    def test_multi_clause_audio_requires_enough_voiced_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial.wav"
+            with wave.open(str(path), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(1000)
+                stream.writeframes(b"\x10\x27" * 400 + b"\x00\x00" * 600)
+            result = audible_speech_quality(
+                path, expected_text="现在闭上眼睛，走吧。"
+            )
+            self.assertEqual(result["expected_clause_count"], 2)
+            self.assertEqual(result["acoustic_completeness_quality"], "failed")
+            self.assertIn("voiced_ratio_low", result["audible_speech_reason"])
 
     def test_light_duration_fit_is_ratio_based_and_ocr_aware(self):
         standard = LightTTSSelector._duration_fit(2.6, 2.0, 3.0, "standard")

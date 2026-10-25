@@ -3622,7 +3622,7 @@ class Mixer:
     def run(self, audio_clips_info: List[Dict[str, Any]], accomp_path: str, original_video: str, duration: float) -> None:
         print("--- [Step 5] 混音 ---")
         final_audio = AudioSegment.silent(duration=int(duration * 1000))
-        from mix_timing import plan_mix_windows
+        from mix_timing import plan_mix_windows, validate_mix_audit
 
         ordered_clips = plan_mix_windows(audio_clips_info, duration)
         bounded_count = 0
@@ -3674,12 +3674,27 @@ class Mixer:
                         "source_overlap_evidence", "none"
                     ),
                     "truncated_to_window": original_duration > audible_duration + 0.001,
+                    "clip_rms": int(clip.rms),
                 })
                 final_audio = final_audio.overlay(
                     clip, position=int(round(start * 1000))
                 )
+        for row in mix_audit:
+            window_start = int(round(float(row["start"]) * 1000))
+            window_end = int(round(float(row["audible_end"]) * 1000))
+            row["stem_window_rms"] = int(final_audio[window_start:window_end].rms)
+            row["mix_verified"] = row["stem_window_rms"] > 0
+        validate_mix_audit(
+            [item.get("segment_id", index) for index, item in enumerate(ordered_clips)],
+            mix_audit,
+            maximum_trim_seconds=float(
+                os.getenv("AUTODUB_TTS_MAX_STEP5_TRIM_SECONDS", "0.03")
+            ),
+        )
         if bounded_count:
-            print(f"⚠️ {bounded_count} 个超时 TTS 片段已限制在各自混音窗口内，未覆盖下一句。")
+            print(
+                f"ℹ️ {bounded_count} 个 TTS 片段仅进行了不超过允许阈值的尾部取整。"
+            )
         if os.path.exists(accomp_path):
             bg = AudioSegment.from_wav(accomp_path)
             final_audio = final_audio.overlay(bg - 6)
@@ -4421,6 +4436,12 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
                     "tts_model": metadata.get("model"),
                     "selected_model": metadata.get("selected_model", metadata.get("model")),
                     "planned_engine": metadata.get("planned_engine"),
+                    "rule_planned_engine": metadata.get(
+                        "rule_planned_engine", metadata.get("planned_engine")
+                    ),
+                    "tts_speaker_engine_locked": metadata.get(
+                        "speaker_engine_locked", False
+                    ),
                     "actual_engine": metadata.get("actual_engine"),
                     "fallback_reason": metadata.get("fallback_reason"),
                     "fallback_count": metadata.get("fallback_count"),
@@ -4458,6 +4479,19 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
                     ),
                     "tts_voiced_duration": metadata.get("voiced_duration"),
                     "tts_voiced_ratio": metadata.get("voiced_ratio"),
+                    "tts_acoustic_completeness_quality": metadata.get(
+                        "acoustic_completeness_quality"
+                    ),
+                    "tts_expected_clause_count": metadata.get(
+                        "expected_clause_count"
+                    ),
+                    "tts_content_completeness_quality": metadata.get(
+                        "content_completeness_quality"
+                    ),
+                    "tts_content_completeness_similarity": metadata.get(
+                        "content_completeness_similarity"
+                    ),
+                    "tts_content_asr_text": metadata.get("content_asr_text"),
                     "tts_inference_seconds": metadata.get("inference_seconds"),
                     "tts_rtf": metadata.get("rtf"),
                     "tts_reference_fallback": metadata.get("reference_fallback", False),
@@ -4566,12 +4600,18 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
         print("↩️ Step 5 将返回 Step 4 定向补生成失败句（已成功句会命中缓存）。")
         run_step_4(config, backend=config.tts_backend, force=False)
         state = state_mgr.load() or state
+        allow_missing = bool(getattr(config, "allow_missing_tts", False))
         quality_issues = validate_mix_state(
-            state, config, allow_missing=True, filter_missing=True
+            state,
+            config,
+            allow_missing=allow_missing,
+            filter_missing=allow_missing,
         )
         if quality_issues:
             state_mgr.save({"tts_degraded_issues": quality_issues})
-            print("⚠️ TTS 补生成后仍有失败句，将使用伴奏/静音完成成片。")
+            print(
+                "⚠️ 用户已显式允许缺失 TTS；失败句将使用伴奏/静音完成成片。"
+            )
     mixer = Mixer(config)
     mixer.run(state["audio_clips"], restore_skipped_vocals(state, config), input_file, state["duration"])
 

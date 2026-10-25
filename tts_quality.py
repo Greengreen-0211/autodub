@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import math
+import re
 from pathlib import Path
 
 
@@ -167,17 +168,35 @@ def audible_speech_quality(path, *, expected_text: str = "") -> dict:
     voiced_ms = sum(max(0, end - start) for start, end in ranges)
     voiced = voiced_ms / 1000.0
     voiced_ratio = voiced / duration if duration > 0 else 0.0
-    lexical = "".join(
-        char for char in str(expected_text or "").strip()
-        if char.isalnum() or "\u4e00" <= char <= "\u9fff"
+    expected = str(expected_text or "").strip()
+    cjk_count = sum("\u4e00" <= char <= "\u9fff" for char in expected)
+    word_count = len(re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", expected))
+    lexical_units = cjk_count + word_count
+    clauses = [
+        part for part in re.split(r"[，,。.!！？?；;：:]+", expected)
+        if any(char.isalnum() or "\u4e00" <= char <= "\u9fff" for char in part)
+    ]
+    clause_count = max(1, len(clauses)) if lexical_units else 0
+    # Do not cap this floor.  The old 0.55 s cap let a fragment of a long or
+    # multi-clause sentence pass merely because it contained some sound.
+    symbol_floor = (
+        cjk_count * float(os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_CJK", "0.085"))
+        + word_count * float(os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_WORD", "0.12"))
     )
-    # This is intentionally only a gross fragment detector, not a speaking-rate
-    # judge.  The duration ratio gate remains the primary timing decision.
+    clause_floor = clause_count * float(
+        os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_CLAUSE", "0.22")
+    )
     min_voiced = max(
         float(os.getenv("AUTODUB_TTS_MIN_VOICED_SECONDS", "0.16")),
-        min(0.55, len(lexical) * float(os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_SYMBOL", "0.055"))),
+        symbol_floor,
+        clause_floor,
     )
     min_ratio = float(os.getenv("AUTODUB_TTS_MIN_VOICED_RATIO", "0.35"))
+    if clause_count > 1:
+        min_ratio = max(
+            min_ratio,
+            float(os.getenv("AUTODUB_TTS_MULTI_CLAUSE_MIN_VOICED_RATIO", "0.50")),
+        )
     min_dbfs = float(os.getenv("AUTODUB_TTS_MIN_DBFS", "-42"))
     reasons = []
     if duration <= 0.0:
@@ -196,6 +215,11 @@ def audible_speech_quality(path, *, expected_text: str = "") -> dict:
         "voiced_duration": round(voiced, 4),
         "voiced_ratio": round(voiced_ratio, 4),
         "minimum_voiced_duration": round(min_voiced, 4),
+        "minimum_voiced_ratio": round(min_ratio, 4),
+        "expected_cjk_characters": cjk_count,
+        "expected_words": word_count,
+        "expected_clause_count": clause_count,
+        "acoustic_completeness_quality": "failed" if reasons else "passed",
     }
 
 
@@ -328,7 +352,7 @@ def voice_consistency_quality(reference_path, synthesized_path):
     enabling blocking.
     """
     policy = os.getenv(
-        "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY", "warn"
+        "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY", "block"
     ).strip().lower()
     if policy == "off":
         return {
@@ -375,7 +399,7 @@ def stage_fingerprint(state, config, backend):
         if path.is_file():
             info=path.stat()
             media[key]={"path":str(path.resolve()),"size":info.st_size,"mtime_ns":info.st_mtime_ns}
-    payload={"version":"tts-stage-v2.6.0-audible-semantic-voice-identity","segments":segments,"media":media,"backend":backend,
+    payload={"version":"tts-stage-v2.7.0-strict-completeness-voice-lock","segments":segments,"media":media,"backend":backend,
              "input_file":state.get("input_file"),
              "target_lang":str(config.target_lang).lower(),
              "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs")))}
@@ -437,7 +461,12 @@ def validate_mix_state(state, config, *, allow_missing=False, filter_missing=Tru
     if integrity_issues:
         raise RuntimeError("Step5 blocked by integrity error: " + "; ".join(integrity_issues))
     if quality_issues:
-        print("⚠️ Step5 发现可降级的 TTS 缺失:",quality_issues)
+        if not allow_missing:
+            raise RuntimeError(
+                "Step5 blocked by incomplete TTS; rerun Step4 or explicitly "
+                "pass --allow-missing-tts: " + "; ".join(quality_issues)
+            )
+        print("⚠️ Step5 发现用户明确允许的 TTS 缺失:",quality_issues)
         # Only verified readable clips may reach the mixer.
         if filter_missing:
             valid=[]

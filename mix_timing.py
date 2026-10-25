@@ -42,3 +42,49 @@ def plan_mix_windows(
             0, int(round((item["hard_end"] - start) * 1000))
         )
     return ordered
+
+
+def validate_mix_audit(
+    expected_segment_ids: Iterable[Any],
+    audit_rows: Iterable[Mapping[str, Any]],
+    *,
+    maximum_trim_seconds: float = 0.03,
+) -> None:
+    """Fail when a verified TTS clip did not actually reach the mix stem.
+
+    Step 4 already owns duration adaptation. Step 5 must not silently repair a
+    substantially overlong clip by cutting off its final word, nor may it omit
+    a clip because its file/window disappeared between validation and mixing.
+    """
+    expected = [str(value) for value in expected_segment_ids]
+    rows = list(audit_rows)
+    actual = [str(row.get("segment_id")) for row in rows]
+    if len(actual) != len(set(actual)):
+        raise RuntimeError("Step5 mix audit found duplicate segment IDs")
+    missing = sorted(set(expected) - set(actual))
+    unexpected = sorted(set(actual) - set(expected))
+    if missing or unexpected:
+        raise RuntimeError(
+            "Step5 mix audit coverage mismatch: "
+            f"missing={missing or 'none'} unexpected={unexpected or 'none'}"
+        )
+    failures = []
+    for row in rows:
+        sid = str(row.get("segment_id"))
+        if float(row.get("audible_duration") or 0.0) <= 0.0:
+            failures.append(f"{sid}:zero audible duration")
+        if int(row.get("clip_rms") or 0) <= 0:
+            failures.append(f"{sid}:silent clip reached mixer")
+        if not bool(row.get("mix_verified", False)):
+            failures.append(f"{sid}:clip is absent from rendered TTS stem")
+        trimmed = max(
+            0.0,
+            float(row.get("original_wav_duration") or 0.0)
+            - float(row.get("audible_duration") or 0.0),
+        )
+        if trimmed > float(maximum_trim_seconds) + 1e-6:
+            failures.append(
+                f"{sid}:would trim {trimmed:.3f}s at the sentence tail"
+            )
+    if failures:
+        raise RuntimeError("Step5 mix audit failed: " + "; ".join(failures))
