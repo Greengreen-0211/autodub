@@ -470,6 +470,15 @@ class RoutingPolicyTests(unittest.TestCase):
 
 
 class RouterTests(unittest.TestCase):
+    def setUp(self):
+        # These fixtures synthesize tones, not speech. A server-wide ASR model
+        # export must not turn them into real content-verification jobs.
+        content_asr = patch.dict(
+            os.environ, {"AUTODUB_TTS_CONTENT_ASR_ENABLED": "0"}
+        )
+        content_asr.start()
+        self.addCleanup(content_asr.stop)
+
     def setup_router(self,tmp,disabled=False):
         ref=Path(tmp)/"ref.wav";wav(ref)
         router=tts_router.TTSRouter(SimpleNamespace(temp_dir=tmp,target_lang="en",source_lang="en",disable_tts_fallback=disabled),scheme="scheme3")
@@ -1075,6 +1084,15 @@ class QualityTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        # Pipeline fixtures also use synthetic WAVs; keep unit-test behavior
+        # independent from QWEN3_ASR_MODEL_DIR exported by the server shell.
+        content_asr = patch.dict(
+            os.environ, {"AUTODUB_TTS_CONTENT_ASR_ENABLED": "0"}
+        )
+        content_asr.start()
+        self.addCleanup(content_asr.stop)
+
     def functions(self,names,globals):
         tree=ast.parse((ROOT/"auto_dubbing_ver_2.0.py").read_text(encoding="utf-8-sig"))
         nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]

@@ -42,6 +42,24 @@ class VoiceConsistencyTests(unittest.TestCase):
 
 
 class ContentCompletenessTests(unittest.TestCase):
+    def test_explicit_content_asr_switch_overrides_server_model_export(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "QWEN3_ASR_MODEL_DIR": tmp,
+            "AUTODUB_TTS_CONTENT_ASR_ENABLED": "0",
+        }):
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            self.assertFalse(router._content_asr_enabled())
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "QWEN3_ASR_MODEL_DIR": tmp,
+            "AUTODUB_TTS_CONTENT_ASR_ENABLED": "1",
+        }):
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            self.assertTrue(router._content_asr_enabled())
+
     def test_short_chinese_line_rejects_one_swallowed_character(self):
         result = content_completeness_quality("杰克你好", "杰你好", "zh")
         self.assertEqual(result["content_completeness_quality"], "failed")
