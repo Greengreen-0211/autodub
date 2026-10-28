@@ -226,6 +226,15 @@ def serialize_trial(
         "requires_duration_resolution": bool(
             trial.get("requires_duration_resolution", recovered_preview)
         ),
+        "attempt_count": _integer(
+            trial.get("trial_attempt_count", trial.get("attempt_count"))
+        ),
+        "attempt_limit": _integer(
+            trial.get("trial_attempt_limit", trial.get("attempt_limit"))
+        ),
+        "selected_attempt": _integer(
+            trial.get("trial_selected_attempt", trial.get("selected_attempt"))
+        ),
         "warning": _error(warning, "TTS_TRIAL_WARNING"),
         "inference_seconds": _optional_number(trial.get("inference_seconds")),
         "rtf": _optional_number(trial.get("rtf")),

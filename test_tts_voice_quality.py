@@ -9,6 +9,7 @@ Runs offline (no GPU / no model downloads). Place in the repo root and run:
     python test_tts_voice_quality.py
 """
 import importlib.util
+import json
 import math
 import os
 import shutil
@@ -33,6 +34,118 @@ from tts_content_verifier import (
 )
 
 HAS_LIBROSA = importlib.util.find_spec("librosa") is not None
+
+
+class TrialSynthesisTests(unittest.TestCase):
+    @staticmethod
+    def _fake_worker(durations):
+        calls = []
+
+        def run(_model, plan_path, result_path, **_kwargs):
+            items = json.loads(Path(plan_path).read_text(encoding="utf-8"))["items"]
+            results = {}
+            for item, duration in zip(items, durations):
+                calls.append(item)
+                write_wav(Path(item["raw_path"]), duration, sample=tone())
+                results[item["segment_id"]] = {"status": "success"}
+            Path(result_path).write_text(
+                json.dumps(results), encoding="utf-8"
+            )
+            return 0
+
+        return calls, run
+
+    def test_user_selected_engine_tries_at_most_three_and_returns_best(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "trial.wav"
+            calls, worker = self._fake_worker([2.4, 1.03, 1.5])
+
+            def postprocess(source, destination, _target):
+                shutil.copy2(source, destination)
+                index = int(Path(source).stem.rsplit("_", 1)[-1]) - 1
+                actual = [2.4, 1.03, 1.5][index]
+                return {"actual_duration": actual, "post_trim_duration": actual}
+
+            with patch("tts_router.preflight_models"), patch(
+                "tts_router._run_worker", side_effect=worker
+            ) as run_worker, patch(
+                "tts_router._postprocess", side_effect=postprocess
+            ), patch(
+                "tts_router.electricity_quality",
+                return_value={"electricity_quality": "passed"},
+            ), patch(
+                "tts_router.audible_speech_quality",
+                return_value={"audible_speech_quality": "passed"},
+            ), patch("tts_router._trial_content_asr_enabled", return_value=False):
+                result = tts_router.synthesize(
+                    "测试句子", "zh", "neutral", str(Path(tmp) / "ref.wav"),
+                    str(output), target_duration=1.0, engine="cosyvoice3",
+                    max_attempts=99,
+                )
+
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(run_worker.call_count, 1)
+            self.assertEqual(result["trial_attempt_limit"], 3)
+            self.assertEqual(result["trial_attempt_count"], 3)
+            self.assertEqual(result["trial_selected_attempt"], 2)
+            self.assertEqual(result["actual_engine"], "cosyvoice3")
+            self.assertTrue(result["adoption_recommended"])
+            self.assertTrue(output.is_file())
+
+    def test_trial_never_selects_reference_leaking_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "trial.wav"
+            durations = [1.0, 1.2, 1.5]
+            _calls, worker = self._fake_worker(durations)
+
+            def postprocess(source, destination, _target):
+                shutil.copy2(source, destination)
+                index = int(Path(source).stem.rsplit("_", 1)[-1]) - 1
+                return {
+                    "actual_duration": durations[index],
+                    "post_trim_duration": durations[index],
+                }
+
+            def audit(command, **_kwargs):
+                output_path = Path(command[command.index("--output") + 1])
+                output_path.write_text(json.dumps({
+                    "1": {
+                        "content_completeness_quality": "passed",
+                        "reference_leakage_quality": "failed",
+                        "reference_leakage_detected": True,
+                    },
+                    "2": {
+                        "content_completeness_quality": "passed",
+                        "reference_leakage_quality": "passed",
+                        "reference_leakage_detected": False,
+                    },
+                    "3": {
+                        "content_completeness_quality": "passed",
+                        "reference_leakage_quality": "passed",
+                        "reference_leakage_detected": False,
+                    },
+                }), encoding="utf-8")
+                return SimpleNamespace(returncode=0)
+
+            with patch("tts_router.preflight_models"), patch(
+                "tts_router._run_worker", side_effect=worker
+            ), patch("tts_router._postprocess", side_effect=postprocess), patch(
+                "tts_router.electricity_quality",
+                return_value={"electricity_quality": "passed"},
+            ), patch(
+                "tts_router.audible_speech_quality",
+                return_value={"audible_speech_quality": "passed"},
+            ), patch("tts_router._trial_content_asr_enabled", return_value=True), patch(
+                "tts_router.subprocess.run", side_effect=audit
+            ):
+                result = tts_router.synthesize(
+                    "测试句子", "zh", "neutral", str(Path(tmp) / "ref.wav"),
+                    str(output), target_duration=1.0, engine="f5tts",
+                )
+
+            self.assertEqual(result["trial_selected_attempt"], 2)
+            self.assertFalse(result["reference_leakage_detected"])
+            self.assertTrue(result["attempt_history"][0]["reference_leakage_detected"])
 
 
 class VoiceConsistencyTests(unittest.TestCase):

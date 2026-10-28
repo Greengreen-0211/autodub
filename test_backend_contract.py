@@ -16,6 +16,9 @@ class TrialContractTests(unittest.TestCase):
             "duration_error": 1.91,
             "duration_quality": "failed",
             "error": "duration exceeded sentence window",
+            "trial_attempt_count": 3,
+            "trial_attempt_limit": 3,
+            "trial_selected_attempt": 2,
         }, artifact_resolver=lambda _value: "artifact-trial-1")
 
         self.assertEqual(result["status"], "success")
@@ -27,6 +30,9 @@ class TrialContractTests(unittest.TestCase):
         self.assertIsNone(result["error"])
         self.assertEqual(result["warning"]["code"], "TTS_DURATION_OUT_OF_RANGE")
         self.assertAlmostEqual(result["duration_ratio"], 5.35 / 3.44)
+        self.assertEqual(result["attempt_count"], 3)
+        self.assertEqual(result["attempt_limit"], 3)
+        self.assertEqual(result["selected_attempt"], 2)
 
     def test_real_generation_failure_remains_failed(self):
         result = serialize_trial({

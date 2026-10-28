@@ -70,6 +70,47 @@ def _generation_attempt_limit() -> int:
     return max(1, min(5, configured))
 
 
+def _trial_attempt_limit(requested: Optional[int] = None) -> int:
+    """Bound a user-requested one-line preview to three generations."""
+    if requested is None:
+        try:
+            requested = int(os.getenv("AUTODUB_TTS_TRIAL_MAX_ATTEMPTS", "3"))
+        except ValueError:
+            requested = 3
+    return max(1, min(3, int(requested)))
+
+
+def _trial_content_asr_enabled() -> bool:
+    configured = os.getenv("AUTODUB_TTS_CONTENT_ASR_ENABLED")
+    if configured is not None:
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    model_dir = os.getenv("QWEN3_ASR_MODEL_DIR", "").strip()
+    return bool(model_dir and Path(model_dir).is_dir())
+
+
+def _trial_candidate_rank(candidate: Dict[str, Any]) -> tuple:
+    """Rank only non-leaking preview candidates; lower is better."""
+    target = float(candidate.get("target_duration") or 0.0)
+    actual = float(candidate.get("actual_duration") or 0.0)
+    if target > 0.0 and actual > 0.0:
+        import math
+        duration_distance = abs(math.log(actual / target))
+    else:
+        duration_distance = 0.0
+    duration_rank = {
+        "passed": 0,
+        "degraded": 1,
+        "failed": 2,
+    }.get(str(candidate.get("duration_quality") or "unmeasured"), 1)
+    return (
+        int(candidate.get("content_completeness_quality") == "failed"),
+        int(candidate.get("electricity_quality") == "failed"),
+        duration_rank,
+        duration_distance,
+        int(candidate.get("trial_attempt") or 0),
+    )
+
+
 def _is_precise_reference_segment(segment: Dict[str, Any]) -> bool:
     """Whether a segment has audio/text alignment safe for voice reference."""
     if (
@@ -622,81 +663,178 @@ def synthesize(
     ref_text: str = "",
     force: bool = False,
     scheme: str = "scheme2",
+    engine: Optional[str] = None,
+    max_attempts: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Unified one-item API; the pipeline uses :class:`TTSRouter` for batching."""
+    """Generate up to three previews with one user-selected TTS engine."""
     destination = Path(output_path).resolve()
     work = destination.parent / (destination.stem + "_router_work")
-    raw = work / "raw.wav"
-    plan = work / "plan.json"
-    result = work / "results.json"
     if scheme not in {"scheme2", "scheme3"}:
         raise ValueError(f"unsupported TTS scheme: {scheme}")
-    model = (
+    model = str(engine or "").strip().lower() or (
         select_scheme3_tts_engine(language, emotion, text)
         if scheme == "scheme3"
         else select_tts_model(language, emotion)
     )
+    if model not in MODEL_ORDER:
+        raise ValueError(f"unsupported TTS engine: {model}")
+    attempt_limit = _trial_attempt_limit(max_attempts)
     canonical_language = normalize_language(language)
     synthesis_language = _language_code(language) if model == "omnivoice" else canonical_language
-    item = {
-        "segment_id": "0", "text": text, "language": synthesis_language,
-        "target_language": canonical_language,
-        "emotion": normalize_emotion(emotion), "speaker": "SPEAKER_00",
-        "ref_audio": str(Path(ref_audio).resolve()), "ref_text": ref_text,
-        "raw_path": str(raw), "target_duration": float(target_duration or 0.0),
-        "model": model, "tts_engine": model,
-    }
-    item["request_fingerprint"] = _request_fingerprint(item)
     preflight_models([model])
-    _atomic_json(plan, {"items": [item]})
-    code = _run_worker(model, plan, result, force=force)
-    results = _load_results(result)
-    metadata = results.get("0", {})
-    if code != 0 or metadata.get("status") != "success":
-        raise RuntimeError(metadata.get("error", f"{model} worker exited with {code}"))
-    metadata.update(_postprocess(raw, destination, float(target_duration or 0.0)))
-    metadata["file"] = str(destination)
-    metadata["target_duration"] = float(target_duration or 0.0)
-    metadata["duration_error"] = metadata["actual_duration"] - metadata["target_duration"] if target_duration else None
-    if target_duration:
-        metadata.update(duration_quality(
-            metadata["actual_duration"], metadata["target_duration"]
-        ))
-        if metadata["duration_quality"] == "failed":
-            # A one-off/trial synthesis did produce playable media.  Preserve
-            # it for diagnosis and comparison instead of converting a timing
-            # rejection into the misleading message "synthesis failed".
-            metadata.update(
-                status="success",
-                duration_quality="degraded",
-                adoption_recommended=False,
-                requires_duration_resolution=True,
-                warning={
-                    "code": "TTS_DURATION_OUT_OF_RANGE",
-                    "message": (
-                        "Audio was generated, but its duration is outside the "
-                        "safe range for this sentence. Preview is available; "
-                        "retry/rewrite before adopting it."
-                    ),
-                },
-            )
-        else:
-            metadata.update(
-                adoption_recommended=True,
-                requires_duration_resolution=False,
-            )
-    metadata.update(electricity_quality(destination))
-    metadata.update(audible_speech_quality(destination, expected_text=text))
-    if metadata.get("audible_speech_quality") == "failed":
-        metadata.update(
-            adoption_recommended=False,
-            warning={
-                "code": "TTS_AUDIO_NOT_RELIABLY_AUDIBLE",
-                "message": metadata.get("audible_speech_reason", "audio quality failed"),
-            },
+    work.mkdir(parents=True, exist_ok=True)
+    candidates: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    target = float(target_duration or 0.0)
+    trial_items = []
+    for attempt in range(1, attempt_limit + 1):
+        segment_id = f"trial_{attempt}"
+        raw = work / f"raw_attempt_{attempt}.wav"
+        preview = work / f"preview_attempt_{attempt}.wav"
+        item = {
+            "segment_id": segment_id, "text": text,
+            "language": synthesis_language,
+            "target_language": canonical_language,
+            "emotion": normalize_emotion(emotion), "speaker": "SPEAKER_00",
+            "ref_audio": str(Path(ref_audio).resolve()), "ref_text": ref_text,
+            "raw_path": str(raw), "target_duration": target,
+            "model": model, "tts_engine": model,
+            "trial_attempt": attempt, "trial_preview_path": str(preview),
+        }
+        item["request_fingerprint"] = _request_fingerprint(item)
+        trial_items.append(item)
+
+    # Generate the three stochastic candidates in one worker process so the
+    # selected model is loaded only once. Force generation prevents an older
+    # preview cache from silently counting as a new attempt.
+    plan = work / "plan.json"
+    result = work / "worker_results.json"
+    _atomic_json(plan, {"items": trial_items})
+    code = _run_worker(model, plan, result, force=True)
+    worker_results = _load_results(result)
+    for item in trial_items:
+        attempt = int(item["trial_attempt"])
+        raw = Path(item["raw_path"])
+        preview = Path(item["trial_preview_path"])
+        metadata = dict(worker_results.get(item["segment_id"], {}))
+        if metadata.get("status") != "success":
+            failures.append({
+                "attempt": attempt,
+                "error": metadata.get(
+                    "error", f"{model} worker exited with {code}"
+                ),
+            })
+            continue
+        try:
+            metadata.update(_postprocess(raw, preview, target))
+        except Exception as exc:
+            failures.append({"attempt": attempt, "error": str(exc)})
+            continue
+        metadata.update({
+            "file": str(preview),
+            "target_duration": target,
+            "duration_error": (
+                metadata["actual_duration"] - target if target else None
+            ),
+            "trial_attempt": attempt,
+            "engine": model,
+            "actual_engine": model,
+        })
+        if target:
+            metadata.update(duration_quality(metadata["actual_duration"], target))
+            if metadata["duration_quality"] == "failed":
+                metadata["duration_quality"] = "degraded"
+        metadata.update(electricity_quality(preview))
+        metadata.update(audible_speech_quality(preview, expected_text=text))
+        candidates.append(metadata)
+
+    if not candidates:
+        raise RuntimeError(
+            f"{model} trial synthesis failed in all {attempt_limit} attempts: "
+            + "; ".join(str(row.get("error") or "unknown") for row in failures)
         )
-    results["0"] = metadata
-    _atomic_json(result, results)
+
+    if _trial_content_asr_enabled():
+        audit_plan = work / "content_asr_plan.json"
+        audit_output = work / "content_asr_results.json"
+        _atomic_json(audit_plan, {"items": [
+            {
+                "segment_id": str(candidate["trial_attempt"]),
+                "text": text,
+                "reference_text": ref_text,
+                "language": canonical_language,
+                "file": candidate["file"],
+            }
+            for candidate in candidates
+        ]})
+        completed = subprocess.run([
+            sys.executable,
+            str(Path(__file__).with_name("tts_content_verifier.py")),
+            "--plan", str(audit_plan), "--output", str(audit_output),
+        ], check=False, env=os.environ.copy())
+        if completed.returncode != 0 or not audit_output.is_file():
+            raise RuntimeError(
+                "TTS trial content verification failed; refusing unchecked previews"
+            )
+        audits = json.loads(audit_output.read_text(encoding="utf-8"))
+        for candidate in candidates:
+            candidate.update(audits.get(str(candidate["trial_attempt"])) or {})
+
+    safe_candidates = [
+        candidate for candidate in candidates
+        if not candidate.get("reference_leakage_detected")
+        and candidate.get("reference_leakage_quality") != "failed"
+        and candidate.get("audible_speech_quality") != "failed"
+    ]
+    if not safe_candidates:
+        raise RuntimeError(
+            "all generated TTS trial candidates were rejected as reference "
+            "leakage or unreliable audio"
+        )
+    chosen = min(safe_candidates, key=_trial_candidate_rank)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(chosen["file"], destination)
+    metadata = dict(chosen)
+    metadata.update(
+        file=str(destination),
+        status="success",
+        trial_attempt_count=len(candidates) + len(failures),
+        trial_attempt_limit=attempt_limit,
+        trial_selected_attempt=int(chosen["trial_attempt"]),
+        trial_engine=model,
+        attempt_history=[
+            {
+                "attempt": int(candidate["trial_attempt"]),
+                "actual_duration": candidate.get("actual_duration"),
+                "duration_quality": candidate.get("duration_quality"),
+                "audible_speech_quality": candidate.get("audible_speech_quality"),
+                "content_completeness_quality": candidate.get(
+                    "content_completeness_quality"
+                ),
+                "reference_leakage_detected": bool(
+                    candidate.get("reference_leakage_detected")
+                ),
+                "selected": candidate is chosen,
+            }
+            for candidate in candidates
+        ] + failures,
+    )
+    strict_pass = (
+        metadata.get("duration_quality") in {"passed", "unmeasured", None}
+        and metadata.get("audible_speech_quality") != "failed"
+        and metadata.get("content_completeness_quality") != "failed"
+    )
+    metadata["adoption_recommended"] = bool(strict_pass)
+    metadata["requires_duration_resolution"] = not strict_pass
+    if not strict_pass:
+        metadata["warning"] = {
+            "code": "TTS_TRIAL_BEST_AVAILABLE",
+            "message": (
+                "No strict-pass result was produced in three or fewer attempts; "
+                "returning the best safe generated preview."
+            ),
+        }
+    _atomic_json(work / "results.json", {"0": metadata})
     return metadata
 
 
