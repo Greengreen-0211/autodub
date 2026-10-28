@@ -55,7 +55,7 @@ MODEL_ORDER = ("f5tts", "indextts2", "cosyvoice3", "confucius4", "omnivoice")
 GENERATION_REQUEST_KEYS = (
     "text", "language", "target_language", "emotion", "speaker",
     "ref_audio", "ref_text", "target_duration", "start", "model",
-    "reference_segment_id", "reference_purity_score",
+    "reference_segment_id", "reference_purity_score", "reference_mode",
     "measure_natural_duration",
     "translation_selection_source",
 )
@@ -864,6 +864,19 @@ class TTSRouter:
         self.candidate_path = self.root / "candidate_vault.json"
         self.duration_rewriter = duration_rewriter
         self.duration_candidate_selector = duration_candidate_selector
+        reference_mode = os.getenv(
+            "AUTODUB_TTS_REFERENCE_MODE", "speaker"
+        ).strip().lower().replace("-", "_")
+        reference_mode = {
+            "per_sentence": "segment",
+            "sentence": "segment",
+            "direct": "segment",
+        }.get(reference_mode, reference_mode)
+        if reference_mode not in {"speaker", "segment"}:
+            raise ValueError(
+                "AUTODUB_TTS_REFERENCE_MODE must be speaker or segment"
+            )
+        self.reference_mode = reference_mode
 
     def _remember_candidate(
         self, item: Dict[str, Any], metadata: Dict[str, Any], stage: str
@@ -1001,6 +1014,10 @@ class TTSRouter:
                 continue
             if str(generation.get("emotion") or "") != str(
                 item.get("emotion") or ""
+            ):
+                continue
+            if str(generation.get("reference_mode") or "speaker") != str(
+                item.get("reference_mode") or "speaker"
             ):
                 continue
             if str(candidate.get("reference_audio_sha256") or "") != (
@@ -1418,6 +1435,165 @@ class TTSRouter:
         _atomic_json(self.root / "reference_manifest.json", manifest)
         return references
 
+    def _segment_references(
+        self, segments: List[Dict[str, Any]], vocal_path: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """Build one source-audio reference for each exact dubbing segment.
+
+        This opt-in A/B mode deliberately ignores speaker-cluster identity when
+        choosing cloning audio.  It leaves Step 2 labels and timestamps intact
+        for diagnostics and mixing, while every TTS request receives the source
+        utterance occupying that same segment boundary.
+        """
+        from pydub import AudioSegment
+
+        full_audio = AudioSegment.from_wav(vocal_path)
+        references: Dict[str, Dict[str, Any]] = {}
+        manifest: Dict[str, Any] = {
+            "version": 4,
+            "policy": "direct_source_audio_per_segment_v1",
+            "reference_mode": "segment",
+            "segments": {},
+        }
+        minimum_reliable = float(os.getenv(
+            "AUTODUB_TTS_MIN_RELIABLE_REFERENCE_SECONDS", "1.50"
+        ))
+
+        for index, segment in enumerate(segments):
+            segment_id = str(segment.get("id", index))
+            try:
+                outer_start = max(
+                    0, int(round(float(segment["start"]) * 1000))
+                )
+                outer_end = min(
+                    len(full_audio),
+                    int(round(float(segment["end"]) * 1000)),
+                )
+            except (KeyError, TypeError, ValueError):
+                manifest["segments"][segment_id] = {
+                    "status": "failed",
+                    "reason": "invalid_segment_boundary",
+                }
+                continue
+            start, end = outer_start, outer_end
+            boundary_source = "segment"
+            if (
+                _is_precise_reference_segment(segment)
+                and segment.get("speech_start") is not None
+                and segment.get("speech_end") is not None
+            ):
+                try:
+                    speech_start = max(
+                        outer_start,
+                        int(round(float(segment.get("speech_start")) * 1000)),
+                    )
+                    speech_end = min(
+                        outer_end,
+                        int(round(float(segment.get("speech_end")) * 1000)),
+                    )
+                except (TypeError, ValueError):
+                    speech_start, speech_end = outer_start, outer_end
+                if speech_end - speech_start >= 200:
+                    start, end = speech_start, speech_end
+                    boundary_source = "word_aligned_speech"
+            if end <= start:
+                manifest["segments"][segment_id] = {
+                    "status": "failed",
+                    "reason": "empty_segment_boundary",
+                    "start": start / 1000.0,
+                    "end": end / 1000.0,
+                }
+                continue
+
+            audio = full_audio[start:end]
+            # A voice-cloning backend cannot use an empty/corrupt slice. Keep
+            # the threshold low so short replies still participate in the A/B
+            # experiment; their reliability is recorded separately below.
+            if len(audio) < 200:
+                manifest["segments"][segment_id] = {
+                    "status": "failed",
+                    "reason": "reference_shorter_than_200ms",
+                    "start": start / 1000.0,
+                    "end": end / 1000.0,
+                }
+                continue
+
+            source_text = str(
+                segment.get("original_text")
+                or segment.get("source_text")
+                or segment.get("qwen3_raw_text")
+                or segment.get("asr_text")
+                or ""
+            ).strip()
+            if not source_text:
+                manifest["segments"][segment_id] = {
+                    "status": "failed",
+                    "reason": "missing_source_reference_text",
+                    "start": start / 1000.0,
+                    "end": end / 1000.0,
+                }
+                continue
+            safe_id = _safe_id(segment_id)
+            ref_path = self.root / "references" / f"ref_segment_{safe_id}.wav"
+            txt_path = ref_path.with_suffix(".txt")
+            ref_path.parent.mkdir(parents=True, exist_ok=True)
+            audio.export(ref_path, format="wav")
+            txt_path.write_text(source_text, encoding="utf-8")
+
+            precise = _is_precise_reference_segment(segment)
+            duration = len(audio) / 1000.0
+            reliability = (
+                "reliable"
+                if precise and duration >= minimum_reliable
+                else "direct_segment_short_or_ambiguous"
+            )
+            voice_identity = f"SEGMENT_{segment_id}"
+            references[segment_id] = {
+                "audio": str(ref_path),
+                "text": source_text,
+                "speaker": str(segment.get("speaker", "SPEAKER_00")),
+                "requested_speaker": str(
+                    segment.get("speaker", "SPEAKER_00")
+                ),
+                "start": start / 1000.0,
+                "end": end / 1000.0,
+                "outer_start": outer_start / 1000.0,
+                "outer_end": outer_end / 1000.0,
+                "boundary_source": boundary_source,
+                "source_segment_id": segment_id,
+                "purity_score": None,
+                "duration": round(duration, 3),
+                "assignment_confidence": None,
+                "reference_reliability": reliability,
+                "voice_identity": voice_identity,
+                "voice_identity_reused": False,
+                "reference_mode": "segment",
+            }
+            manifest["segments"][segment_id] = {
+                "status": "success",
+                "speaker_label_for_audit": str(
+                    segment.get("speaker", "SPEAKER_00")
+                ),
+                "selected_segment_id": segment_id,
+                "start": start / 1000.0,
+                "end": end / 1000.0,
+                "outer_start": outer_start / 1000.0,
+                "outer_end": outer_end / 1000.0,
+                "boundary_source": boundary_source,
+                "duration": round(duration, 3),
+                "text": source_text,
+                "precise_boundary": precise,
+                "reference_reliability": reliability,
+                "voice_identity": voice_identity,
+            }
+            print(
+                f"逐句参考 segment={segment_id}: 原句自身 "
+                f"{duration:.2f}s reliability={reliability}"
+            )
+
+        _atomic_json(self.root / "reference_manifest.json", manifest)
+        return references
+
     @staticmethod
     def _nearest_safe_reference(
         segment: Dict[str, Any], references: Dict[str, Dict[str, Any]]
@@ -1461,7 +1637,12 @@ class TTSRouter:
         require_translated(segment_list, self.config.target_lang, getattr(self.config, "source_lang", ""))
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.final_dir.mkdir(parents=True, exist_ok=True)
-        references = self._speaker_references(segment_list, vocal_path)
+        if self.reference_mode == "segment":
+            print("--- TTS 参考模式: 每个句子使用对应原句音频（忽略聚类声纹）---")
+            references = self._segment_references(segment_list, vocal_path)
+        else:
+            print("--- TTS 参考模式: 按说话人聚类选择参考音频 ---")
+            references = self._speaker_references(segment_list, vocal_path)
         previous = _load_results(self.result_path)
         items = []
         unreferenced_results = []
@@ -1473,11 +1654,16 @@ class TTSRouter:
                 raise ValueError(f"invalid/duplicate TTS segment: {segment_id}")
             seen.add(segment_id)
             speaker = str(segment.get("speaker", "SPEAKER_00"))
-            reference = references.get(speaker)
+            reference_key = segment_id if self.reference_mode == "segment" else speaker
+            reference = references.get(reference_key)
             reference_fallback_speaker = None
             reference_fallback_reason = ""
-            if reference is None and _env_bool(
-                "AUTODUB_TTS_ALLOW_CROSS_SPEAKER_REFERENCE", True
+            if (
+                self.reference_mode == "speaker"
+                and reference is None
+                and _env_bool(
+                    "AUTODUB_TTS_ALLOW_CROSS_SPEAKER_REFERENCE", True
+                )
             ):
                 reference_fallback_speaker, reference = self._nearest_safe_reference(
                     segment, references
@@ -1545,6 +1731,7 @@ class TTSRouter:
                 "reference_purity_score": reference.get("purity_score"),
                 "reference_duration": reference.get("duration"),
                 "reference_reliability": reference.get("reference_reliability", "reliable"),
+                "reference_mode": self.reference_mode,
                 "voice_identity": reference.get("voice_identity", speaker),
                 "voice_identity_reused": bool(reference.get("voice_identity_reused", False)),
                 "reference_fallback": reference_fallback_speaker is not None,
@@ -1901,6 +2088,7 @@ class TTSRouter:
                              reference_purity_score=item.get("reference_purity_score"),
                              reference_duration=item.get("reference_duration"),
                              reference_reliability=item.get("reference_reliability"),
+                             reference_mode=item.get("reference_mode", "speaker"),
                              voice_identity=item.get("voice_identity", item["speaker"]),
                              voice_identity_reused=item.get("voice_identity_reused", False),
                             reference_fallback=item.get("reference_fallback", False),

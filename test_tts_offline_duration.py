@@ -97,6 +97,65 @@ class OfflineTests(unittest.TestCase):
 
 
 class DurationTests(unittest.TestCase):
+    def test_segment_reference_mode_uses_each_utterance_and_is_reversible(self):
+        from pydub import AudioSegment
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp, "vocals.wav")
+            AudioSegment.silent(duration=6000).export(source, format="wav")
+            segments = [
+                {
+                    "id": 10,
+                    "start": 0.0,
+                    "end": 2.0,
+                    "speaker": "SAME_CLUSTER",
+                    "original_text": "First source sentence.",
+                    "timestamp_precision": "word",
+                },
+                {
+                    "id": 11,
+                    "start": 3.0,
+                    "end": 5.5,
+                    "speaker": "SAME_CLUSTER",
+                    "original_text": "Second source sentence.",
+                    "timestamp_precision": "word",
+                },
+            ]
+            with patch.dict(
+                os.environ,
+                {"AUTODUB_TTS_REFERENCE_MODE": "segment"},
+            ):
+                router = tts_router.TTSRouter(
+                    SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+                )
+                references = router._segment_references(segments, str(source))
+
+            self.assertEqual(router.reference_mode, "segment")
+            self.assertEqual(set(references), {"10", "11"})
+            self.assertEqual(
+                references["10"]["text"], "First source sentence."
+            )
+            self.assertEqual(
+                references["11"]["text"], "Second source sentence."
+            )
+            self.assertNotEqual(
+                references["10"]["audio"], references["11"]["audio"]
+            )
+            self.assertEqual(references["10"]["voice_identity"], "SEGMENT_10")
+            self.assertEqual(references["11"]["voice_identity"], "SEGMENT_11")
+            manifest = json.loads(
+                (router.root / "reference_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["reference_mode"], "segment")
+
+            with patch.dict(os.environ, {}, clear=True):
+                restored = tts_router.TTSRouter(
+                    SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+                )
+            self.assertEqual(restored.reference_mode, "speaker")
+
     def test_reference_uses_pure_components_from_reassembled_identity(self):
         class FakeAudio:
             dBFS = -20.0
