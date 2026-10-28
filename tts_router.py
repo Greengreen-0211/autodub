@@ -264,6 +264,7 @@ def _content_audit_fingerprint(item: Dict[str, Any], metadata: Dict[str, Any]) -
         "version": "tts-content-audit-v1",
         "audio_sha256": audio_sha,
         "expected_text": str(item.get("text") or ""),
+        "reference_text": str(item.get("ref_text") or ""),
         "language": str(item.get("target_language") or ""),
         "verifier_sha256": hashlib.sha256(
             Path(__file__).with_name("tts_content_verifier.py").read_bytes()
@@ -277,6 +278,12 @@ def _content_audit_fingerprint(item: Dict[str, Any], metadata: Dict[str, Any]) -
         ),
         "safe_extra_ratio": os.getenv(
             "AUTODUB_TTS_CONTENT_ASR_MAX_SAFE_EXTRA_RATIO", "0.25"
+        ),
+        "reference_leak_min_coverage": os.getenv(
+            "AUTODUB_TTS_REFERENCE_LEAK_MIN_COVERAGE", "0.50"
+        ),
+        "reference_leak_same_language_similarity": os.getenv(
+            "AUTODUB_TTS_REFERENCE_LEAK_SAME_LANG_SIMILARITY", "0.82"
         ),
     }
     return hashlib.sha256(
@@ -827,6 +834,19 @@ class TTSRouter:
             path = Path(str(candidate.get("file") or ""))
             if not path.is_file() or not path.stat().st_size:
                 continue
+            # Reference-speech leakage is a hard safety failure, never a
+            # scoring penalty. It cannot enter best-candidate fallback even if
+            # its voice, duration and target-text metrics look excellent.
+            if (
+                bool(candidate.get("reference_leakage_detected"))
+                or candidate.get("reference_leakage_quality") == "failed"
+            ):
+                continue
+            if (
+                self._content_asr_enabled()
+                and candidate.get("reference_leakage_quality") != "passed"
+            ):
+                continue
             if current_text not in {
                 str(candidate.get("planned_text") or ""),
                 str(candidate.get("candidate_text") or ""),
@@ -927,11 +947,15 @@ class TTSRouter:
         pending = []
         for item in items:
             metadata = updated.get(item["segment_id"], {})
-            if metadata.get("status") != "success":
+            if (
+                metadata.get("status") != "success"
+                and metadata.get("audible_speech_quality") != "passed"
+            ):
                 continue
             audit_fingerprint = _content_audit_fingerprint(item, metadata)
             if (
                 metadata.get("content_completeness_quality") == "passed"
+                and metadata.get("reference_leakage_quality") == "passed"
                 and metadata.get("content_asr_request_fingerprint")
                 == audit_fingerprint
             ):
@@ -941,6 +965,7 @@ class TTSRouter:
                 pending.append({
                     "segment_id": item["segment_id"],
                     "text": item["text"],
+                    "reference_text": item.get("ref_text", ""),
                     "language": item["target_language"],
                     "file": str(path),
                     "request_fingerprint": item["request_fingerprint"],
@@ -975,12 +1000,20 @@ class TTSRouter:
             metadata["content_asr_request_fingerprint"] = row[
                 "content_audit_fingerprint"
             ]
-            if audit.get("content_completeness_quality") != "passed":
+            if (
+                audit.get("content_completeness_quality") != "passed"
+                or audit.get("reference_leakage_detected")
+            ):
+                reason = (
+                    "reference_audio_text_leakage:"
+                    + str(audit.get("reference_leakage_reason") or "detected")
+                    if audit.get("reference_leakage_detected")
+                    else str(audit.get("content_completeness_reason") or "mismatch")
+                )
                 metadata.update(
                     status="failed",
                     error=(
-                        "TTS content incomplete after ASR verification: "
-                        + str(audit.get("content_completeness_reason") or "mismatch")
+                        "TTS content verification failed: " + reason
                     ),
                     preview_file=metadata.get("file"),
                     preview_available=True,

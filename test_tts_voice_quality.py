@@ -26,7 +26,11 @@ from tts_quality import (
     electricity_quality,
     voice_consistency_quality,
 )
-from tts_content_verifier import content_completeness_quality
+from tts_content_verifier import (
+    content_completeness_quality,
+    reference_leakage_quality,
+    synthesized_content_quality,
+)
 
 HAS_LIBROSA = importlib.util.find_spec("librosa") is not None
 
@@ -42,6 +46,38 @@ class VoiceConsistencyTests(unittest.TestCase):
 
 
 class ContentCompletenessTests(unittest.TestCase):
+    def test_chinese_target_blocks_leaked_english_reference_sentence(self):
+        result = synthesized_content_quality(
+            "你好，杰克。",
+            "你好，杰克。 Hello, Jack.",
+            "Hello, Jack.",
+            "zh",
+        )
+        self.assertTrue(result["reference_leakage_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "failed")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+        self.assertEqual(
+            result["content_completeness_match_rule"],
+            "reference_leakage_blocked",
+        )
+
+    def test_english_target_blocks_leaked_chinese_reference_sentence(self):
+        result = reference_leakage_quality(
+            "Give me your hand.",
+            "Give me your hand. 把手给我。",
+            "把手给我。",
+            "en",
+        )
+        self.assertTrue(result["reference_leakage_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "failed")
+
+    def test_target_only_speech_does_not_trigger_reference_leakage(self):
+        result = reference_leakage_quality(
+            "你好，杰克。", "你好，杰克。", "Hello, Jack.", "zh"
+        )
+        self.assertFalse(result["reference_leakage_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "passed")
+
     def test_explicit_content_asr_switch_overrides_server_model_export(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
             "QWEN3_ASR_MODEL_DIR": tmp,
@@ -187,6 +223,8 @@ class ContentCompletenessTests(unittest.TestCase):
                 "actual_duration": 1.0,
                 "audible_speech_quality": "passed",
                 "content_completeness_quality": "failed",
+                "reference_leakage_quality": "passed",
+                "reference_leakage_detected": False,
                 "voice_consistency_quality": "passed",
                 "error": "content mismatch",
             }, "content_audit")
@@ -195,6 +233,8 @@ class ContentCompletenessTests(unittest.TestCase):
                 "actual_duration": 1.0,
                 "audible_speech_quality": "passed",
                 "content_completeness_quality": "passed",
+                "reference_leakage_quality": "passed",
+                "reference_leakage_detected": False,
                 "voice_consistency_quality": "passed",
                 "error": "strict duration policy",
             }, "content_audit")
@@ -208,6 +248,42 @@ class ContentCompletenessTests(unittest.TestCase):
                 tts_router._file_sha256(Path(adopted["file"])),
                 tts_router._file_sha256(complete),
             )
+
+    def test_reference_leak_candidate_can_never_be_best_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            leaked = Path(tmp) / "leaked.wav"
+            write_wav(leaked, 1.0, sample=tone())
+            item = {
+                "segment_id": "0",
+                "text": "你好，杰克。",
+                "planned_text": "你好，杰克。",
+                "language": "zh",
+                "target_language": "zh",
+                "emotion": "neutral",
+                "speaker": "A",
+                "ref_audio": "speaker.wav",
+                "ref_text": "Hello, Jack.",
+                "target_duration": 1.0,
+                "start": 0.0,
+                "model": "f5tts",
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            router._remember_candidate(item, {
+                "file": str(leaked),
+                "actual_duration": 1.0,
+                "audible_speech_quality": "passed",
+                "content_completeness_quality": "passed",
+                "reference_leakage_quality": "failed",
+                "reference_leakage_detected": True,
+                "reference_leakage_reason": "reference_latin_in_chinese_target",
+                "voice_consistency_quality": "passed",
+            }, "content_audit")
+            self.assertIsNone(router._adopt_best_generated_candidate(item))
 
 
 def write_wav(path, duration_s, rate=16000, sample=None):
