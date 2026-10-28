@@ -129,14 +129,24 @@ def attach_precise_tts_placement(
     word_gap_seconds: float = 0.42,
     pre_roll: float = 0.06,
     post_roll: float = 0.08,
+    max_onset_shift_seconds: float | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Attach an ideal speech duration and a separate collision boundary.
 
     Public sentence bounds remain immutable.  Long pauses between aligned
     words are retained as diagnostics but are not counted as speech that a
     translation must fill.  Acoustic activity only refines a word-aligned
-    onset when the two sources agree locally.
+    onset when the two sources agree locally.  The sentence start remains the
+    playback anchor: word/VAD evidence may move it inward only by a small,
+    configurable amount.  In particular, a later lexical island after a long
+    pause may reduce the natural-duration budget but may not relocate the
+    complete translated sentence.
     """
+    if max_onset_shift_seconds is None:
+        max_onset_shift_seconds = float(os.getenv(
+            "AUTODUB_TTS_MAX_ONSET_SHIFT_SECONDS", "0.30"
+        ))
+    max_onset_shift_seconds = max(0.0, float(max_onset_shift_seconds))
     active = merge_ranges(speech_ranges, max_gap=0.10)
     output: List[Dict[str, Any]] = []
     audit: List[Dict[str, Any]] = []
@@ -221,11 +231,10 @@ def attach_precise_tts_placement(
         dominant_word_island = None
         dominant_island_mode = bool(ambiguous and long_internal_pauses)
         if dominant_island_mode:
-            # The enclosing word span is not spoken continuously.  Keep the
-            # complete semantic sentence, but anchor its single TTS clip to
-            # the largest lexical island instead of centring it inside a long
-            # silent gap.  Effective duration below still counts every word
-            # island, never the silence between them.
+            # The enclosing word span is not spoken continuously.  Record the
+            # largest lexical island for diagnostics and duration estimation,
+            # but do not move the complete translated sentence to that later
+            # island.  Doing so used to delay some lines by several seconds.
             dominant_index, dominant_range = max(
                 enumerate(word_ranges),
                 key=lambda indexed: (
@@ -234,9 +243,6 @@ def attach_precise_tts_placement(
                 ),
             )
             dominant_start, dominant_end = dominant_range
-            onset = max(outer_start, dominant_start - float(pre_roll))
-            aligned_end = min(outer_end, dominant_end + float(post_roll))
-            hard_end = aligned_end
             dominant_word_island = {
                 "index": dominant_index,
                 "start": round(dominant_start, 3),
@@ -272,7 +278,7 @@ def attach_precise_tts_placement(
             if dominant_word_island is not None else word_ranges
         )
         timing_reason = (
-            "ambiguous_long_pause_dominant_island"
+            "ambiguous_long_pause_preserved_anchor"
             if dominant_island_mode else "word_vad_consensus"
         )
         ratio_guard = None
@@ -324,6 +330,17 @@ def attach_precise_tts_placement(
                 "guarded_start": round(onset, 3),
                 "guarded_end": round(hard_end, 3),
             }
+        # Word alignment and VAD are refinements, not new sentence boundaries.
+        # Never allow either path (including the ambiguity ratio guard) to
+        # delay the complete translated sentence by seconds.  Long pauses are
+        # still excluded from the duration budget through ``speech_islands``.
+        unbounded_onset = onset
+        onset_ceiling = min(
+            outer_end,
+            outer_start + max_onset_shift_seconds,
+        )
+        onset = min(onset, onset_ceiling)
+        onset_shift_limited = onset < unbounded_onset - 1e-9
         effective = sum(max(0.0, end - start) for start, end in speech_islands)
         word_effective = sum(max(0.0, end - start) for start, end in word_ranges)
         # Energy VAD can clip unvoiced consonants.  Never budget less than the
@@ -364,6 +381,10 @@ def attach_precise_tts_placement(
                 minimum_pronounceable, 3
             ),
             "tts_original_placement_start": round(original_onset, 3),
+            "tts_unbounded_placement_start": round(unbounded_onset, 3),
+            "tts_sentence_anchor_start": round(outer_start, 3),
+            "tts_max_onset_shift_seconds": round(max_onset_shift_seconds, 3),
+            "tts_onset_shift_limited": onset_shift_limited,
             "tts_leading_slack_used": round(leading_slack_used, 3),
             "tts_leading_slack_policy": (
                 "bounded_sentence_internal_leading_slack"
@@ -380,7 +401,7 @@ def attach_precise_tts_placement(
                     0.58
                     if timing_reason == "ambiguous_word_span_ratio_guard"
                     else 0.68
-                    if timing_reason == "ambiguous_long_pause_dominant_island"
+                    if timing_reason == "ambiguous_long_pause_preserved_anchor"
                     else (
                         0.72 if ambiguous
                         else min(
@@ -402,6 +423,10 @@ def attach_precise_tts_placement(
             "hard_end": round(hard_end, 3),
             "target_speech_duration": round(effective, 3),
             "original_placement_start": round(original_onset, 3),
+            "unbounded_placement_start": round(unbounded_onset, 3),
+            "sentence_anchor_start": round(outer_start, 3),
+            "max_onset_shift_seconds": round(max_onset_shift_seconds, 3),
+            "onset_shift_limited": onset_shift_limited,
             "leading_slack_used": round(leading_slack_used, 3),
             "dominant_word_island": dominant_word_island,
             "speech_islands": segment["tts_speech_islands"],
