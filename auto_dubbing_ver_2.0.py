@@ -3748,6 +3748,7 @@ def run_step_1a(config: DubbingConfig, input_file: str) -> None:
         "asr_non_dialogue_audited_regions",
         "asr_tts_duration_blocked_ids",
         "segments_step2", "segments_step2_timing_refined", "tts_timing_report",
+        "tts_voice_embedding_audit",
         "segments_emotion", "segments_audio_analyzed",
         "segments_step3", "segments_scheme3", "segments_json_path", "audio_clips",
         "segments_translation_candidates", "translation_candidates_fingerprint",
@@ -3797,6 +3798,7 @@ def run_step_1b(config: DubbingConfig, input_file: str, disable_ocr: bool = Fals
         legacy_corrector_cls=ASROCRCorrector,
         downstream_state_keys=[
             "segments_step2", "segments_step2_timing_refined", "tts_timing_report",
+            "tts_voice_embedding_audit",
             "segments_emotion", "segments_audio_analyzed",
             "segments_step3", "segments_scheme3", "segments_json_path", "audio_clips",
             "segments_translation_candidates", "translation_candidates_fingerprint",
@@ -4508,8 +4510,26 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
                     "tts_reference_duration": metadata.get(
                         "reference_duration"
                     ),
+                    "tts_reference_quality": metadata.get(
+                        "reference_quality", {}
+                    ),
                     "tts_reference_reliability": metadata.get(
                         "reference_reliability"
+                    ),
+                    "tts_voice_consistency_quality": metadata.get(
+                        "voice_consistency_quality"
+                    ),
+                    "tts_voice_consistency_similarity": metadata.get(
+                        "voice_consistency_similarity"
+                    ),
+                    "tts_voice_consistency_threshold": metadata.get(
+                        "voice_consistency_threshold"
+                    ),
+                    "tts_voice_consistency_backend": metadata.get(
+                        "voice_consistency_backend"
+                    ),
+                    "tts_voice_consistency_policy": metadata.get(
+                        "voice_consistency_policy"
                     ),
                     "tts_forced_duration_fit": metadata.get(
                         "forced_duration_fit", False

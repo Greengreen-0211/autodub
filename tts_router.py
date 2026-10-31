@@ -33,7 +33,10 @@ from tts_quality import (
     electricity_quality,
     natural_duration_fit,
     voice_consistency_quality,
-    voice_reference_similarity,
+)
+from tts_voice_identity import (
+    build_voice_profiles,
+    conservative_identity_map,
 )
 
 
@@ -276,6 +279,16 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         ),
         "minimum_voice_consistency": os.getenv(
             "AUTODUB_TTS_MIN_VOICE_CONSISTENCY", "0.45"
+        ),
+        "wespeaker_voice_policy": os.getenv(
+            "AUTODUB_TTS_WESPEAKER_VOICE_POLICY", "warn"
+        ),
+        "minimum_wespeaker_voice_similarity": os.getenv(
+            "AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY", "0.55"
+        ),
+        "wespeaker_model_path": os.getenv(
+            "SIMAM_MODEL_PATH",
+            "/data0/goldenseed/models/wespeaker_simamresnet100/speaker-embedding.onnx",
         ),
     }
     ref_audio = Path(str(item.get("ref_audio") or ""))
@@ -945,9 +958,9 @@ class TTSRouter:
         voice_rank = {
             "passed": 0,
             "degraded": 1,
-            "": 1,
-            "failed": 2,
-        }.get(str(candidate.get("voice_consistency_quality") or ""), 1)
+            "": 2,
+            "failed": 3,
+        }.get(str(candidate.get("voice_consistency_quality") or ""), 2)
         electricity_rank = int(candidate.get("electricity_quality") == "failed")
         duration = float(
             candidate.get("post_trim_duration")
@@ -1184,25 +1197,84 @@ class TTSRouter:
         return updated
 
     @staticmethod
-    def _reference_score(segment: Dict[str, Any], clip: Any) -> float:
+    def _reference_quality(segment: Dict[str, Any], clip: Any) -> tuple:
+        """Score and conservatively trim one cloning-reference candidate."""
         from pydub import silence
-        duration = max(0.0, float(segment["end"]) - float(segment["start"]))
+
         nonsilent = silence.detect_nonsilent(
             clip,
             min_silence_len=180,
             silence_thresh=(clip.dBFS - 18.0 if clip.dBFS != float("-inf") else -50.0),
         )
-        speech_ratio = sum(end - start for start, end in nonsilent) / max(1, len(clip))
-        duration_score = max(0.0, 1.0 - abs(duration - 5.0) / 8.0)
-        loudness_score = max(0.0, min(1.0, (clip.dBFS + 50.0) / 35.0)) if clip.dBFS != float("-inf") else 0.0
-        confidence = float(segment.get("speaker_assignment_confidence", 1.0) or 0.0)
-        boundary_penalty = 0.35 if "speaker_boundary" in (
-            segment.get("segment_split_reasons") or []
-        ) else 0.0
-        return (
-            2.0 * speech_ratio + duration_score + loudness_score
-            + 0.8 * confidence - boundary_penalty
+        if nonsilent:
+            trim_start = max(0, int(nonsilent[0][0]) - 80)
+            trim_end = min(len(clip), int(nonsilent[-1][1]) + 100)
+            trimmed = clip[trim_start:trim_end]
+            shifted_nonsilent = [
+                (max(0, start - trim_start), min(len(trimmed), end - trim_start))
+                for start, end in nonsilent
+                if end > trim_start and start < trim_end
+            ]
+        else:
+            trim_start, trim_end, trimmed = 0, len(clip), clip
+            shifted_nonsilent = []
+        speech_ms = sum(
+            max(0, end - start) for start, end in shifted_nonsilent
         )
+        speech_ratio = speech_ms / max(1, len(trimmed))
+        effective_duration = speech_ms / 1000.0
+        duration_score = max(
+            0.0, 1.0 - abs(effective_duration - 5.0) / 7.0
+        )
+        loudness_score = (
+            max(0.0, min(1.0, (trimmed.dBFS + 50.0) / 35.0))
+            if trimmed.dBFS != float("-inf") else 0.0
+        )
+        internal_gaps = [
+            max(0, right[0] - left[1])
+            for left, right in zip(shifted_nonsilent, shifted_nonsilent[1:])
+        ]
+        longest_silence_ms = max(internal_gaps, default=0)
+        silence_penalty = min(1.0, max(0.0, longest_silence_ms - 350) / 1800.0)
+        samples = trimmed.get_array_of_samples()
+        peak_limit = max(1.0, float(trimmed.max_possible_amplitude) * 0.995)
+        clipping_ratio = (
+            sum(abs(float(value)) >= peak_limit for value in samples)
+            / max(1, len(samples))
+        )
+        clipping_penalty = min(1.0, clipping_ratio / 0.003)
+        confidence = float(segment.get("speaker_assignment_confidence", 1.0) or 0.0)
+        boundary_penalty = 0.45 if (
+            segment.get("speaker_boundary_ambiguous")
+            or "speaker_boundary" in (segment.get("segment_split_reasons") or [])
+        ) else 0.0
+        score = (
+            2.2 * speech_ratio + duration_score + loudness_score
+            + 0.9 * confidence - boundary_penalty
+            - 0.9 * silence_penalty - 1.2 * clipping_penalty
+        )
+        metrics = {
+            "score": round(float(score), 6),
+            "speech_ratio": round(float(speech_ratio), 6),
+            "effective_speech_duration": round(effective_duration, 4),
+            "trimmed_duration": round(len(trimmed) / 1000.0, 4),
+            "leading_trim_seconds": round(trim_start / 1000.0, 4),
+            "trailing_trim_seconds": round((len(clip) - trim_end) / 1000.0, 4),
+            "longest_internal_silence_seconds": round(
+                longest_silence_ms / 1000.0, 4
+            ),
+            "clipping_ratio": round(clipping_ratio, 8),
+            "assignment_confidence": round(confidence, 6),
+            "boundary_ambiguous": bool(
+                segment.get("speaker_boundary_ambiguous")
+            ),
+        }
+        return score, trimmed, metrics, trim_start, trim_end
+
+    @staticmethod
+    def _reference_score(segment: Dict[str, Any], clip: Any) -> float:
+        """Backward-compatible scalar used by older tests and callers."""
+        return float(TTSRouter._reference_quality(segment, clip)[0])
 
     def _speaker_references(self, segments: List[Dict[str, Any]], vocal_path: str) -> Dict[str, Dict[str, str]]:
         from pydub import AudioSegment
@@ -1238,11 +1310,23 @@ class TTSRouter:
                     clip = full_audio[start:end]
                     if len(clip) < 500:
                         continue
+                    (
+                        quality_score,
+                        reference_clip,
+                        quality_metrics,
+                        trim_start,
+                        trim_end,
+                    ) = self._reference_quality(source_segment, clip)
+                    if len(reference_clip) < 400:
+                        continue
                     candidates.append((
-                        self._reference_score(source_segment, clip),
+                        quality_score,
                         index,
                         source_segment,
-                        clip,
+                        reference_clip,
+                        quality_metrics,
+                        trim_start,
+                        trim_end,
                     ))
             if not candidates:
                 print(
@@ -1262,7 +1346,15 @@ class TTSRouter:
             preferred = [item for item in selection_pool if 2500 <= len(item[3]) <= 8000]
             bounded = [item for item in selection_pool if len(item[3]) <= 10000]
             chosen = (preferred or bounded or selection_pool)[0]
-            score, source_index, source_segment, audio = chosen
+            (
+                score,
+                source_index,
+                source_segment,
+                audio,
+                quality_metrics,
+                trim_start,
+                trim_end,
+            ) = chosen
             source_text = str(
                 source_segment.get("original_text")
                 or source_segment.get("qwen3_raw_text")
@@ -1279,11 +1371,12 @@ class TTSRouter:
                 "audio": str(ref_path),
                 "text": source_text,
                 "speaker": speaker,
-                "start": float(source_segment["start"]),
-                "end": float(source_segment["end"]),
+                "start": float(source_segment["start"]) + trim_start / 1000.0,
+                "end": float(source_segment["start"]) + trim_end / 1000.0,
                 "source_segment_id": str(source_segment.get("id", source_index)),
                 "purity_score": round(float(score), 4),
                 "duration": round(len(audio) / 1000.0, 3),
+                "reference_quality": quality_metrics,
                 "assignment_confidence": float(
                     source_segment.get("speaker_assignment_confidence", 1.0)
                     or 0.0
@@ -1293,10 +1386,11 @@ class TTSRouter:
                 "candidate_count": len(candidates),
                 "confident_candidate_count": len(confident),
                 "selected_segment_id": source_segment.get("id", source_index),
-                "start": float(source_segment["start"]),
-                "end": float(source_segment["end"]),
+                "start": float(source_segment["start"]) + trim_start / 1000.0,
+                "end": float(source_segment["start"]) + trim_end / 1000.0,
                 "duration": round(len(audio) / 1000.0, 3),
                 "score": round(float(score), 4),
+                "quality": quality_metrics,
                 "assignment_confidence": source_segment.get("speaker_assignment_confidence"),
                 "confidence_degraded": not bool(confident),
                 "boundary_ambiguous": bool(source_segment.get("speaker_boundary_ambiguous")),
@@ -1307,6 +1401,7 @@ class TTSRouter:
                         "start": float(item[2]["start"]),
                         "end": float(item[2]["end"]),
                         "score": round(float(item[0]), 4),
+                        "quality": item[4],
                         "assignment_confidence": item[2].get(
                             "speaker_assignment_confidence"
                         ),
@@ -1315,74 +1410,47 @@ class TTSRouter:
                 ],
             }
             print(f"参考音频 {speaker}: 候选 {len(candidates)}，选中单段 ID={source_segment.get('id', source_index)}，{len(audio)/1000.0:.2f}s")
-        # Step 2 speaker labels remain untouched: they define dialogue turns and
-        # timestamps.  For voice cloning only, conservatively reuse a stronger
-        # reference when two labels have near-identical acoustic proxies.  This
-        # reduces voice drift caused by an over-split diarization without ever
-        # joining sentences or changing their boundaries.
-        similarity_threshold = float(os.getenv(
-            "AUTODUB_TTS_REFERENCE_IDENTITY_SIMILARITY", "0.90"
-        ))
+        # Step 2 speaker labels remain untouched. For voice cloning only, use
+        # the exact WeSpeaker vectors exported with those immutable sentences
+        # to reconcile obvious over-splitting. Mutual-nearest and temporal
+        # exclusion rules are intentionally stricter than diarization itself.
         minimum_reliable = float(os.getenv(
             "AUTODUB_TTS_MIN_RELIABLE_REFERENCE_SECONDS", "1.50"
         ))
         minimum_reference_confidence = float(os.getenv(
             "AUTODUB_TTS_MIN_RELIABLE_REFERENCE_CONFIDENCE", "0.72"
         ))
-        similarities = []
-        similarity_by_pair = {}
         reference_names = sorted(references)
-        for left_index, left in enumerate(reference_names):
-            for right in reference_names[left_index + 1:]:
-                similarity = voice_reference_similarity(
-                    references[left]["audio"], references[right]["audio"]
+        identity_mode = os.getenv(
+            "AUTODUB_TTS_IDENTITY_REUSE_MODE", "apply"
+        ).strip().lower()
+        if identity_mode not in {"off", "audit", "apply"}:
+            raise ValueError(
+                "AUTODUB_TTS_IDENTITY_REUSE_MODE must be off, audit, or apply"
+            )
+        profiles, speaker_intervals = build_voice_profiles(segments)
+        proposed_identity_map, identity_diagnostics = conservative_identity_map(
+            profiles, speaker_intervals, references
+        )
+        identity_diagnostics["mode"] = identity_mode
+        identity_diagnostics["step2_labels_immutable"] = True
+        if identity_mode == "apply":
+            voice_identity_map = {
+                name: proposed_identity_map.get(name, name)
+                for name in reference_names
+            }
+        else:
+            voice_identity_map = {name: name for name in reference_names}
+        identity_diagnostics["applied_identity_map"] = voice_identity_map
+        if identity_mode == "apply" and identity_diagnostics["merge_decisions"]:
+            print(
+                "🎙️ TTS-only WeSpeaker 音色复用: "
+                + ", ".join(
+                    f"{row['fragment']}→{row['canonical']}"
+                    f"({row['similarity']:.3f})"
+                    for row in identity_diagnostics["merge_decisions"]
                 )
-                if similarity is None:
-                    continue
-                similarity_by_pair[frozenset((left, right))] = similarity
-                similarities.append({
-                    "left": left,
-                    "right": right,
-                    "similarity": round(similarity, 6),
-                    "merged": False,
-                })
-
-        # Reliable references are immutable anchors. A short label may attach
-        # directly to its single closest anchor, but anchors are never merged
-        # with each other and short-to-short transitive chains are forbidden.
-        # This avoids collapsing two same-gender actors through an accidental
-        # A~B~C similarity bridge.
-        anchors = [
-            name for name in reference_names
-            if float(references[name].get("duration", 0.0)) >= minimum_reliable
-            and float(references[name].get("assignment_confidence", 1.0))
-            >= minimum_reference_confidence
-        ]
-        voice_identity_map = {name: name for name in reference_names}
-        for speaker in reference_names:
-            if speaker in anchors:
-                continue
-            matches = [
-                (similarity_by_pair.get(frozenset((speaker, anchor))), anchor)
-                for anchor in anchors
-            ]
-            matches = [
-                (similarity, anchor) for similarity, anchor in matches
-                if similarity is not None and similarity >= similarity_threshold
-            ]
-            if matches:
-                _, best_anchor = max(
-                    matches,
-                    key=lambda item: (
-                        item[0],
-                        float(references[item[1]].get("purity_score", 0.0)),
-                    ),
-                )
-                voice_identity_map[speaker] = best_anchor
-                for row in similarities:
-                    if {row["left"], row["right"]} == {speaker, best_anchor}:
-                        row["merged"] = True
-                        break
+            )
 
         for speaker in reference_names:
             canonical = voice_identity_map[speaker]
@@ -1425,12 +1493,11 @@ class TTSRouter:
             })
         manifest.update({
             "version": 3,
-            "policy": "sentence_boundaries_preserved_voice_identity_reuse_v1",
+            "policy": "wespeaker_mutual_nearest_tts_identity_reuse_v2",
             "minimum_reliable_reference_seconds": minimum_reliable,
             "minimum_reliable_reference_confidence": minimum_reference_confidence,
-            "voice_identity_similarity_threshold": similarity_threshold,
             "voice_identity_map": voice_identity_map,
-            "voice_identity_similarities": similarities,
+            "voice_identity_diagnostics": identity_diagnostics,
         })
         _atomic_json(self.root / "reference_manifest.json", manifest)
         return references
@@ -1730,6 +1797,7 @@ class TTSRouter:
                 "reference_segment_id": reference.get("source_segment_id"),
                 "reference_purity_score": reference.get("purity_score"),
                 "reference_duration": reference.get("duration"),
+                "reference_quality": reference.get("reference_quality", {}),
                 "reference_reliability": reference.get("reference_reliability", "reliable"),
                 "reference_mode": self.reference_mode,
                 "voice_identity": reference.get("voice_identity", speaker),
@@ -2087,6 +2155,7 @@ class TTSRouter:
                              reference_segment_id=item.get("reference_segment_id"),
                              reference_purity_score=item.get("reference_purity_score"),
                              reference_duration=item.get("reference_duration"),
+                             reference_quality=item.get("reference_quality", {}),
                              reference_reliability=item.get("reference_reliability"),
                              reference_mode=item.get("reference_mode", "speaker"),
                              voice_identity=item.get("voice_identity", item["speaker"]),
@@ -2626,7 +2695,7 @@ class TTSRouter:
                                 os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY","warn").strip().lower()=="block"):
                             metadata.update(status="failed", error=metadata.get("electricity_reason","electric artifact detected"))
                         elif (metadata.get("voice_consistency_quality")=="failed" and
-                                os.getenv("AUTODUB_TTS_VOICE_CONSISTENCY_POLICY","block").strip().lower()=="block" and
+                                metadata.get("voice_consistency_policy")=="block" and
                                 item.get("reference_reliability", "reliable") == "reliable"):
                             metadata.update(status="failed", error=metadata.get("voice_consistency_reason","voice consistency check failed"))
                         elif (

@@ -493,6 +493,80 @@ def _read_embedding_windows(emb_scp):
     return windows
 
 
+def attach_tts_voice_embeddings(segments):
+    """Persist robust WeSpeaker evidence for downstream TTS identity reuse.
+
+    These vectors never alter Step 2 labels or sentence boundaries. Keeping
+    them with each immutable sentence lets the TTS layer repair harmless
+    over-splitting without re-running the speaker model in another Conda
+    environment or falling back to content-sensitive MFCC features.
+    """
+    if kaldiio is None or np is None:
+        return segments, {
+            "status": "unavailable",
+            "reason": "kaldiio_or_numpy_missing",
+        }
+    emb_scp = os.path.join(WORK_DIR, "embedding", "emb.scp")
+    if not os.path.isfile(emb_scp):
+        return segments, {
+            "status": "unavailable",
+            "reason": "embedding_scp_missing",
+        }
+    windows = _read_embedding_windows(emb_scp)
+    attached = 0
+    for segment in segments:
+        try:
+            start = float(segment.get("start", 0.0))
+            end = float(segment.get("end", start))
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        selected = [
+            item for item in windows
+            if start <= float(item["center"]) <= end
+            and min(end, float(item["end"]))
+            - max(start, float(item["start"])) >= 0.20
+        ]
+        if not selected:
+            # Very short replies may fall between 0.75 s window centres. A
+            # single strongly overlapping window is still useful weak evidence.
+            overlapping = [
+                item for item in windows
+                if min(end, float(item["end"]))
+                - max(start, float(item["start"]))
+                >= min(0.35, 0.60 * (end - start))
+            ]
+            if overlapping:
+                selected = [max(
+                    overlapping,
+                    key=lambda item: min(end, float(item["end"]))
+                    - max(start, float(item["start"])),
+                )]
+        if not selected:
+            continue
+        values = [item["embedding"] for item in selected]
+        pooled, retained = _robust_embedding_pool(values)
+        stacked = np.stack(values)
+        cohesion = float(np.mean(stacked @ pooled))
+        segment["wespeaker_tts_embedding"] = [
+            round(float(value), 7) for value in pooled.tolist()
+        ]
+        segment["wespeaker_tts_embedding_windows"] = int(retained)
+        segment["wespeaker_tts_embedding_cohesion"] = round(cohesion, 6)
+        segment["wespeaker_tts_embedding_source"] = (
+            "step2_simamresnet100_segment_pool"
+        )
+        attached += 1
+    return segments, {
+        "status": "success" if attached else "empty",
+        "backend": "SimAMResNet100",
+        "segment_count": len(segments),
+        "attached_segment_count": attached,
+        "embedding_window_count": len(windows),
+    }
+
+
 def _timestamp_items(segments):
     """Collect valid timestamps and recover punctuation from the transcript."""
     from speaker_alignment import normalize_timestamp_items
@@ -4167,6 +4241,13 @@ def main():
         update_dialogue_identity_diagnostics(aligned, diagnostics)
         save_clustering_diagnostics(diagnostics)
 
+    aligned, tts_voice_embedding_audit = attach_tts_voice_embeddings(aligned)
+    print(
+        "🎙️ TTS 声纹证据: "
+        f"{tts_voice_embedding_audit.get('attached_segment_count', 0)}/"
+        f"{tts_voice_embedding_audit.get('segment_count', len(aligned))} 句已附加"
+    )
+
     clustering_comparison = None
     pairwise_aligned = None
     if (
@@ -4227,6 +4308,7 @@ def main():
             + ", ".join(removed)
         )
     state["segments_step2"] = aligned
+    state["tts_voice_embedding_audit"] = tts_voice_embedding_audit
     if clustering_comparison is not None:
         state["speaker_clustering_comparison"] = clustering_comparison
         state["segments_step2_wespeaker_pairwise"] = pairwise_aligned

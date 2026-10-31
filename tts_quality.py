@@ -8,6 +8,9 @@ import re
 from pathlib import Path
 
 
+_WESPEAKER_ONNX_SESSIONS = {}
+
+
 def duration_quality(actual: float, target: float) -> dict:
     absolute=abs(actual-target)
     ratio=actual/target if target>0 else 0.0
@@ -223,10 +226,99 @@ def audible_speech_quality(path, *, expected_text: str = "") -> dict:
     }
 
 
+def _wespeaker_embedding(path):
+    """Extract a SimAMResNet100 voice vector when the runtime is available."""
+    model_path = os.getenv(
+        "SIMAM_MODEL_PATH",
+        "/data0/goldenseed/models/wespeaker_simamresnet100/speaker-embedding.onnx",
+    )
+    if not model_path or not Path(model_path).is_file():
+        return None
+    try:
+        import numpy as np
+        import onnxruntime as ort
+        import soundfile as sf
+        import torch
+        import torchaudio
+        import torchaudio.compliance.kaldi as kaldi
+    except Exception:
+        return None
+    try:
+        session = _WESPEAKER_ONNX_SESSIONS.get(model_path)
+        if session is None:
+            configured = os.getenv(
+                "AUTODUB_TTS_WESPEAKER_ONNX_PROVIDER", "CPUExecutionProvider"
+            ).strip()
+            providers = [configured] if configured else ["CPUExecutionProvider"]
+            session = ort.InferenceSession(model_path, providers=providers)
+            _WESPEAKER_ONNX_SESSIONS[model_path] = session
+        audio, sample_rate = sf.read(str(path), dtype="float32")
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+        if audio.size < max(400, int(sample_rate * 0.20)):
+            return None
+        waveform = torch.from_numpy(audio).reshape(1, -1)
+        if int(sample_rate) != 16000:
+            waveform = torchaudio.functional.resample(
+                waveform, int(sample_rate), 16000
+            )
+        sample_rate = 16000
+        window_samples = int(1.5 * sample_rate)
+        period_samples = int(0.75 * sample_rate)
+        starts = list(range(0, max(1, waveform.shape[-1] - window_samples + 1), period_samples))
+        if not starts or starts[-1] + window_samples < waveform.shape[-1] - period_samples:
+            starts.append(max(0, waveform.shape[-1] - window_samples))
+        vectors = []
+        input_name = session.get_inputs()[0].name
+        for start in sorted(set(starts)):
+            chunk = waveform[:, start:min(waveform.shape[-1], start + window_samples)]
+            if chunk.shape[-1] < int(0.20 * sample_rate):
+                continue
+            features = kaldi.fbank(
+                chunk,
+                htk_compat=True,
+                sample_frequency=sample_rate,
+                use_energy=False,
+                window_type="hanning",
+                num_mel_bins=80,
+                dither=0.0,
+                frame_shift=10,
+            )
+            features = features - features.mean(dim=0, keepdim=True)
+            output = session.run(
+                None, {input_name: features.unsqueeze(0).numpy()}
+            )[0]
+            vector = np.asarray(output, dtype=np.float32).reshape(-1)
+            norm = float(np.linalg.norm(vector))
+            if norm > 1e-9:
+                vectors.append(vector / norm)
+        if not vectors:
+            return None
+        pooled = np.mean(np.stack(vectors), axis=0)
+        norm = float(np.linalg.norm(pooled))
+        return pooled / norm if norm > 1e-9 else None
+    except Exception:
+        return None
+
+
+def _preferred_voice_embedding(path):
+    embedding = _wespeaker_embedding(path)
+    if embedding is not None:
+        return embedding, "wespeaker_simamresnet100"
+    embedding = _voice_proxy_embedding(path)
+    if embedding is not None:
+        return embedding, "mfcc_proxy_fallback"
+    return None, "unavailable"
+
+
 def voice_reference_similarity(left_path, right_path):
-    """Return the conservative MFCC proxy similarity used by reference reuse."""
-    left = _voice_proxy_embedding(left_path)
-    right = _voice_proxy_embedding(right_path)
+    """Return voice similarity, preferring the real WeSpeaker encoder."""
+    left, left_backend = _preferred_voice_embedding(left_path)
+    right, right_backend = _preferred_voice_embedding(right_path)
+    if left_backend != right_backend:
+        left = _voice_proxy_embedding(left_path)
+        right = _voice_proxy_embedding(right_path)
     if left is None or right is None:
         return None
     return float(left @ right)
@@ -351,36 +443,57 @@ def voice_consistency_quality(reference_path, synthesized_path):
     default threshold should be calibrated with production samples before
     enabling blocking.
     """
-    policy = os.getenv(
+    global_policy = os.getenv(
         "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY", "block"
     ).strip().lower()
+    if global_policy == "off":
+        return {
+            "voice_consistency_quality": "skipped",
+            "voice_consistency_policy": "off",
+        }
+    reference, reference_backend = _preferred_voice_embedding(reference_path)
+    synthesized, synthesized_backend = _preferred_voice_embedding(synthesized_path)
+    backend = (
+        reference_backend
+        if reference_backend == synthesized_backend else "mfcc_proxy_fallback"
+    )
+    if backend == "wespeaker_simamresnet100":
+        policy = os.getenv(
+            "AUTODUB_TTS_WESPEAKER_VOICE_POLICY", "warn"
+        ).strip().lower()
+        minimum = float(os.getenv(
+            "AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY", "0.55"
+        ))
+    else:
+        policy = global_policy
+        minimum = float(os.getenv(
+            "AUTODUB_TTS_MIN_VOICE_CONSISTENCY", "0.45"
+        ))
     if policy == "off":
         return {
             "voice_consistency_quality": "skipped",
             "voice_consistency_policy": policy,
         }
-    reference = _voice_proxy_embedding(reference_path)
-    synthesized = _voice_proxy_embedding(synthesized_path)
     if reference is None or synthesized is None:
         return {
             "voice_consistency_quality": "skipped",
             "voice_consistency_policy": policy,
             "voice_consistency_reason": "feature extraction unavailable",
-            "voice_consistency_backend": "mfcc_proxy",
+            "voice_consistency_backend": backend,
         }
     similarity = float(reference @ synthesized)
-    minimum = float(os.getenv(
-        "AUTODUB_TTS_MIN_VOICE_CONSISTENCY", "0.45"
-    ))
     failed = similarity < minimum
+    quality = "passed"
+    if failed:
+        quality = "failed" if policy == "block" else "degraded"
     return {
-        "voice_consistency_quality": "failed" if failed else "passed",
+        "voice_consistency_quality": quality,
         "voice_consistency_policy": policy,
         "voice_consistency_similarity": round(similarity, 6),
         "voice_consistency_threshold": minimum,
-        "voice_consistency_backend": "mfcc_proxy",
+        "voice_consistency_backend": backend,
         "voice_consistency_reason": (
-            f"proxy_similarity={similarity:.4f}<{minimum:.4f}"
+            f"voice_similarity={similarity:.4f}<{minimum:.4f}"
             if failed else ""
         ),
     }
@@ -392,6 +505,9 @@ def stage_fingerprint(state, config, backend):
                                    "tts_hard_end", "tts_target_duration",
                                    "tts_timing_precision", "tts_timing_reason",
                                    "speaker_boundary_ambiguous",
+                                   "wespeaker_tts_embedding",
+                                   "wespeaker_tts_embedding_windows",
+                                   "wespeaker_tts_embedding_cohesion",
                                    "translation_selection_source")} for s in state.get("segments_step3",[])]
     media={}
     for key in ("vocals_path","accomp_path"):
@@ -399,10 +515,18 @@ def stage_fingerprint(state, config, backend):
         if path.is_file():
             info=path.stat()
             media[key]={"path":str(path.resolve()),"size":info.st_size,"mtime_ns":info.st_mtime_ns}
-    payload={"version":"tts-stage-v2.8.0-pronounceable-window-reference-fallback","segments":segments,"media":media,"backend":backend,
+    payload={"version":"tts-stage-v2.9.0-wespeaker-voice-identity","segments":segments,"media":media,"backend":backend,
              "input_file":state.get("input_file"),
              "target_lang":str(config.target_lang).lower(),
-             "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs")))}
+             "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs"))),
+             "voice_policy":{
+                 "reference_mode":os.getenv("AUTODUB_TTS_REFERENCE_MODE","speaker"),
+                 "identity_reuse_mode":os.getenv("AUTODUB_TTS_IDENTITY_REUSE_MODE","apply"),
+                 "identity_similarity":os.getenv("AUTODUB_TTS_WESPEAKER_IDENTITY_SIMILARITY","0.78"),
+                 "identity_margin":os.getenv("AUTODUB_TTS_WESPEAKER_IDENTITY_MARGIN","0.06"),
+                 "candidate_policy":os.getenv("AUTODUB_TTS_WESPEAKER_VOICE_POLICY","warn"),
+                 "candidate_similarity":os.getenv("AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY","0.55"),
+             }}
     return hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
 
 
