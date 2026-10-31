@@ -204,6 +204,58 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _f5_native_duration_eligibility(actual: float, target: float) -> Dict[str, Any]:
+    """Judge whether F5 may make one model-native duration-controlled pass.
+
+    This is intentionally separate from :func:`duration_adaptation_safety`.
+    The latter protects post-generation atempo processing and is especially
+    strict for short lines. F5's native duration control generates a new
+    waveform inside the acoustic model, so a credible near miss may use a
+    slightly wider range without authorising the same amount of time scaling.
+    Gross duration anomalies remain ineligible because they can indicate
+    babble, incomplete speech, or copied reference content.
+    """
+    actual = float(actual or 0.0)
+    target = float(target or 0.0)
+    ratio = actual / target if actual > 0.0 and target > 0.0 else 0.0
+    minimum = max(
+        0.01,
+        float(os.getenv("AUTODUB_F5_NATIVE_DURATION_MIN_RATIO", "0.80")),
+    )
+    maximum = max(
+        minimum,
+        float(os.getenv("AUTODUB_F5_NATIVE_DURATION_MAX_RATIO", "1.50")),
+    )
+    anomaly_limit = max(
+        1.0,
+        float(os.getenv("AUTODUB_TTS_GENERATION_ANOMALY_RATIO", "2.00")),
+    )
+    eligible = (
+        actual > 0.0
+        and target > 0.0
+        and minimum <= ratio <= maximum
+        and ratio < anomaly_limit
+    )
+    if actual <= 0.0 or target <= 0.0:
+        reason = "missing_duration"
+    elif ratio >= anomaly_limit:
+        reason = "generation_anomaly"
+    elif ratio < minimum:
+        reason = "implausibly_short"
+    elif ratio > maximum:
+        reason = "too_long_for_native_control"
+    else:
+        reason = "credible_near_miss"
+    return {
+        "f5_native_duration_input_ratio": ratio,
+        "f5_native_duration_min_ratio": minimum,
+        "f5_native_duration_max_ratio": maximum,
+        "f5_native_duration_anomaly_ratio": anomaly_limit,
+        "f5_native_duration_eligible": bool(eligible),
+        "f5_native_duration_eligibility_reason": reason,
+    }
+
+
 def _minimum_pronounceable_duration(text: Any, language: Any = "") -> float:
     """Return a conservative lower speech budget for complete target text.
 
@@ -278,6 +330,12 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         ),
         "maximum_safe_slowdown_ratio": os.getenv(
             "AUTODUB_TTS_MAX_SAFE_SLOWDOWN_RATIO", "1.25"
+        ),
+        "f5_native_duration_min_ratio": os.getenv(
+            "AUTODUB_F5_NATIVE_DURATION_MIN_RATIO", "0.80"
+        ),
+        "f5_native_duration_max_ratio": os.getenv(
+            "AUTODUB_F5_NATIVE_DURATION_MAX_RATIO", "1.50"
         ),
     }
     payload["quality_policy"] = {
@@ -2865,17 +2923,37 @@ class TTSRouter:
             chosen_safety = duration_adaptation_safety(
                 chosen["fit"]["natural_duration"], item["target_duration"]
             )
+            native_eligibility = _f5_native_duration_eligibility(
+                chosen["fit"]["natural_duration"], item["target_duration"]
+            )
+            chosen_metadata = chosen.get("metadata") or {}
+            candidate_leakage_safe = (
+                not bool(chosen_metadata.get("reference_leakage_detected"))
+                and chosen_metadata.get("reference_leakage_quality") != "failed"
+            )
+            if item["model"] != "f5tts":
+                native_eligibility["f5_native_duration_eligible"] = False
+                native_eligibility[
+                    "f5_native_duration_eligibility_reason"
+                ] = "non_f5_engine"
+            elif not candidate_leakage_safe:
+                native_eligibility["f5_native_duration_eligible"] = False
+                native_eligibility[
+                    "f5_native_duration_eligibility_reason"
+                ] = "known_reference_leakage"
             # F5 can control output duration inside the acoustic model.  Use
             # that as the preferred final pass after selecting the best text,
             # but only when the unconstrained result is already close enough
-            # to be credible.  A huge duration anomaly may contain babble or
-            # reference leakage and must fall back to another engine instead
-            # of being hidden inside native duration control.
+            # to be credible. This gate is deliberately wider than the
+            # post-generation atempo limit: native duration control creates a
+            # new waveform, while atempo distorts an existing one. A huge
+            # anomaly or known reference leakage must still fall back to
+            # another engine instead of being hidden by native control.
             if (
                 item["model"] == "f5tts"
                 and chosen["fit"]["natural_duration_fit"] != "passed"
-                and chosen_safety["safe_to_force_fit"]
-                and not chosen_safety["duration_anomaly"]
+                and native_eligibility["f5_native_duration_eligible"]
+                and candidate_leakage_safe
                 and int(item.get("generation_attempt_count") or 0)
                 < _generation_attempt_limit()
             ):
@@ -3095,6 +3173,7 @@ class TTSRouter:
                     ),
                     duration_candidate_selector=selector_result or {},
                     native_duration_control=bool(native_duration_control),
+                    **native_eligibility,
                     duration_attempt_history=[
                         {
                             "attempt": candidate["attempt"],

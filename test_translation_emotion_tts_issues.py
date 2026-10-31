@@ -926,12 +926,22 @@ class RouterTests(unittest.TestCase):
                 "atempo_raw_factor":actual/target,"atempo_capped":False,
                 **tts_router.duration_adaptation_safety(actual,target),
             }
-        with tempfile.TemporaryDirectory() as tmp,patch(
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ, {
+            "AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO": "1.18",
+            "AUTODUB_F5_NATIVE_DURATION_MIN_RATIO": "0.80",
+            "AUTODUB_F5_NATIVE_DURATION_MAX_RATIO": "1.50",
+            "AUTODUB_TTS_GENERATION_ANOMALY_RATIO": "2.00",
+        }),patch(
             "tts_router.preflight_models"
         ),patch("tts_router._run_worker",side_effect=worker),patch(
             "tts_router._postprocess",side_effect=postprocess
         ),patch("tts_router.electricity_quality",return_value={}),patch(
             "tts_router.voice_consistency_quality",return_value={}
+        ),patch(
+            "tts_router.audible_speech_quality",
+            return_value={"audible_speech_quality": "passed"},
+        ),patch.object(
+            tts_router.TTSRouter, "_remember_candidate", return_value=None,
         ):
             router=self.setup_router(tmp)
             router.duration_rewriter=lambda *_args,**_kwargs:None
@@ -946,6 +956,29 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(
             results[0]["duration_selection_reason"],
             "f5_native_duration_final_pass",
+        )
+
+    def test_f5_native_duration_gate_is_separate_from_atempo_safety(self):
+        with patch.dict(os.environ, {
+            "AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO": "1.25",
+            "AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO": "1.18",
+            "AUTODUB_F5_NATIVE_DURATION_MIN_RATIO": "0.80",
+            "AUTODUB_F5_NATIVE_DURATION_MAX_RATIO": "1.50",
+            "AUTODUB_TTS_GENERATION_ANOMALY_RATIO": "2.00",
+        }):
+            atempo = tts_router.duration_adaptation_safety(1.30, 1.00)
+            native = tts_router._f5_native_duration_eligibility(1.30, 1.00)
+            anomaly = tts_router._f5_native_duration_eligibility(2.10, 1.00)
+        self.assertFalse(atempo["safe_to_force_fit"])
+        self.assertTrue(native["f5_native_duration_eligible"])
+        self.assertEqual(
+            native["f5_native_duration_eligibility_reason"],
+            "credible_near_miss",
+        )
+        self.assertFalse(anomaly["f5_native_duration_eligible"])
+        self.assertEqual(
+            anomaly["f5_native_duration_eligibility_reason"],
+            "generation_anomaly",
         )
 
     def test_duration_candidate_selector_can_preserve_contextual_wording(self):
