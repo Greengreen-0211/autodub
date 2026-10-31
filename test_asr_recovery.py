@@ -2,8 +2,10 @@
 
 import unittest
 import json
+import os
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from asr_recovery import (
     acoustic_dialogue_score,
@@ -343,10 +345,10 @@ class OCRTimelineTests(unittest.TestCase):
         )
         row = refined[0]
         self.assertAlmostEqual(row["tts_original_placement_start"], 42.87)
-        # The pronunciation slack remains diagnostic, while the universal
-        # sentence-anchor guard prevents the final placement from drifting
-        # more than 0.30 s into the sentence.
-        self.assertAlmostEqual(row["tts_placement_start"], 42.27)
+        # The pronunciation slack remains diagnostic, while the public
+        # sentence boundary is now the authoritative playback anchor.
+        self.assertAlmostEqual(row["tts_placement_start"], 41.97)
+        self.assertTrue(row["tts_sentence_start_anchored"])
         self.assertAlmostEqual(row["tts_leading_slack_used"], 0.18)
         self.assertAlmostEqual(row["tts_target_duration"], 0.80)
         self.assertEqual(row["tts_hard_end"], 43.49)
@@ -421,7 +423,7 @@ class OCRTimelineTests(unittest.TestCase):
         )
         self.assertFalse(row["tts_onset_shift_limited"])
 
-    def test_word_timing_cannot_move_complete_sentence_more_than_point_three(self):
+    def test_word_timing_cannot_move_complete_sentence_off_public_anchor(self):
         segment = {
             "id": 12, "start": 57.74, "end": 60.75,
             "text": "Hold on.", "timestamp_precision": "word",
@@ -435,12 +437,30 @@ class OCRTimelineTests(unittest.TestCase):
         )
         row = refined[0]
         self.assertAlmostEqual(row["tts_unbounded_placement_start"], 59.90)
-        self.assertAlmostEqual(row["tts_placement_start"], 58.04)
-        self.assertAlmostEqual(
-            row["tts_placement_start"] - row["start"], 0.30
-        )
+        self.assertAlmostEqual(row["tts_placement_start"], 57.74)
+        self.assertAlmostEqual(row["tts_placement_start"] - row["start"], 0.0)
+        self.assertTrue(row["tts_sentence_start_anchored"])
         self.assertTrue(row["tts_onset_shift_limited"])
         self.assertTrue(audit[0]["onset_shift_limited"])
+
+    def test_legacy_bounded_shift_requires_explicit_anchor_opt_out(self):
+        segment = {
+            "id": 12, "start": 57.74, "end": 60.75,
+            "text": "Hold on.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Hold", "start": 59.95, "end": 60.30},
+                {"text": "on", "start": 60.30, "end": 60.69},
+            ],
+        }
+        with patch.dict(
+            os.environ,
+            {"AUTODUB_TTS_PRESERVE_SENTENCE_START": "0"},
+        ):
+            refined, _ = attach_precise_tts_placement(
+                [segment], [(59.93, 60.71)]
+            )
+        self.assertAlmostEqual(refined[0]["tts_placement_start"], 58.04)
+        self.assertFalse(refined[0]["tts_sentence_start_anchored"])
 
     def test_ambiguous_implausible_word_span_uses_local_ratio_guard(self):
         segment = {

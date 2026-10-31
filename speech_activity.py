@@ -135,18 +135,21 @@ def attach_precise_tts_placement(
 
     Public sentence bounds remain immutable.  Long pauses between aligned
     words are retained as diagnostics but are not counted as speech that a
-    translation must fill.  Acoustic activity only refines a word-aligned
-    onset when the two sources agree locally.  The sentence start remains the
-    playback anchor: word/VAD evidence may move it inward only by a small,
-    configurable amount.  In particular, a later lexical island after a long
-    pause may reduce the natural-duration budget but may not relocate the
-    complete translated sentence.
+    translation must fill.  Acoustic activity refines the natural-duration
+    estimate, not the default playback anchor.  A reliable word-level sentence
+    therefore starts at its public sentence boundary; otherwise a 0.30 s
+    alignment refinement plus TTS-internal leading silence can make a short
+    line audibly more than half a second late.  The older bounded inward shift
+    remains available only through an explicit opt-out environment flag.
     """
     if max_onset_shift_seconds is None:
         max_onset_shift_seconds = float(os.getenv(
             "AUTODUB_TTS_MAX_ONSET_SHIFT_SECONDS", "0.30"
         ))
     max_onset_shift_seconds = max(0.0, float(max_onset_shift_seconds))
+    preserve_sentence_start = os.getenv(
+        "AUTODUB_TTS_PRESERVE_SENTENCE_START", "1"
+    ).strip().lower() in {"1", "true", "yes", "y", "on"}
     active = merge_ranges(speech_ranges, max_gap=0.10)
     output: List[Dict[str, Any]] = []
     audit: List[Dict[str, Any]] = []
@@ -335,11 +338,14 @@ def attach_precise_tts_placement(
         # delay the complete translated sentence by seconds.  Long pauses are
         # still excluded from the duration budget through ``speech_islands``.
         unbounded_onset = onset
-        onset_ceiling = min(
-            outer_end,
-            outer_start + max_onset_shift_seconds,
-        )
-        onset = min(onset, onset_ceiling)
+        if preserve_sentence_start:
+            onset = outer_start
+        else:
+            onset_ceiling = min(
+                outer_end,
+                outer_start + max_onset_shift_seconds,
+            )
+            onset = min(onset, onset_ceiling)
         onset_shift_limited = onset < unbounded_onset - 1e-9
         effective = sum(max(0.0, end - start) for start, end in speech_islands)
         word_effective = sum(max(0.0, end - start) for start, end in word_ranges)
@@ -383,6 +389,7 @@ def attach_precise_tts_placement(
             "tts_original_placement_start": round(original_onset, 3),
             "tts_unbounded_placement_start": round(unbounded_onset, 3),
             "tts_sentence_anchor_start": round(outer_start, 3),
+            "tts_sentence_start_anchored": preserve_sentence_start,
             "tts_max_onset_shift_seconds": round(max_onset_shift_seconds, 3),
             "tts_onset_shift_limited": onset_shift_limited,
             "tts_leading_slack_used": round(leading_slack_used, 3),
@@ -425,6 +432,7 @@ def attach_precise_tts_placement(
             "original_placement_start": round(original_onset, 3),
             "unbounded_placement_start": round(unbounded_onset, 3),
             "sentence_anchor_start": round(outer_start, 3),
+            "sentence_start_anchored": preserve_sentence_start,
             "max_onset_shift_seconds": round(max_onset_shift_seconds, 3),
             "onset_shift_limited": onset_shift_limited,
             "leading_slack_used": round(leading_slack_used, 3),

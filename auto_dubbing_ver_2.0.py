@@ -4449,6 +4449,16 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
                     "fallback_count": metadata.get("fallback_count"),
                     "duration_ratio": metadata.get("duration_ratio"),
                     "tts_actual_duration": metadata.get("actual_duration"),
+                    "tts_source_trimmed_leading_silence": metadata.get(
+                        "source_trimmed_leading_silence_seconds"
+                    ),
+                    "tts_audible_leading_silence": metadata.get(
+                        "audible_leading_silence_seconds"
+                    ),
+                    "tts_audible_trailing_silence": metadata.get(
+                        "audible_trailing_silence_seconds"
+                    ),
+                    "tts_timing_quality": metadata.get("timing_quality"),
                     "tts_target_duration": metadata.get("target_duration"),
                     "tts_duration_error": metadata.get("duration_error"),
                     "tts_natural_duration": metadata.get("natural_duration"),

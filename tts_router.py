@@ -538,6 +538,72 @@ def _apply_atempo_exact(
     }
 
 
+def _silence_trim_plan(clip: Any) -> Dict[str, Any]:
+    """Measure trustworthy speech edges with an adaptive noise threshold.
+
+    A fixed -45 dBFS threshold misses the low-level breath/noise emitted by
+    some CosyVoice generations, leaving 250-400 ms before the first word.  A
+    relative threshold follows each clip's actual level, while a ceiling and
+    conservative pads protect quiet speech and initial consonants.
+    """
+    from pydub import silence as pydub_silence
+
+    duration_ms = len(clip)
+    source_dbfs = (
+        float(clip.dBFS) if clip.dBFS != float("-inf") else -120.0
+    )
+    absolute_floor = float(os.getenv(
+        "AUTODUB_TTS_SILENCE_THRESH_DBFS", "-45"
+    ))
+    relative_db = max(0.0, float(os.getenv(
+        "AUTODUB_TTS_SILENCE_RELATIVE_DB", "16"
+    )))
+    maximum_threshold = float(os.getenv(
+        "AUTODUB_TTS_SILENCE_MAX_THRESH_DBFS", "-28"
+    ))
+    threshold = min(
+        maximum_threshold,
+        max(absolute_floor, source_dbfs - relative_db),
+    )
+    min_len = max(20, int(os.getenv(
+        "AUTODUB_TTS_SILENCE_MIN_LEN_MS", "80"
+    )))
+    legacy_pad = int(os.getenv("AUTODUB_TTS_SILENCE_PAD_MS", "70"))
+    leading_pad = max(0, int(os.getenv(
+        "AUTODUB_TTS_SILENCE_LEADING_PAD_MS", str(legacy_pad)
+    )))
+    trailing_pad = max(0, int(os.getenv(
+        "AUTODUB_TTS_SILENCE_TRAILING_PAD_MS", "50"
+    )))
+    ranges = pydub_silence.detect_nonsilent(
+        clip,
+        min_silence_len=min_len,
+        silence_thresh=threshold,
+        seek_step=5,
+    )
+    if not ranges:
+        return {
+            "detected": False,
+            "source_dbfs": source_dbfs,
+            "threshold_dbfs": threshold,
+            "nonsilent_start_ms": 0,
+            "nonsilent_end_ms": duration_ms,
+            "trim_start_ms": 0,
+            "trim_end_ms": duration_ms,
+        }
+    nonsilent_start = max(0, int(ranges[0][0]))
+    nonsilent_end = min(duration_ms, int(ranges[-1][1]))
+    return {
+        "detected": True,
+        "source_dbfs": source_dbfs,
+        "threshold_dbfs": threshold,
+        "nonsilent_start_ms": nonsilent_start,
+        "nonsilent_end_ms": nonsilent_end,
+        "trim_start_ms": max(0, nonsilent_start - leading_pad),
+        "trim_end_ms": min(duration_ms, nonsilent_end + trailing_pad),
+    }
+
+
 def _trim_silence(source: Path, destination: Path) -> Path:
     """Trim leading/trailing silence (TTS首尾静音).
 
@@ -549,26 +615,54 @@ def _trim_silence(source: Path, destination: Path) -> Path:
         shutil.copy2(source, destination)
         return destination
     from pydub import AudioSegment
-    from pydub import silence as pydub_silence
     clip = AudioSegment.from_wav(str(source))
     if len(clip) <= 300:
         shutil.copy2(source, destination)
         return destination
-    threshold = float(os.getenv("AUTODUB_TTS_SILENCE_THRESH_DBFS", "-45"))
-    min_len = int(os.getenv("AUTODUB_TTS_SILENCE_MIN_LEN_MS", "100"))
-    pad = int(os.getenv("AUTODUB_TTS_SILENCE_PAD_MS", "30"))
-    ranges = pydub_silence.detect_nonsilent(clip, min_silence_len=min_len, silence_thresh=threshold)
-    if not ranges:
+    plan = _silence_trim_plan(clip)
+    if not plan["detected"]:
         shutil.copy2(source, destination)
         return destination
-    start = max(0, ranges[0][0] - pad)
-    end = min(len(clip), ranges[-1][1] + pad)
+    start = int(plan["trim_start_ms"])
+    end = int(plan["trim_end_ms"])
     if end <= start:
+        shutil.copy2(source, destination)
+        return destination
+    if start <= 0 and end >= len(clip):
         shutil.copy2(source, destination)
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
     clip[start:end].export(str(destination), format="wav")
     return destination
+
+
+def _edge_silence_metrics(path: Path) -> Dict[str, Any]:
+    """Return auditable speech-edge measurements without mutating audio."""
+    from pydub import AudioSegment
+
+    clip = AudioSegment.from_wav(str(path))
+    plan = _silence_trim_plan(clip)
+    duration_ms = len(clip)
+    return {
+        "trim_detection_source_dbfs": round(float(plan["source_dbfs"]), 3),
+        "trim_detection_threshold_dbfs": round(
+            float(plan["threshold_dbfs"]), 3
+        ),
+        "detected_leading_silence_seconds": round(
+            float(plan["nonsilent_start_ms"]) / 1000.0, 6
+        ),
+        "detected_trailing_silence_seconds": round(
+            max(0.0, duration_ms - float(plan["nonsilent_end_ms"])) / 1000.0,
+            6,
+        ),
+        "trimmed_leading_silence_seconds": round(
+            float(plan["trim_start_ms"]) / 1000.0, 6
+        ),
+        "trimmed_trailing_silence_seconds": round(
+            max(0.0, duration_ms - float(plan["trim_end_ms"])) / 1000.0,
+            6,
+        ),
+    }
 
 
 def _postprocess(
@@ -582,6 +676,7 @@ def _postprocess(
     trimmed = destination.with_name(destination.stem + ".trim.wav")
     try:
         pre_trim = _wav_duration(source)
+        source_edges = _edge_silence_metrics(source)
         _trim_silence(source, trimmed)
         post_trim = _wav_duration(trimmed)
         factor, capped, raw = _atempo_factor(post_trim, target_duration)
@@ -608,6 +703,7 @@ def _postprocess(
                 }
             else:
                 forced = _apply_atempo_exact(trimmed, destination, target_duration)
+        final_edges = _edge_silence_metrics(destination)
     finally:
         if trimmed.exists():
             trimmed.unlink(missing_ok=True)
@@ -618,9 +714,47 @@ def _postprocess(
         "atempo_raw_factor": round(raw, 6),
         "atempo_capped": bool(capped),
         "actual_duration": _wav_duration(destination),
+        "source_detected_leading_silence_seconds": source_edges[
+            "detected_leading_silence_seconds"
+        ],
+        "source_trimmed_leading_silence_seconds": source_edges[
+            "trimmed_leading_silence_seconds"
+        ],
+        "source_trimmed_trailing_silence_seconds": source_edges[
+            "trimmed_trailing_silence_seconds"
+        ],
+        "audible_leading_silence_seconds": final_edges[
+            "detected_leading_silence_seconds"
+        ],
+        "audible_trailing_silence_seconds": final_edges[
+            "detected_trailing_silence_seconds"
+        ],
+        "silence_detection_threshold_dbfs": final_edges[
+            "trim_detection_threshold_dbfs"
+        ],
         **adaptation,
         **forced,
     }
+
+
+def _leading_silence_failure(metadata: Dict[str, Any]) -> str:
+    """Return a blocking reason when the final WAV still starts too late."""
+    maximum = max(0.0, float(os.getenv(
+        "AUTODUB_TTS_MAX_AUDIBLE_LEADING_SILENCE_SECONDS", "0.18"
+    )))
+    try:
+        actual = max(
+            0.0,
+            float(metadata.get("audible_leading_silence_seconds") or 0.0),
+        )
+    except (TypeError, ValueError):
+        actual = float("inf")
+    if actual <= maximum:
+        return ""
+    return (
+        "generated WAV starts too late after silence trim: "
+        f"{actual:.3f}s > {maximum:.3f}s"
+    )
 
 
 def _worker_environment(model: str) -> Dict[str, str]:
@@ -905,6 +1039,15 @@ class TTSRouter:
             )
         if measured.get("audible_speech_quality") != "passed":
             return
+        if measured.get("audible_leading_silence_seconds") is None:
+            edge_metrics = _edge_silence_metrics(source)
+            measured.update(edge_metrics)
+            measured["audible_leading_silence_seconds"] = edge_metrics[
+                "detected_leading_silence_seconds"
+            ]
+            measured["audible_trailing_silence_seconds"] = edge_metrics[
+                "detected_trailing_silence_seconds"
+            ]
         audio_sha = str(measured.get("audio_sha256") or _file_sha256(source))
         reference = Path(str(item.get("ref_audio") or ""))
         reference_sha = _file_sha256(reference) if reference.is_file() else ""
@@ -962,6 +1105,14 @@ class TTSRouter:
             "failed": 3,
         }.get(str(candidate.get("voice_consistency_quality") or ""), 2)
         electricity_rank = int(candidate.get("electricity_quality") == "failed")
+        try:
+            leading_silence = max(
+                0.0,
+                float(candidate.get("audible_leading_silence_seconds") or 0.0),
+            )
+        except (TypeError, ValueError):
+            leading_silence = float("inf")
+        leading_silence_rank = max(0.0, leading_silence - 0.12)
         duration = float(
             candidate.get("post_trim_duration")
             or candidate.get("actual_duration")
@@ -977,6 +1128,7 @@ class TTSRouter:
             semantic_selection_rank,
             voice_rank,
             electricity_rank,
+            leading_silence_rank,
             distance,
         )
 
@@ -1060,6 +1212,15 @@ class TTSRouter:
         source = Path(str(chosen["file"]))
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
+        # Candidate-vault entries may have been produced by an older fixed
+        # silence threshold. Re-run the current adaptive trim before a
+        # degraded candidate is allowed back into the mix.
+        retrimmed = destination.with_name(destination.stem + ".retrim.wav")
+        try:
+            _trim_silence(destination, retrimmed)
+            os.replace(retrimmed, destination)
+        finally:
+            retrimmed.unlink(missing_ok=True)
         fit = {}
         actual = _wav_duration(destination)
         target = float(item.get("target_duration") or 0.0)
@@ -1069,6 +1230,14 @@ class TTSRouter:
         item["final_path"] = str(destination)
         item["request_fingerprint"] = _request_fingerprint(item)
         result = dict(chosen)
+        edge_metrics = _edge_silence_metrics(destination)
+        result.update(edge_metrics)
+        result["audible_leading_silence_seconds"] = edge_metrics[
+            "detected_leading_silence_seconds"
+        ]
+        result["audible_trailing_silence_seconds"] = edge_metrics[
+            "detected_trailing_silence_seconds"
+        ]
         original_error = str(result.get("error") or "strict quality checks failed")
         result.update(
             status="success",
@@ -2466,6 +2635,19 @@ class TTSRouter:
                         preview_available=True,
                         adoption_recommended=False,
                     )
+                leading_silence_error = _leading_silence_failure(final_metadata)
+                if (
+                    final_metadata.get("status") != "failed"
+                    and leading_silence_error
+                ):
+                    final_metadata.update(
+                        status="failed",
+                        timing_quality="failed",
+                        error=leading_silence_error,
+                        preview_file=item["final_path"],
+                        preview_available=True,
+                        adoption_recommended=False,
+                    )
                 if (
                     final_metadata.get("status") != "failed"
                     and final_metadata.get("duration_quality") == "failed"
@@ -2687,6 +2869,15 @@ class TTSRouter:
                                     "generated WAV has no reliable audible speech: "
                                     + str(metadata.get("audible_speech_reason") or "unknown")
                                 ),
+                                preview_file=item["final_path"],
+                                preview_available=True,
+                                adoption_recommended=False,
+                            )
+                        elif _leading_silence_failure(metadata):
+                            metadata.update(
+                                status="failed",
+                                timing_quality="failed",
+                                error=_leading_silence_failure(metadata),
                                 preview_file=item["final_path"],
                                 preview_available=True,
                                 adoption_recommended=False,

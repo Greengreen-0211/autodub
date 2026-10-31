@@ -480,6 +480,50 @@ class TrimSilenceTests(unittest.TestCase):
             tts_router._trim_silence(src, dst)
             self.assertAlmostEqual(tts_router._wav_duration(dst), 1.0, delta=0.05)
 
+    def test_low_level_model_noise_before_speech_is_removed_adaptively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            dst = Path(tmp) / "dst.wav"
+            voice = tone()
+            # The prefix is above the old fixed -45 dBFS threshold, but far
+            # below the actual speech level and must not delay playback.
+            write_wav(
+                src,
+                1.4,
+                sample=lambda i: (
+                    0.007 if i < 6400
+                    else voice(i) if i < 22400
+                    else 0.0
+                ),
+            )
+            before = tts_router._edge_silence_metrics(src)
+            tts_router._trim_silence(src, dst)
+            after = tts_router._edge_silence_metrics(dst)
+            self.assertGreater(
+                before["detected_leading_silence_seconds"], 0.30
+            )
+            self.assertLessEqual(
+                after["detected_leading_silence_seconds"], 0.09
+            )
+            self.assertLess(tts_router._wav_duration(dst), 1.20)
+
+    def test_short_quiet_initial_consonant_is_not_trimmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            dst = Path(tmp) / "dst.wav"
+            voice = tone()
+            write_wav(
+                src,
+                0.8,
+                sample=lambda i: 0.007 if i < 960 else voice(i),
+            )
+            tts_router._trim_silence(src, dst)
+            # A 60 ms quiet onset is shorter than the 80 ms silence rule and
+            # protects initial consonants such as the missing sound in 杰克.
+            self.assertAlmostEqual(
+                tts_router._wav_duration(dst), 0.8, delta=0.04
+            )
+
 
 class PostprocessTests(unittest.TestCase):
     def test_postprocess_records_metrics(self):
@@ -495,6 +539,8 @@ class PostprocessTests(unittest.TestCase):
             self.assertAlmostEqual(post["actual_duration"], post["post_trim_duration"], delta=0.05)
             self.assertIn("atempo_factor", post)
             self.assertIn("atempo_capped", post)
+            self.assertIn("source_trimmed_leading_silence_seconds", post)
+            self.assertIn("audible_leading_silence_seconds", post)
             self.assertTrue(dst.is_file())
 
     def test_postprocess_force_fits_only_moderate_overlength_audio(self):

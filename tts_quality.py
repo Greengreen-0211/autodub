@@ -515,7 +515,7 @@ def stage_fingerprint(state, config, backend):
         if path.is_file():
             info=path.stat()
             media[key]={"path":str(path.resolve()),"size":info.st_size,"mtime_ns":info.st_mtime_ns}
-    payload={"version":"tts-stage-v2.9.0-wespeaker-voice-identity","segments":segments,"media":media,"backend":backend,
+    payload={"version":"tts-stage-v2.10.0-audible-onset-anchor","segments":segments,"media":media,"backend":backend,
              "input_file":state.get("input_file"),
              "target_lang":str(config.target_lang).lower(),
              "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs"))),
@@ -526,6 +526,11 @@ def stage_fingerprint(state, config, backend):
                  "identity_margin":os.getenv("AUTODUB_TTS_WESPEAKER_IDENTITY_MARGIN","0.06"),
                  "candidate_policy":os.getenv("AUTODUB_TTS_WESPEAKER_VOICE_POLICY","warn"),
                  "candidate_similarity":os.getenv("AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY","0.55"),
+                 "preserve_sentence_start":os.getenv("AUTODUB_TTS_PRESERVE_SENTENCE_START","1"),
+                 "silence_absolute_dbfs":os.getenv("AUTODUB_TTS_SILENCE_THRESH_DBFS","-45"),
+                 "silence_relative_db":os.getenv("AUTODUB_TTS_SILENCE_RELATIVE_DB","16"),
+                 "silence_leading_pad_ms":os.getenv("AUTODUB_TTS_SILENCE_LEADING_PAD_MS","70"),
+                 "maximum_audible_leading_silence":os.getenv("AUTODUB_TTS_MAX_AUDIBLE_LEADING_SILENCE_SECONDS","0.18"),
              }}
     return hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
 
