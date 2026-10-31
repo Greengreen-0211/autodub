@@ -266,7 +266,13 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
             "AUTODUB_TTS_FORCE_FIT_TOLERANCE", "0.03"
         ),
         "maximum_safe_compression_ratio": os.getenv(
-            "AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO", "1.50"
+            "AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO", "1.25"
+        ),
+        "maximum_safe_short_compression_ratio": os.getenv(
+            "AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO", "1.18"
+        ),
+        "short_duration_threshold": os.getenv(
+            "AUTODUB_TTS_SHORT_DURATION_THRESHOLD", "2.00"
         ),
         "maximum_safe_slowdown_ratio": os.getenv(
             "AUTODUB_TTS_MAX_SAFE_SLOWDOWN_RATIO", "1.25"
@@ -285,6 +291,12 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         ),
         "minimum_wespeaker_voice_similarity": os.getenv(
             "AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY", "0.55"
+        ),
+        "minimum_wespeaker_gross_voice_similarity": os.getenv(
+            "AUTODUB_TTS_MIN_WESPEAKER_GROSS_VOICE_SIMILARITY", "0.30"
+        ),
+        "minimum_gross_voice_consistency": os.getenv(
+            "AUTODUB_TTS_MIN_GROSS_VOICE_CONSISTENCY", "0.25"
         ),
         "wespeaker_model_path": os.getenv(
             "SIMAM_MODEL_PATH",
@@ -1158,6 +1170,11 @@ class TTSRouter:
                 or candidate.get("reference_leakage_quality") == "failed"
             ):
                 continue
+            # A gross speaker-embedding mismatch is the voice equivalent of
+            # reference leakage: it cannot become the autonomous fallback
+            # merely because its text and duration are convenient.
+            if bool(candidate.get("voice_gross_mismatch")):
+                continue
             if (
                 self._content_asr_enabled()
                 and candidate.get("reference_leakage_quality") != "passed"
@@ -1192,10 +1209,26 @@ class TTSRouter:
             compatible.append(candidate)
         if not compatible:
             return None
+        target = float(item.get("target_duration") or 0.0)
+        safely_adaptable = []
+        for candidate in compatible:
+            duration = float(
+                candidate.get("post_trim_duration")
+                or candidate.get("actual_duration")
+                or 0.0
+            )
+            if duration <= target + 0.01:
+                safely_adaptable.append(candidate)
+                continue
+            if duration_adaptation_safety(
+                duration, target
+            )["safe_to_force_fit"]:
+                safely_adaptable.append(candidate)
+        candidate_pool = safely_adaptable or compatible
         chosen = min(
-            compatible,
+            candidate_pool,
             key=lambda row: self._candidate_score(
-                row, float(item.get("target_duration") or 0.0)
+                row, target
             ),
         )
         generation = dict(chosen.get("generation_request") or {})
@@ -1223,7 +1256,7 @@ class TTSRouter:
             retrimmed.unlink(missing_ok=True)
         fit = {}
         actual = _wav_duration(destination)
-        target = float(item.get("target_duration") or 0.0)
+        fallback_safety = duration_adaptation_safety(actual, target)
         if target > 0.04 and actual > target + 0.01:
             fit = _apply_atempo_exact(destination, destination, target)
             actual = _wav_duration(destination)
@@ -1232,6 +1265,23 @@ class TTSRouter:
         result = dict(chosen)
         edge_metrics = _edge_silence_metrics(destination)
         result.update(edge_metrics)
+        final_audible = audible_speech_quality(
+            destination, expected_text=item.get("text", "")
+        )
+        final_voice = voice_consistency_quality(
+            Path(str(item.get("ref_audio") or "")), destination
+        )
+        # Candidate-vault metadata describes the pre-adoption waveform. A
+        # retrimmed/time-scaled final file must pass the basic audible gate and
+        # may never cross the gross voice-mismatch boundary.
+        if (
+            final_audible.get("audible_speech_quality") == "failed"
+            or final_voice.get("voice_gross_mismatch")
+        ):
+            destination.unlink(missing_ok=True)
+            return None
+        result.update(final_audible)
+        result.update(final_voice)
         result["audible_leading_silence_seconds"] = edge_metrics[
             "detected_leading_silence_seconds"
         ]
@@ -1250,6 +1300,8 @@ class TTSRouter:
             error="",
             duration_quality="degraded",
             duration_degraded_reason="agent_best_generated_candidate",
+            agent_safe_duration_candidate=bool(safely_adaptable),
+            agent_pre_adoption_duration_safety=fallback_safety,
             actual_duration=actual,
             audio_sha256=_file_sha256(destination),
             request_fingerprint=item["request_fingerprint"],
@@ -1672,7 +1724,12 @@ class TTSRouter:
         return references
 
     def _segment_references(
-        self, segments: List[Dict[str, Any]], vocal_path: str
+        self,
+        segments: List[Dict[str, Any]],
+        vocal_path: str,
+        *,
+        write_manifest: bool = True,
+        announce: bool = True,
     ) -> Dict[str, Dict[str, Any]]:
         """Build one source-audio reference for each exact dubbing segment.
 
@@ -1822,12 +1879,14 @@ class TTSRouter:
                 "reference_reliability": reliability,
                 "voice_identity": voice_identity,
             }
-            print(
-                f"逐句参考 segment={segment_id}: 原句自身 "
-                f"{duration:.2f}s reliability={reliability}"
-            )
+            if announce:
+                print(
+                    f"逐句参考 segment={segment_id}: 原句自身 "
+                    f"{duration:.2f}s reliability={reliability}"
+                )
 
-        _atomic_json(self.root / "reference_manifest.json", manifest)
+        if write_manifest:
+            _atomic_json(self.root / "reference_manifest.json", manifest)
         return references
 
     @staticmethod
@@ -1876,9 +1935,27 @@ class TTSRouter:
         if self.reference_mode == "segment":
             print("--- TTS 参考模式: 每个句子使用对应原句音频（忽略聚类声纹）---")
             references = self._segment_references(segment_list, vocal_path)
+            same_segment_fallbacks: Dict[str, Dict[str, Any]] = {}
         else:
             print("--- TTS 参考模式: 按说话人聚类选择参考音频 ---")
             references = self._speaker_references(segment_list, vocal_path)
+            same_segment_fallbacks = {}
+            if (
+                _env_bool("AUTODUB_TTS_SAME_SEGMENT_REFERENCE_FALLBACK", True)
+                and Path(str(vocal_path)).is_file()
+            ):
+                try:
+                    same_segment_fallbacks = self._segment_references(
+                        segment_list,
+                        vocal_path,
+                        write_manifest=False,
+                        announce=False,
+                    )
+                except Exception as exc:
+                    print(
+                        "⚠️ 同句原声参考准备失败，将保留原有安全参考策略: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
         previous = _load_results(self.result_path)
         items = []
         unreferenced_results = []
@@ -1894,6 +1971,17 @@ class TTSRouter:
             reference = references.get(reference_key)
             reference_fallback_speaker = None
             reference_fallback_reason = ""
+            if self.reference_mode == "speaker" and reference is None:
+                direct_reference = same_segment_fallbacks.get(segment_id)
+                if direct_reference is not None:
+                    reference = dict(
+                        direct_reference,
+                        reference_mode="segment_fallback",
+                    )
+                    reference_fallback_speaker = speaker
+                    reference_fallback_reason = (
+                        "same_segment_source_reference_preserves_voice"
+                    )
             if (
                 self.reference_mode == "speaker"
                 and reference is None
@@ -1917,11 +2005,18 @@ class TTSRouter:
                 unreferenced_results.append(failure)
                 continue
             if reference_fallback_speaker is not None:
-                reference_fallback_reason = "nearest_safe_precise_reference"
-                print(
-                    f"⚠️ segment={segment_id} speaker={speaker} 没有安全参考音频；"
-                    f"使用最近可靠声纹 {reference_fallback_speaker}，保留整句并标记降级"
-                )
+                if not reference_fallback_reason:
+                    reference_fallback_reason = "nearest_safe_precise_reference"
+                if reference_fallback_reason.startswith("same_segment"):
+                    print(
+                        f"⚠️ segment={segment_id} speaker={speaker} 没有安全聚类参考；"
+                        "改用该句自身原声保留性别和音色，并启用泄漏检查"
+                    )
+                else:
+                    print(
+                        f"⚠️ segment={segment_id} speaker={speaker} 没有安全参考音频；"
+                        f"使用最近可靠声纹 {reference_fallback_speaker}，保留整句并标记降级"
+                    )
             placement_start, source_duration, hard_end = _tts_window(segment)
             raw_emotion = segment.get("raw_emotion", segment.get("emotion_raw", segment.get("emotion")))
             if "emotion_reliable" in segment:
@@ -1968,7 +2063,9 @@ class TTSRouter:
                 "reference_duration": reference.get("duration"),
                 "reference_quality": reference.get("reference_quality", {}),
                 "reference_reliability": reference.get("reference_reliability", "reliable"),
-                "reference_mode": self.reference_mode,
+                "reference_mode": reference.get(
+                    "reference_mode", self.reference_mode
+                ),
                 "voice_identity": reference.get("voice_identity", speaker),
                 "voice_identity_reused": bool(reference.get("voice_identity_reused", False)),
                 "reference_fallback": reference_fallback_speaker is not None,
@@ -2624,12 +2721,41 @@ class TTSRouter:
                 final_metadata.update(audible_speech_quality(
                     Path(item["final_path"]), expected_text=item["text"]
                 ))
+                # Duration rewrites and final collision fitting replace the
+                # waveform audited by the first worker pass. Re-check the
+                # actual final clip so a wrong-gender/gross voice drift cannot
+                # inherit a stale successful voice score.
+                final_metadata.update(voice_consistency_quality(
+                    Path(item["ref_audio"]), Path(item["final_path"])
+                ))
                 if final_metadata.get("audible_speech_quality") == "failed":
                     final_metadata.update(
                         status="failed",
                         error=(
                             "generated WAV has no reliable audible speech: "
                             + str(final_metadata.get("audible_speech_reason") or "unknown")
+                        ),
+                        preview_file=item["final_path"],
+                        preview_available=True,
+                        adoption_recommended=False,
+                    )
+                if (
+                    final_metadata.get("status") != "failed"
+                    and final_metadata.get("voice_consistency_quality")
+                    == "failed"
+                    and final_metadata.get("voice_consistency_policy")
+                    == "block"
+                    and (
+                        final_metadata.get("voice_gross_mismatch")
+                        or item.get("reference_reliability", "reliable")
+                        == "reliable"
+                    )
+                ):
+                    final_metadata.update(
+                        status="failed",
+                        error=final_metadata.get(
+                            "voice_consistency_reason",
+                            "voice consistency check failed",
                         ),
                         preview_file=item["final_path"],
                         preview_available=True,
@@ -2887,7 +3013,8 @@ class TTSRouter:
                             metadata.update(status="failed", error=metadata.get("electricity_reason","electric artifact detected"))
                         elif (metadata.get("voice_consistency_quality")=="failed" and
                                 metadata.get("voice_consistency_policy")=="block" and
-                                item.get("reference_reliability", "reliable") == "reliable"):
+                                (metadata.get("voice_gross_mismatch") or
+                                 item.get("reference_reliability", "reliable") == "reliable")):
                             metadata.update(status="failed", error=metadata.get("voice_consistency_reason","voice consistency check failed"))
                         elif (
                             metadata.get("unsafe_duration_compression")

@@ -157,6 +157,28 @@ class VoiceConsistencyTests(unittest.TestCase):
         self.assertEqual(result["voice_consistency_quality"], "skipped")
         self.assertEqual(result["voice_consistency_policy"], "off")
 
+    def test_gross_wespeaker_mismatch_blocks_even_under_warn_policy(self):
+        class Vector:
+            def __init__(self, similarity):
+                self.similarity = similarity
+
+            def __matmul__(self, _other):
+                return self.similarity
+
+        with patch.dict(os.environ, {
+            "AUTODUB_TTS_WESPEAKER_VOICE_POLICY": "warn",
+        }), patch(
+            "tts_quality._preferred_voice_embedding",
+            side_effect=[
+                (Vector(0.20), "wespeaker_simamresnet100"),
+                (Vector(0.20), "wespeaker_simamresnet100"),
+            ],
+        ):
+            result = voice_consistency_quality("reference.wav", "tts.wav")
+        self.assertTrue(result["voice_gross_mismatch"])
+        self.assertEqual(result["voice_consistency_quality"], "failed")
+        self.assertEqual(result["voice_consistency_policy"], "block")
+
 
 class ContentCompletenessTests(unittest.TestCase):
     def test_chinese_target_blocks_leaked_english_reference_sentence(self):
@@ -547,14 +569,14 @@ class PostprocessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "raw.wav"
             dst = Path(tmp) / "final.wav"
-            write_wav(src, 1.4, sample=tone())
+            write_wav(src, 1.15, sample=tone())
 
             def exact(source, destination, target):
                 write_wav(destination, target, sample=tone())
                 return {
                     "forced_duration_fit": True,
-                    "forced_atempo_factor": 1.4,
-                    "forced_atempo_chain": "atempo=1.4",
+                    "forced_atempo_factor": 1.15,
+                    "forced_atempo_chain": "atempo=1.15",
                 }
 
             with patch(
@@ -593,6 +615,14 @@ class PostprocessTests(unittest.TestCase):
         self.assertAlmostEqual(result["duration_ratio"], 5.35 / 3.44)
         self.assertTrue(result["unsafe_duration_compression"])
         self.assertFalse(result["safe_to_force_fit"])
+
+    def test_short_sentence_uses_stricter_compression_limit(self):
+        short = duration_adaptation_safety(1.25, 1.0)
+        longer = duration_adaptation_safety(3.75, 3.0)
+        self.assertTrue(short["short_duration_compression_policy"])
+        self.assertTrue(short["unsafe_duration_compression"])
+        self.assertFalse(longer["short_duration_compression_policy"])
+        self.assertFalse(longer["unsafe_duration_compression"])
 
 
 @unittest.skipUnless(HAS_LIBROSA, "librosa not installed")

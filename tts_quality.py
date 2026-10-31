@@ -59,8 +59,22 @@ def duration_adaptation_safety(actual: float, target: float) -> dict:
     ratio = actual / target if actual > 0.0 and target > 0.0 else 0.0
     maximum_compression = max(
         1.0,
-        float(os.getenv("AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO", "1.50")),
+        float(os.getenv("AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO", "1.25")),
     )
+    short_threshold = max(
+        0.1,
+        float(os.getenv("AUTODUB_TTS_SHORT_DURATION_THRESHOLD", "2.00")),
+    )
+    if 0.0 < target <= short_threshold:
+        maximum_compression = min(
+            maximum_compression,
+            max(
+                1.0,
+                float(os.getenv(
+                    "AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO", "1.18"
+                )),
+            ),
+        )
     maximum_slowdown = max(
         1.0,
         float(os.getenv("AUTODUB_TTS_MAX_SAFE_SLOWDOWN_RATIO", "1.25")),
@@ -74,6 +88,10 @@ def duration_adaptation_safety(actual: float, target: float) -> dict:
         "required_atempo_factor": required_speed,
         "required_slowdown_factor": required_slowdown,
         "maximum_safe_compression_ratio": maximum_compression,
+        "short_duration_threshold": short_threshold,
+        "short_duration_compression_policy": bool(
+            0.0 < target <= short_threshold
+        ),
         "maximum_safe_slowdown_ratio": maximum_slowdown,
         "safe_to_force_fit": bool(compression_safe and slowdown_safe),
         "unsafe_duration_compression": bool(ratio > maximum_compression),
@@ -464,10 +482,16 @@ def voice_consistency_quality(reference_path, synthesized_path):
         minimum = float(os.getenv(
             "AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY", "0.55"
         ))
+        gross_minimum = float(os.getenv(
+            "AUTODUB_TTS_MIN_WESPEAKER_GROSS_VOICE_SIMILARITY", "0.30"
+        ))
     else:
         policy = global_policy
         minimum = float(os.getenv(
             "AUTODUB_TTS_MIN_VOICE_CONSISTENCY", "0.45"
+        ))
+        gross_minimum = float(os.getenv(
+            "AUTODUB_TTS_MIN_GROSS_VOICE_CONSISTENCY", "0.25"
         ))
     if policy == "off":
         return {
@@ -483,16 +507,27 @@ def voice_consistency_quality(reference_path, synthesized_path):
         }
     similarity = float(reference @ synthesized)
     failed = similarity < minimum
+    gross_mismatch = similarity < min(minimum, gross_minimum)
     quality = "passed"
-    if failed:
+    effective_policy = "block" if gross_mismatch else policy
+    if gross_mismatch:
+        quality = "failed"
+    elif failed:
         quality = "failed" if policy == "block" else "degraded"
     return {
         "voice_consistency_quality": quality,
-        "voice_consistency_policy": policy,
+        "voice_consistency_policy": effective_policy,
         "voice_consistency_similarity": round(similarity, 6),
         "voice_consistency_threshold": minimum,
+        "voice_gross_mismatch": gross_mismatch,
+        "voice_gross_mismatch_threshold": gross_minimum,
         "voice_consistency_backend": backend,
         "voice_consistency_reason": (
+            (
+                f"gross_voice_mismatch={similarity:.4f}<"
+                f"{gross_minimum:.4f}"
+            )
+            if gross_mismatch else
             f"voice_similarity={similarity:.4f}<{minimum:.4f}"
             if failed else ""
         ),
@@ -515,7 +550,7 @@ def stage_fingerprint(state, config, backend):
         if path.is_file():
             info=path.stat()
             media[key]={"path":str(path.resolve()),"size":info.st_size,"mtime_ns":info.st_mtime_ns}
-    payload={"version":"tts-stage-v2.10.0-audible-onset-anchor","segments":segments,"media":media,"backend":backend,
+    payload={"version":"tts-stage-v2.11.0-adaptive-onset-voice-duration","segments":segments,"media":media,"backend":backend,
              "input_file":state.get("input_file"),
              "target_lang":str(config.target_lang).lower(),
              "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs"))),
@@ -526,11 +561,16 @@ def stage_fingerprint(state, config, backend):
                  "identity_margin":os.getenv("AUTODUB_TTS_WESPEAKER_IDENTITY_MARGIN","0.06"),
                  "candidate_policy":os.getenv("AUTODUB_TTS_WESPEAKER_VOICE_POLICY","warn"),
                  "candidate_similarity":os.getenv("AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY","0.55"),
+                 "gross_candidate_similarity":os.getenv("AUTODUB_TTS_MIN_WESPEAKER_GROSS_VOICE_SIMILARITY","0.30"),
                  "preserve_sentence_start":os.getenv("AUTODUB_TTS_PRESERVE_SENTENCE_START","1"),
+                 "dominant_island_share":os.getenv("AUTODUB_TTS_DOMINANT_ISLAND_MIN_SHARE","0.65"),
+                 "trailing_island_leading_seconds":os.getenv("AUTODUB_TTS_TRAILING_ISLAND_MIN_LEADING_SECONDS","0.75"),
                  "silence_absolute_dbfs":os.getenv("AUTODUB_TTS_SILENCE_THRESH_DBFS","-45"),
                  "silence_relative_db":os.getenv("AUTODUB_TTS_SILENCE_RELATIVE_DB","16"),
                  "silence_leading_pad_ms":os.getenv("AUTODUB_TTS_SILENCE_LEADING_PAD_MS","70"),
                  "maximum_audible_leading_silence":os.getenv("AUTODUB_TTS_MAX_AUDIBLE_LEADING_SILENCE_SECONDS","0.18"),
+                 "maximum_safe_compression":os.getenv("AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO","1.25"),
+                 "maximum_safe_short_compression":os.getenv("AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO","1.18"),
              }}
     return hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
 

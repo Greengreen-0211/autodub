@@ -135,12 +135,13 @@ def attach_precise_tts_placement(
 
     Public sentence bounds remain immutable.  Long pauses between aligned
     words are retained as diagnostics but are not counted as speech that a
-    translation must fill.  Acoustic activity refines the natural-duration
-    estimate, not the default playback anchor.  A reliable word-level sentence
-    therefore starts at its public sentence boundary; otherwise a 0.30 s
-    alignment refinement plus TTS-internal leading silence can make a short
-    line audibly more than half a second late.  The older bounded inward shift
-    remains available only through an explicit opt-out environment flag.
+    translation must fill.  Acoustic activity refines both the natural-duration
+    estimate and, when the evidence is strong, the playback anchor.  Short
+    contiguous sentences stay at their public boundary so alignment refinement
+    plus TTS-internal silence cannot make them late.  A dominant lexical island
+    after a long pause, or aligned words concentrated at the tail of a long
+    outer interval, instead uses its evidenced audible onset.  Anchoring either
+    shape at the public boundary makes the translated line audibly early.
     """
     if max_onset_shift_seconds is None:
         max_onset_shift_seconds = float(os.getenv(
@@ -232,12 +233,13 @@ def attach_precise_tts_placement(
         original_onset = onset
         leading_slack_used = 0.0
         dominant_word_island = None
-        dominant_island_mode = bool(ambiguous and long_internal_pauses)
-        if dominant_island_mode:
-            # The enclosing word span is not spoken continuously.  Record the
-            # largest lexical island for diagnostics and duration estimation,
-            # but do not move the complete translated sentence to that later
-            # island.  Doing so used to delay some lines by several seconds.
+        dominant_island_mode = False
+        if long_internal_pauses:
+            # A translated sentence is synthesized as one continuous clip. If
+            # most source speech lives after a long pause, starting that clip
+            # at the outer sentence boundary moves its main meaning several
+            # seconds early. Keep the island in diagnostics even when it is
+            # not dominant enough to move the final anchor.
             dominant_index, dominant_range = max(
                 enumerate(word_ranges),
                 key=lambda indexed: (
@@ -252,6 +254,30 @@ def attach_precise_tts_placement(
                 "end": round(dominant_end, 3),
                 "duration": round(dominant_end - dominant_start, 3),
             }
+            total_word_activity = sum(
+                max(0.0, end - start) for start, end in word_ranges
+            )
+            dominant_share = (
+                (dominant_end - dominant_start) / total_word_activity
+                if total_word_activity > 0.0 else 0.0
+            )
+            dominant_word_island["activity_share"] = round(
+                dominant_share, 4
+            )
+            dominant_activity = intersect_ranges(
+                active,
+                [(dominant_start - 0.25, dominant_end + 0.25)],
+            )
+            dominant_island_mode = bool(
+                dominant_activity
+                and dominant_index > 0
+                and dominant_start - outer_start >= float(os.getenv(
+                    "AUTODUB_TTS_DOMINANT_ISLAND_MIN_OFFSET_SECONDS", "0.80"
+                ))
+                and dominant_share >= float(os.getenv(
+                    "AUTODUB_TTS_DOMINANT_ISLAND_MIN_SHARE", "0.65"
+                ))
+            )
         # A complete short sentence can own useful silence before its first
         # aligned word.  When the remaining slot is shorter than a conservative
         # pronunciation prior, borrow only the amount required, stay inside
@@ -278,12 +304,10 @@ def attach_precise_tts_placement(
             onset -= leading_slack_used
         speech_islands = intersect_ranges(active, [(onset, aligned_end)]) or (
             [tuple(word_ranges[dominant_word_island["index"]])]
-            if dominant_word_island is not None else word_ranges
+            if dominant_island_mode and dominant_word_island is not None
+            else word_ranges
         )
-        timing_reason = (
-            "ambiguous_long_pause_preserved_anchor"
-            if dominant_island_mode else "word_vad_consensus"
-        )
+        timing_reason = "word_vad_consensus"
         ratio_guard = None
         word_span = max(0.0, word_end - word_start)
         # Speaker ambiguity means the inherited word skeleton may still be
@@ -333,19 +357,55 @@ def attach_precise_tts_placement(
                 "guarded_start": round(onset, 3),
                 "guarded_end": round(hard_end, 3),
             }
-        # Word alignment and VAD are refinements, not new sentence boundaries.
-        # Never allow either path (including the ambiguity ratio guard) to
-        # delay the complete translated sentence by seconds.  Long pauses are
-        # still excluded from the duration budget through ``speech_islands``.
+        # Public sentence bounds are immutable, but they are not always the
+        # audible onset. Keep the boundary anchor for ordinary/short lines and
+        # move it only when word alignment and VAD provide strong structural
+        # evidence. This avoids both the old blanket +0.30 s delay and the
+        # newer failure where speech at the end of a multi-second interval was
+        # played from the interval's beginning.
         unbounded_onset = onset
+        outer_duration = max(0.0, outer_end - outer_start)
+        leading_word_gap = max(0.0, word_start - outer_start)
+        trailing_word_gap = max(0.0, outer_end - word_end)
+        trailing_word_island_mode = bool(
+            acoustic
+            and not dominant_island_mode
+            and outer_duration >= float(os.getenv(
+                "AUTODUB_TTS_TRAILING_ISLAND_MIN_OUTER_SECONDS", "2.00"
+            ))
+            and leading_word_gap >= float(os.getenv(
+                "AUTODUB_TTS_TRAILING_ISLAND_MIN_LEADING_SECONDS", "0.75"
+            ))
+            and trailing_word_gap <= float(os.getenv(
+                "AUTODUB_TTS_TRAILING_ISLAND_MAX_TRAILING_SECONDS", "0.45"
+            ))
+        )
         if preserve_sentence_start:
-            onset = outer_start
+            if timing_reason == "ambiguous_word_span_ratio_guard":
+                # The guard exists specifically because the inherited word
+                # span is not credible as one continuous utterance. Do not
+                # erase its local acoustic anchor by forcing the outer start.
+                onset = unbounded_onset
+            elif dominant_island_mode and dominant_word_island is not None:
+                onset = max(
+                    outer_start,
+                    float(dominant_word_island["start"]) - float(pre_roll),
+                )
+                timing_reason = "dominant_island_after_long_pause"
+            elif trailing_word_island_mode:
+                onset = unbounded_onset
+                timing_reason = "trailing_word_island_consensus"
+            else:
+                onset = outer_start
+                timing_reason = "sentence_start_anchor"
         else:
             onset_ceiling = min(
                 outer_end,
                 outer_start + max_onset_shift_seconds,
             )
             onset = min(onset, onset_ceiling)
+            timing_reason = "legacy_bounded_word_vad_shift"
+        sentence_start_anchored = abs(onset - outer_start) <= 1e-9
         onset_shift_limited = onset < unbounded_onset - 1e-9
         effective = sum(max(0.0, end - start) for start, end in speech_islands)
         word_effective = sum(max(0.0, end - start) for start, end in word_ranges)
@@ -389,7 +449,11 @@ def attach_precise_tts_placement(
             "tts_original_placement_start": round(original_onset, 3),
             "tts_unbounded_placement_start": round(unbounded_onset, 3),
             "tts_sentence_anchor_start": round(outer_start, 3),
-            "tts_sentence_start_anchored": preserve_sentence_start,
+            "tts_sentence_start_anchored": sentence_start_anchored,
+            "tts_sentence_start_policy_enabled": preserve_sentence_start,
+            "tts_leading_word_gap": round(leading_word_gap, 3),
+            "tts_trailing_word_gap": round(trailing_word_gap, 3),
+            "tts_trailing_word_island_mode": trailing_word_island_mode,
             "tts_max_onset_shift_seconds": round(max_onset_shift_seconds, 3),
             "tts_onset_shift_limited": onset_shift_limited,
             "tts_leading_slack_used": round(leading_slack_used, 3),
@@ -407,8 +471,10 @@ def attach_precise_tts_placement(
                 (
                     0.58
                     if timing_reason == "ambiguous_word_span_ratio_guard"
-                    else 0.68
-                    if timing_reason == "ambiguous_long_pause_preserved_anchor"
+                    else 0.90
+                    if timing_reason == "dominant_island_after_long_pause"
+                    else 0.88
+                    if timing_reason == "trailing_word_island_consensus"
                     else (
                         0.72 if ambiguous
                         else min(
@@ -432,7 +498,11 @@ def attach_precise_tts_placement(
             "original_placement_start": round(original_onset, 3),
             "unbounded_placement_start": round(unbounded_onset, 3),
             "sentence_anchor_start": round(outer_start, 3),
-            "sentence_start_anchored": preserve_sentence_start,
+            "sentence_start_anchored": sentence_start_anchored,
+            "sentence_start_policy_enabled": preserve_sentence_start,
+            "leading_word_gap": round(leading_word_gap, 3),
+            "trailing_word_gap": round(trailing_word_gap, 3),
+            "trailing_word_island_mode": trailing_word_island_mode,
             "max_onset_shift_seconds": round(max_onset_shift_seconds, 3),
             "onset_shift_limited": onset_shift_limited,
             "leading_slack_used": round(leading_slack_used, 3),

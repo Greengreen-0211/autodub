@@ -385,7 +385,7 @@ class OCRTimelineTests(unittest.TestCase):
         )
         self.assertEqual(refined[0]["tts_leading_slack_used"], 0.0)
 
-    def test_ambiguous_long_pause_keeps_complete_sentence_at_original_anchor(self):
+    def test_long_pause_places_continuous_translation_at_dominant_island(self):
         segment = {
             "id": 7, "start": 43.49, "end": 49.61,
             "text": "Now hold on to the railing.",
@@ -405,25 +405,32 @@ class OCRTimelineTests(unittest.TestCase):
         row = refined[0]
         self.assertEqual(
             row["tts_timing_reason"],
-            "ambiguous_long_pause_preserved_anchor",
+            "dominant_island_after_long_pause",
         )
         self.assertAlmostEqual(row["tts_original_placement_start"], 43.49)
-        self.assertAlmostEqual(row["tts_placement_start"], 43.49)
+        self.assertAlmostEqual(row["tts_placement_start"], 48.07)
         self.assertAlmostEqual(row["tts_aligned_speech_end"], 49.25)
         self.assertEqual(row["tts_hard_end"], 49.61)
         self.assertLess(row["tts_target_duration"], 2.0)
         self.assertEqual(row["tts_internal_pauses"], [[43.73, 48.13]])
         self.assertEqual(
             row["tts_dominant_word_island"],
-            {"index": 1, "start": 48.13, "end": 49.17, "duration": 1.04},
+            {
+                "index": 1,
+                "start": 48.13,
+                "end": 49.17,
+                "duration": 1.04,
+                "activity_share": 0.8125,
+            },
         )
         self.assertEqual(
             audit[0]["dominant_word_island"],
             row["tts_dominant_word_island"],
         )
         self.assertFalse(row["tts_onset_shift_limited"])
+        self.assertFalse(row["tts_sentence_start_anchored"])
 
-    def test_word_timing_cannot_move_complete_sentence_off_public_anchor(self):
+    def test_long_interval_with_words_at_tail_uses_audible_onset(self):
         segment = {
             "id": 12, "start": 57.74, "end": 60.75,
             "text": "Hold on.", "timestamp_precision": "word",
@@ -437,11 +444,31 @@ class OCRTimelineTests(unittest.TestCase):
         )
         row = refined[0]
         self.assertAlmostEqual(row["tts_unbounded_placement_start"], 59.90)
-        self.assertAlmostEqual(row["tts_placement_start"], 57.74)
-        self.assertAlmostEqual(row["tts_placement_start"] - row["start"], 0.0)
+        self.assertAlmostEqual(row["tts_placement_start"], 59.90)
+        self.assertEqual(
+            row["tts_timing_reason"], "trailing_word_island_consensus"
+        )
+        self.assertFalse(row["tts_sentence_start_anchored"])
+        self.assertFalse(row["tts_onset_shift_limited"])
+        self.assertTrue(row["tts_trailing_word_island_mode"])
+        self.assertFalse(audit[0]["onset_shift_limited"])
+
+    def test_long_interval_with_trailing_room_keeps_sentence_anchor(self):
+        segment = {
+            "id": 5, "start": 37.32, "end": 41.20,
+            "text": "Go on.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Go", "start": 38.22, "end": 38.42},
+                {"text": "on", "start": 38.42, "end": 38.68},
+            ],
+        }
+        refined, _ = attach_precise_tts_placement(
+            [segment], [(38.20, 38.70)]
+        )
+        row = refined[0]
+        self.assertAlmostEqual(row["tts_placement_start"], 37.32)
         self.assertTrue(row["tts_sentence_start_anchored"])
-        self.assertTrue(row["tts_onset_shift_limited"])
-        self.assertTrue(audit[0]["onset_shift_limited"])
+        self.assertFalse(row["tts_trailing_word_island_mode"])
 
     def test_legacy_bounded_shift_requires_explicit_anchor_opt_out(self):
         segment = {

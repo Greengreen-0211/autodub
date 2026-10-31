@@ -4541,6 +4541,12 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
                     "tts_voice_consistency_policy": metadata.get(
                         "voice_consistency_policy"
                     ),
+                    "tts_voice_gross_mismatch": metadata.get(
+                        "voice_gross_mismatch", False
+                    ),
+                    "tts_voice_gross_mismatch_threshold": metadata.get(
+                        "voice_gross_mismatch_threshold"
+                    ),
                     "tts_forced_duration_fit": metadata.get(
                         "forced_duration_fit", False
                     ),
