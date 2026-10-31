@@ -4,8 +4,10 @@ from unittest.mock import patch
 
 from tts_quality import voice_consistency_quality
 from tts_voice_identity import (
+    build_local_continuity_groups,
     build_voice_profiles,
     conservative_identity_map,
+    contaminated_reference_rescue_pairs,
 )
 
 
@@ -95,6 +97,48 @@ class VoiceIdentityTests(unittest.TestCase):
         self.assertGreater(profiles["A"]["embedding"][0], 0.99)
         self.assertLess(profiles["A"]["embedding"][1], 0.10)
 
+    def test_adjacent_strong_match_gets_tts_only_continuity_group(self):
+        segments = [
+            {
+                "id": 0, "speaker": "A", "start": 0.0, "end": 1.0,
+                "wespeaker_tts_embedding": [1.0, 0.0],
+            },
+            {
+                "id": 1, "speaker": "B", "start": 1.0, "end": 2.0,
+                "wespeaker_tts_embedding": [0.99, 0.05],
+            },
+            {
+                "id": 2, "speaker": "C", "start": 2.0, "end": 3.0,
+                "wespeaker_tts_embedding": [0.0, 1.0],
+            },
+        ]
+        identity_map, audit = build_local_continuity_groups(segments)
+        self.assertEqual(identity_map["0"], identity_map["1"])
+        self.assertNotIn("2", identity_map)
+        self.assertTrue(audit["edges"][0]["accepted"])
+        self.assertFalse(audit["edges"][1]["accepted"])
+
+    def test_contaminated_cluster_pair_cross_references_each_other(self):
+        segments = [
+            {
+                "id": 0, "speaker": "A", "start": 0.0, "end": 1.0,
+                "wespeaker_tts_embedding": [1.0, 0.0],
+            },
+            {
+                "id": 1, "speaker": "A", "start": 2.0, "end": 3.0,
+                "wespeaker_tts_embedding": [0.0, 1.0],
+            },
+            {
+                "id": 2, "speaker": "A", "start": 4.0, "end": 5.0,
+                "wespeaker_tts_embedding": [0.02, 0.999],
+            },
+        ]
+        rescue, audit = contaminated_reference_rescue_pairs(
+            segments, {"A": "0"}
+        )
+        self.assertEqual(rescue, {"1": "2", "2": "1"})
+        self.assertEqual(set(audit["contaminated_segments"]), {"1", "2"})
+
     def test_wespeaker_low_similarity_warns_without_blocking(self):
         with patch.dict(os.environ, {
             "AUTODUB_TTS_WESPEAKER_VOICE_POLICY": "warn",
@@ -116,4 +160,3 @@ class VoiceIdentityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

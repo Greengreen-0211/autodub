@@ -36,7 +36,9 @@ from tts_quality import (
 )
 from tts_voice_identity import (
     build_voice_profiles,
+    build_local_continuity_groups,
     conservative_identity_map,
+    contaminated_reference_rescue_pairs,
 )
 
 
@@ -279,7 +281,7 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         ),
     }
     payload["quality_policy"] = {
-        "electricity": os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY", "warn"),
+        "electricity": os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY", "block"),
         "voice_consistency": os.getenv(
             "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY", "block"
         ),
@@ -1023,6 +1025,7 @@ class TTSRouter:
         self.candidate_path = self.root / "candidate_vault.json"
         self.duration_rewriter = duration_rewriter
         self.duration_candidate_selector = duration_candidate_selector
+        self.voice_reference_diagnostics: Dict[str, Any] = {}
         reference_mode = os.getenv(
             "AUTODUB_TTS_REFERENCE_MODE", "speaker"
         ).strip().lower().replace("-", "_")
@@ -1175,9 +1178,23 @@ class TTSRouter:
             # merely because its text and duration are convenient.
             if bool(candidate.get("voice_gross_mismatch")):
                 continue
+            # A best-effort fallback still has to contain an intelligible,
+            # audible target sentence.  "Some waveform exists" is not enough
+            # to promote near-silence or an ASR-confirmed swallowed sentence.
+            if candidate.get("audible_speech_quality") != "passed":
+                continue
+            if candidate.get("content_completeness_quality") == "failed":
+                continue
+            if candidate.get("electricity_quality") == "failed":
+                continue
             if (
                 self._content_asr_enabled()
                 and candidate.get("reference_leakage_quality") != "passed"
+            ):
+                continue
+            if (
+                self._content_asr_enabled()
+                and candidate.get("content_completeness_quality") != "passed"
             ):
                 continue
             if current_text not in {
@@ -1224,7 +1241,13 @@ class TTSRouter:
                 duration, target
             )["safe_to_force_fit"]:
                 safely_adaptable.append(candidate)
-        candidate_pool = safely_adaptable or compatible
+        # Never hide an impossible candidate behind extreme time compression.
+        # Additional engines are tried before this method; if none produced a
+        # safely placeable utterance, returning None is safer than converting
+        # five seconds of speech into one second of unintelligible audio.
+        if not safely_adaptable:
+            return None
+        candidate_pool = safely_adaptable
         chosen = min(
             candidate_pool,
             key=lambda row: self._candidate_score(
@@ -1258,6 +1281,9 @@ class TTSRouter:
         actual = _wav_duration(destination)
         fallback_safety = duration_adaptation_safety(actual, target)
         if target > 0.04 and actual > target + 0.01:
+            if not fallback_safety["safe_to_force_fit"]:
+                destination.unlink(missing_ok=True)
+                return None
             fit = _apply_atempo_exact(destination, destination, target)
             actual = _wav_duration(destination)
         item["final_path"] = str(destination)
@@ -1271,17 +1297,20 @@ class TTSRouter:
         final_voice = voice_consistency_quality(
             Path(str(item.get("ref_audio") or "")), destination
         )
+        final_electricity = electricity_quality(destination)
         # Candidate-vault metadata describes the pre-adoption waveform. A
         # retrimmed/time-scaled final file must pass the basic audible gate and
         # may never cross the gross voice-mismatch boundary.
         if (
             final_audible.get("audible_speech_quality") == "failed"
             or final_voice.get("voice_gross_mismatch")
+            or final_electricity.get("electricity_quality") == "failed"
         ):
             destination.unlink(missing_ok=True)
             return None
         result.update(final_audible)
         result.update(final_voice)
+        result.update(final_electricity)
         result["audible_leading_silence_seconds"] = edge_metrics[
             "detected_leading_silence_seconds"
         ]
@@ -1923,6 +1952,150 @@ class TTSRouter:
         )
         return speaker, reference
 
+    @staticmethod
+    def _voice_reference_rank(reference: Dict[str, Any]) -> tuple:
+        return (
+            int(str(reference.get("reference_reliability", "reliable")) == "reliable"),
+            float(reference.get("assignment_confidence", 0.0) or 0.0),
+            float(reference.get("purity_score", 0.0) or 0.0),
+            min(8.0, float(reference.get("duration", 0.0) or 0.0)),
+        )
+
+    def _build_voice_reference_overrides(
+        self,
+        segments: List[Dict[str, Any]],
+        references: Dict[str, Dict[str, Any]],
+        segment_references: Dict[str, Dict[str, Any]],
+    ) -> tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+        """Build TTS-only continuity and contaminated-cluster corrections."""
+        continuity_map, continuity_audit = build_local_continuity_groups(segments)
+        source_ids = {
+            speaker: reference.get("source_segment_id")
+            for speaker, reference in references.items()
+            if reference.get("source_segment_id") is not None
+        }
+        rescue_pairs, rescue_audit = contaminated_reference_rescue_pairs(
+            segments, source_ids
+        )
+        by_id = {
+            str(segment.get("id", index)): segment
+            for index, segment in enumerate(segments)
+        }
+        overrides: Dict[str, Dict[str, Any]] = {}
+
+        # A continuous local turn uses one reference even when Step 2 has
+        # over-split it into several immutable diagnostic labels.
+        groups: Dict[str, List[str]] = {}
+        for segment_id, group_id in continuity_map.items():
+            groups.setdefault(group_id, []).append(segment_id)
+        for group_id, member_ids in groups.items():
+            candidates = []
+            for segment_id in member_ids:
+                segment = by_id.get(segment_id, {})
+                reference = references.get(str(segment.get("speaker")))
+                if reference is not None:
+                    candidates.append(reference)
+            if not candidates:
+                continue
+            chosen = max(candidates, key=self._voice_reference_rank)
+            identity = "LOCAL_CONTINUITY_" + _safe_id(member_ids[0])
+            for segment_id in member_ids:
+                overrides[segment_id] = {
+                    **dict(chosen),
+                    "voice_identity": identity,
+                    "voice_identity_reused": True,
+                    "reference_mode": "local_continuity",
+                    "reference_override_reason": (
+                        "adjacent_strong_wespeaker_similarity"
+                    ),
+                }
+
+        # If a label's selected reference is acoustically inconsistent with a
+        # mutually matching pair inside that label, cross-reference the pair.
+        # This preserves the real voice without using the sentence's own audio.
+        for segment_id, partner_id in rescue_pairs.items():
+            partner_reference = segment_references.get(partner_id)
+            if partner_reference is None:
+                continue
+            pair_key = "_".join(sorted((segment_id, partner_id)))
+            overrides[segment_id] = {
+                **dict(partner_reference),
+                "voice_identity": "SEGMENT_RESCUE_" + _safe_id(pair_key),
+                "voice_identity_reused": True,
+                "reference_mode": "segment_identity_rescue",
+                "reference_override_reason": (
+                    "cluster_reference_embedding_mismatch"
+                ),
+                "reference_partner_segment_id": partner_id,
+            }
+
+        self.voice_reference_diagnostics = {
+            "step2_labels_immutable": True,
+            "continuity": continuity_audit,
+            "contaminated_reference_rescue": rescue_audit,
+            "applied_overrides": {
+                segment_id: {
+                    "voice_identity": reference.get("voice_identity"),
+                    "reference_segment_id": reference.get("source_segment_id"),
+                    "reference_mode": reference.get("reference_mode"),
+                    "reason": reference.get("reference_override_reason"),
+                }
+                for segment_id, reference in overrides.items()
+            },
+        }
+        _atomic_json(
+            self.root / "voice_reference_diagnostics.json",
+            self.voice_reference_diagnostics,
+        )
+        return overrides, continuity_map
+
+    def _synchronize_continuity_retries(
+        self,
+        items: List[Dict[str, Any]],
+        retry: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Retry a verified local turn with one engine, within the global cap."""
+        if not retry or not _env_bool(
+            "AUTODUB_TTS_CONTINUITY_ENGINE_SYNC", True
+        ):
+            return retry
+        retry_ids = {str(row["segment_id"]) for row in retry}
+        for seed in list(retry):
+            group = seed.get("voice_continuity_group")
+            fallback_model = str(seed.get("model") or "")
+            if not group or not fallback_model:
+                continue
+            for peer in items:
+                peer_id = str(peer["segment_id"])
+                if (
+                    peer_id in retry_ids
+                    or peer.get("voice_continuity_group") != group
+                    or int(peer.get("generation_attempt_count") or 0)
+                    >= _generation_attempt_limit()
+                    or fallback_model in peer.get("attempted_engines", [])
+                ):
+                    continue
+                peer["fallback_reason"] += (
+                    ("; " if peer["fallback_reason"] else "")
+                    + "local voice continuity engine synchronization"
+                )
+                peer["fallback_count"] += 1
+                peer["attempted_engines"].append(fallback_model)
+                peer["model"] = fallback_model
+                peer["tts_engine"] = fallback_model
+                peer["duration_attempt"] = 0
+                peer["language"] = (
+                    _language_code(peer["target_language_raw"])
+                    if fallback_model == "omnivoice"
+                    else peer["target_language"]
+                )
+                self._job_paths(peer)
+                peer["request_fingerprint"] = _request_fingerprint(peer)
+                peer["force_regenerate"] = True
+                retry.append(peer)
+                retry_ids.add(peer_id)
+        return retry
+
     def run(self, segments: Iterable[Dict[str, Any]], vocal_path: str, *, force: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         from translation_quality import is_skipped, require_translated
         # Segments without any safe target-language text never reach a TTS
@@ -1956,6 +2129,14 @@ class TTSRouter:
                         "⚠️ 同句原声参考准备失败，将保留原有安全参考策略: "
                         f"{type(exc).__name__}: {exc}"
                     )
+        reference_overrides: Dict[str, Dict[str, Any]] = {}
+        continuity_map: Dict[str, str] = {}
+        if self.reference_mode == "speaker" and same_segment_fallbacks:
+            reference_overrides, continuity_map = (
+                self._build_voice_reference_overrides(
+                    segment_list, references, same_segment_fallbacks
+                )
+            )
         previous = _load_results(self.result_path)
         items = []
         unreferenced_results = []
@@ -1968,7 +2149,9 @@ class TTSRouter:
             seen.add(segment_id)
             speaker = str(segment.get("speaker", "SPEAKER_00"))
             reference_key = segment_id if self.reference_mode == "segment" else speaker
-            reference = references.get(reference_key)
+            reference = reference_overrides.get(segment_id) or references.get(
+                reference_key
+            )
             reference_fallback_speaker = None
             reference_fallback_reason = ""
             if self.reference_mode == "speaker" and reference is None:
@@ -2071,6 +2254,13 @@ class TTSRouter:
                 "reference_fallback": reference_fallback_speaker is not None,
                 "reference_fallback_speaker": reference_fallback_speaker,
                 "reference_fallback_reason": reference_fallback_reason,
+                "reference_override_reason": reference.get(
+                    "reference_override_reason", ""
+                ),
+                "reference_partner_segment_id": reference.get(
+                    "reference_partner_segment_id"
+                ),
+                "voice_continuity_group": continuity_map.get(segment_id),
                 "start": placement_start, "model": model, "tts_engine": model,
                 "end": hard_end,
                 "hard_duration": hard_duration,
@@ -2272,15 +2462,49 @@ class TTSRouter:
                 self._job_paths(resumed)
                 resumed["request_fingerprint"] = _request_fingerprint(resumed)
                 try:
+                    known_file = Path(str(known.get("file") or ""))
                     valid = (
                         known.get("request_fingerprint")
                         == resumed["request_fingerprint"]
                         or legacy_generation_match
                     )
-                    actual = _wav_duration(Path(known["file"])) if valid else 0
+                    actual = _wav_duration(known_file) if valid else 0
                     measured_quality = duration_quality(actual, item["target_duration"])["duration_quality"]
                     saved_quality = str(known.get("duration_quality", ""))
-                    if (valid and known.get("audio_sha256")==_file_sha256(Path(known["file"])) and
+                    current_audible = (
+                        audible_speech_quality(
+                            known_file, expected_text=resumed.get("text", "")
+                        )
+                        if valid else {"audible_speech_quality": "failed"}
+                    )
+                    current_electricity = (
+                        electricity_quality(known_file)
+                        if valid else {"electricity_quality": "failed"}
+                    )
+                    try:
+                        forced_factor = float(
+                            known.get("forced_atempo_factor") or 1.0
+                        )
+                    except (TypeError, ValueError):
+                        forced_factor = float("inf")
+                    maximum_safe = duration_adaptation_safety(
+                        max(actual, 0.001) * max(1.0, forced_factor),
+                        max(float(item["target_duration"]), 0.001),
+                    )["maximum_safe_compression_ratio"]
+                    historical_transform_safe = (
+                        not bool(known.get("unsafe_duration_compression"))
+                        and forced_factor <= maximum_safe + 1e-6
+                    )
+                    current_quality_safe = (
+                        current_audible.get("audible_speech_quality") == "passed"
+                        and current_electricity.get("electricity_quality")
+                        != "failed"
+                        and known.get("content_completeness_quality") != "failed"
+                        and not bool(known.get("reference_leakage_detected"))
+                        and historical_transform_safe
+                    )
+                    if (valid and current_quality_safe and
+                            known.get("audio_sha256")==_file_sha256(known_file) and
                             (
                                 measured_quality == "passed"
                                 or saved_quality == "degraded"
@@ -2308,7 +2532,13 @@ class TTSRouter:
                                 for key in GENERATION_REQUEST_KEYS
                             }
                             known.pop("content_asr_request_fingerprint", None)
-                        previous[item["segment_id"]] = dict(known)
+                        known = {
+                            **dict(known),
+                            **current_audible,
+                            **current_electricity,
+                            "resume_quality_revalidated": True,
+                        }
+                        previous[item["segment_id"]] = known
                         reused = True
                 except Exception:
                     pass
@@ -2358,6 +2588,11 @@ class TTSRouter:
                     item["request_fingerprint"] = _request_fingerprint(item)
                     item["force_regenerate"] = True
                     retry.append(item)
+                # If one member of a strongly verified local turn must change
+                # engines, synthesize its successful peers with that engine as
+                # well.  Their earlier candidates remain in the vault, so a
+                # failed synchronized attempt can still fall back safely.
+                retry = self._synchronize_continuity_retries(items, retry)
                 if not retry:
                     if any(previous.get(i["segment_id"],{}).get("status")!="success" and
                            int(i.get("generation_attempt_count") or 0) < _generation_attempt_limit() and
@@ -2426,6 +2661,18 @@ class TTSRouter:
                              reference_mode=item.get("reference_mode", "speaker"),
                              voice_identity=item.get("voice_identity", item["speaker"]),
                              voice_identity_reused=item.get("voice_identity_reused", False),
+                            voice_continuity_group=item.get(
+                                "voice_continuity_group"
+                            ),
+                            reference_override_reason=item.get(
+                                "reference_override_reason", ""
+                            ),
+                            reference_partner_segment_id=item.get(
+                                "reference_partner_segment_id"
+                            ),
+                            voice_reference_diagnostics_path=str(
+                                self.root / "voice_reference_diagnostics.json"
+                            ),
                             reference_fallback=item.get("reference_fallback", False),
                             reference_fallback_speaker=item.get("reference_fallback_speaker"),
                             reference_fallback_reason=item.get("reference_fallback_reason", ""),
@@ -2721,6 +2968,9 @@ class TTSRouter:
                 final_metadata.update(audible_speech_quality(
                     Path(item["final_path"]), expected_text=item["text"]
                 ))
+                final_metadata.update(electricity_quality(
+                    Path(item["final_path"])
+                ))
                 # Duration rewrites and final collision fitting replace the
                 # waveform audited by the first worker pass. Re-check the
                 # actual final clip so a wrong-gender/gross voice drift cannot
@@ -2734,6 +2984,22 @@ class TTSRouter:
                         error=(
                             "generated WAV has no reliable audible speech: "
                             + str(final_metadata.get("audible_speech_reason") or "unknown")
+                        ),
+                        preview_file=item["final_path"],
+                        preview_available=True,
+                        adoption_recommended=False,
+                    )
+                if (
+                    final_metadata.get("status") != "failed"
+                    and final_metadata.get("electricity_quality") == "failed"
+                    and os.getenv(
+                        "AUTODUB_TTS_ELECTRICITY_POLICY", "block"
+                    ).strip().lower() == "block"
+                ):
+                    final_metadata.update(
+                        status="failed",
+                        error=final_metadata.get(
+                            "electricity_reason", "electric artifact detected"
                         ),
                         preview_file=item["final_path"],
                         preview_available=True,
@@ -2880,8 +3146,13 @@ class TTSRouter:
 
     @staticmethod
     def _fallback_chain(model, language):
-        defaults = {"confucius4":["f5tts","indextts2"], "cosyvoice3":["f5tts"],
-                    "indextts2":["f5tts"], "f5tts":["cosyvoice3"], "omnivoice":[]}
+        defaults = {
+            "confucius4": ["f5tts", "indextts2"],
+            "cosyvoice3": ["f5tts", "indextts2"],
+            "indextts2": ["f5tts", "cosyvoice3"],
+            "f5tts": ["cosyvoice3", "indextts2"],
+            "omnivoice": [],
+        }
         raw = os.getenv("AUTODUB_TTS_FALLBACK_CHAINS", "")
         chains = json.loads(raw) if raw else defaults
         chain = chains.get(model, [])
@@ -3009,7 +3280,7 @@ class TTSRouter:
                                 adoption_recommended=False,
                             )
                         elif (metadata.get("electricity_quality")=="failed" and
-                                os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY","warn").strip().lower()=="block"):
+                                os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY","block").strip().lower()=="block"):
                             metadata.update(status="failed", error=metadata.get("electricity_reason","electric artifact detected"))
                         elif (metadata.get("voice_consistency_quality")=="failed" and
                                 metadata.get("voice_consistency_policy")=="block" and

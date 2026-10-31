@@ -485,6 +485,106 @@ class RouterTests(unittest.TestCase):
         router._speaker_references=lambda *args:{"A":{"audio":str(ref),"text":"source text"}}
         return router
 
+    def test_short_line_fallback_chain_reserves_a_third_engine(self):
+        self.assertEqual(
+            tts_router.TTSRouter._fallback_chain("f5tts", "zh"),
+            ["cosyvoice3", "indextts2"],
+        )
+        self.assertEqual(
+            tts_router.TTSRouter._fallback_chain("cosyvoice3", "zh"),
+            ["f5tts", "indextts2"],
+        )
+
+    def test_runtime_voice_overrides_stabilize_continuity_and_rescue_pollution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = self.setup_router(tmp)
+            continuous = [
+                dict(source(0), speaker="A", start=0.0, end=1.0,
+                     wespeaker_tts_embedding=[1.0, 0.0]),
+                dict(source(1), speaker="B", start=1.0, end=2.0,
+                     wespeaker_tts_embedding=[0.99, 0.02]),
+            ]
+            references = {
+                "A": {"audio": "a.wav", "text": "a", "source_segment_id": "0",
+                      "purity_score": 2.0, "duration": 2.0},
+                "B": {"audio": "b.wav", "text": "b", "source_segment_id": "1",
+                      "purity_score": 3.0, "duration": 3.0},
+            }
+            segment_refs = {
+                "0": {**references["A"], "source_segment_id": "0"},
+                "1": {**references["B"], "source_segment_id": "1"},
+            }
+            overrides, groups = router._build_voice_reference_overrides(
+                continuous, references, segment_refs
+            )
+            self.assertEqual(groups["0"], groups["1"])
+            self.assertEqual(overrides["0"]["audio"], overrides["1"]["audio"])
+            self.assertEqual(
+                overrides["0"]["voice_identity"],
+                overrides["1"]["voice_identity"],
+            )
+
+            polluted = [
+                dict(source(0), speaker="A", start=0.0, end=1.0,
+                     wespeaker_tts_embedding=[1.0, 0.0]),
+                dict(source(1), speaker="A", start=2.0, end=3.0,
+                     wespeaker_tts_embedding=[0.0, 1.0]),
+                dict(source(2), speaker="A", start=4.0, end=5.0,
+                     wespeaker_tts_embedding=[0.02, 0.999]),
+            ]
+            references = {
+                "A": {"audio": "male.wav", "text": "male",
+                      "source_segment_id": "0", "purity_score": 3.0,
+                      "duration": 3.0},
+            }
+            segment_refs = {
+                "1": {"audio": "one.wav", "text": "one",
+                      "source_segment_id": "1", "duration": 1.0},
+                "2": {"audio": "two.wav", "text": "two",
+                      "source_segment_id": "2", "duration": 1.0},
+            }
+            overrides, _ = router._build_voice_reference_overrides(
+                polluted, references, segment_refs
+            )
+            self.assertEqual(overrides["1"]["audio"], "two.wav")
+            self.assertEqual(overrides["2"]["audio"], "one.wav")
+            self.assertEqual(
+                overrides["1"]["reference_mode"],
+                "segment_identity_rescue",
+            )
+
+    def test_continuity_retry_sync_obeys_five_attempt_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = self.setup_router(tmp)
+            seed = {
+                "segment_id": "0", "voice_continuity_group": "g",
+                "model": "cosyvoice3", "attempted_engines": ["f5tts", "cosyvoice3"],
+                "generation_attempt_count": 4, "fallback_reason": "failed",
+                "fallback_count": 1, "target_language_raw": "zh",
+                "target_language": "zh", "text": "a", "speaker": "A",
+            }
+            peer = {
+                "segment_id": "1", "voice_continuity_group": "g",
+                "model": "f5tts", "attempted_engines": ["f5tts"],
+                "generation_attempt_count": 4, "fallback_reason": "",
+                "fallback_count": 0, "target_language_raw": "zh",
+                "target_language": "zh", "text": "b", "speaker": "A",
+            }
+            exhausted = {
+                "segment_id": "2", "voice_continuity_group": "g",
+                "model": "f5tts", "attempted_engines": ["f5tts"],
+                "generation_attempt_count": 5, "fallback_reason": "",
+                "fallback_count": 0, "target_language_raw": "zh",
+                "target_language": "zh", "text": "c", "speaker": "A",
+            }
+            retry = router._synchronize_continuity_retries(
+                [seed, peer, exhausted], [seed]
+            )
+            self.assertEqual([row["segment_id"] for row in retry], ["0", "1"])
+            self.assertEqual(peer["model"], "cosyvoice3")
+            self.assertIn("cosyvoice3", peer["attempted_engines"])
+            self.assertEqual(exhausted["model"], "f5tts")
+
     def worker(self,calls,failed):
         def run(model,plan,result,force=False):
             calls.append(model)

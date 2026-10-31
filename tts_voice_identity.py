@@ -37,6 +37,236 @@ def cosine_similarity(left: Sequence[Any], right: Sequence[Any]) -> float | None
     return float(sum(x * y for x, y in zip(a, b)))
 
 
+def _segment_embedding(segment: Mapping[str, Any]) -> List[float]:
+    values = segment.get("wespeaker_tts_embedding") or []
+    if not isinstance(values, (list, tuple)):
+        return []
+    try:
+        return _unit(values)
+    except (TypeError, ValueError):
+        return []
+
+
+def _segment_interval(segment: Mapping[str, Any]) -> Tuple[float, float] | None:
+    try:
+        start = float(segment.get("start", 0.0))
+        end = float(segment.get("end", start))
+    except (TypeError, ValueError):
+        return None
+    return (start, end) if end > start else None
+
+
+def _precise_reference_candidate(segment: Mapping[str, Any]) -> bool:
+    return not (
+        str(segment.get("timestamp_precision", "")).lower() == "coarse"
+        or str(segment.get("asr_recovery_status", "")).lower()
+        == "accepted_coarse"
+        or bool(segment.get("speaker_boundary_ambiguous"))
+        or bool(segment.get("speaker_reference_mixed_raw"))
+    )
+
+
+def build_local_continuity_groups(
+    segments: Sequence[Mapping[str, Any]],
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Link only adjacent, strongly matching utterances for TTS continuity.
+
+    This never changes diarization labels or sentence timestamps.  It gives the
+    TTS layer a local identity key so an over-split speaker does not change
+    reference voice and engine in the middle of one continuous turn.
+    """
+    cross_label_threshold = _env_float(
+        "AUTODUB_TTS_LOCAL_CONTINUITY_SIMILARITY", 0.80
+    )
+    same_label_threshold = _env_float(
+        "AUTODUB_TTS_LOCAL_CONTINUITY_SAME_LABEL_SIMILARITY", 0.70
+    )
+    maximum_gap = _env_float("AUTODUB_TTS_LOCAL_CONTINUITY_MAX_GAP", 0.45)
+    ordered = sorted(
+        [segment for segment in segments if _segment_interval(segment)],
+        key=lambda row: _segment_interval(row) or (float("inf"), float("inf")),
+    )
+    parent: Dict[str, str] = {
+        str(segment.get("id", index)): str(segment.get("id", index))
+        for index, segment in enumerate(ordered)
+    }
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    edges: List[Dict[str, Any]] = []
+    for left, right in zip(ordered, ordered[1:]):
+        left_id = str(left.get("id"))
+        right_id = str(right.get("id"))
+        left_interval = _segment_interval(left)
+        right_interval = _segment_interval(right)
+        if left_interval is None or right_interval is None:
+            continue
+        gap = right_interval[0] - left_interval[1]
+        if gap < -0.08 or gap > maximum_gap:
+            continue
+        similarity = cosine_similarity(
+            _segment_embedding(left), _segment_embedding(right)
+        )
+        same_label = str(left.get("speaker")) == str(right.get("speaker"))
+        threshold = same_label_threshold if same_label else cross_label_threshold
+        accepted = similarity is not None and similarity >= threshold
+        edges.append({
+            "left": left_id,
+            "right": right_id,
+            "gap": round(gap, 6),
+            "similarity": round(similarity, 6) if similarity is not None else None,
+            "same_step2_label": same_label,
+            "threshold": threshold,
+            "accepted": accepted,
+        })
+        if accepted:
+            union(left_id, right_id)
+
+    members: Dict[str, List[str]] = defaultdict(list)
+    for segment_id in parent:
+        members[find(segment_id)].append(segment_id)
+    identity_map: Dict[str, str] = {}
+    groups = []
+    for member_ids in members.values():
+        if len(member_ids) < 2:
+            continue
+        ordered_ids = sorted(
+            member_ids,
+            key=lambda value: next(
+                index for index, row in enumerate(ordered)
+                if str(row.get("id")) == value
+            ),
+        )
+        group_id = "local_continuity:" + ordered_ids[0]
+        for segment_id in ordered_ids:
+            identity_map[segment_id] = group_id
+        groups.append({"group_id": group_id, "segment_ids": ordered_ids})
+    return identity_map, {
+        "policy": "adjacent_strong_wespeaker_similarity",
+        "cross_label_similarity_threshold": cross_label_threshold,
+        "same_label_similarity_threshold": same_label_threshold,
+        "maximum_gap_seconds": maximum_gap,
+        "edges": edges,
+        "groups": groups,
+    }
+
+
+def contaminated_reference_rescue_pairs(
+    segments: Sequence[Mapping[str, Any]],
+    reference_source_ids: Mapping[str, Any],
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Pair mutually matching outliers that were put in a contaminated label.
+
+    A segment is rescued only when it disagrees with its cluster's selected
+    reference and has a high-margin mutual match in another precise utterance.
+    The caller can then cross-reference the pair, avoiding both the polluted
+    cluster reference and same-sentence reference leakage.
+    """
+    contamination_threshold = _env_float(
+        "AUTODUB_TTS_REFERENCE_CONTAMINATION_SIMILARITY", 0.62
+    )
+    rescue_threshold = _env_float(
+        "AUTODUB_TTS_REFERENCE_RESCUE_SIMILARITY", 0.78
+    )
+    minimum_margin = _env_float("AUTODUB_TTS_REFERENCE_RESCUE_MARGIN", 0.03)
+    rows = {
+        str(segment.get("id", index)): segment
+        for index, segment in enumerate(segments)
+        if (
+            _segment_embedding(segment)
+            and _segment_interval(segment)
+            and _precise_reference_candidate(segment)
+        )
+    }
+    contaminated: Dict[str, Dict[str, Any]] = {}
+    for segment_id, segment in rows.items():
+        source_id = reference_source_ids.get(str(segment.get("speaker")))
+        source = rows.get(str(source_id))
+        similarity = (
+            cosine_similarity(
+                _segment_embedding(segment), _segment_embedding(source)
+            )
+            if source is not None else None
+        )
+        if similarity is not None and similarity < contamination_threshold:
+            contaminated[segment_id] = {
+                "speaker": str(segment.get("speaker")),
+                "selected_reference_segment_id": str(source_id),
+                "reference_similarity": round(similarity, 6),
+            }
+
+    nearest: Dict[str, Tuple[float, str, float]] = {}
+    for segment_id in contaminated:
+        segment = rows[segment_id]
+        interval = _segment_interval(segment)
+        ranked = []
+        for other_id, other in rows.items():
+            if other_id == segment_id:
+                continue
+            other_interval = _segment_interval(other)
+            if interval is None or other_interval is None:
+                continue
+            if min(interval[1], other_interval[1]) - max(
+                interval[0], other_interval[0]
+            ) > 0.08:
+                continue
+            similarity = cosine_similarity(
+                _segment_embedding(segment), _segment_embedding(other)
+            )
+            if similarity is not None:
+                ranked.append((similarity, other_id))
+        ranked.sort(reverse=True)
+        if not ranked:
+            continue
+        best_similarity, best_id = ranked[0]
+        second_similarity = ranked[1][0] if len(ranked) > 1 else -1.0
+        nearest[segment_id] = (
+            best_similarity, best_id, best_similarity - second_similarity
+        )
+
+    rescue: Dict[str, str] = {}
+    decisions = []
+    for segment_id, (similarity, partner_id, margin) in nearest.items():
+        partner = nearest.get(partner_id)
+        mutual = partner is not None and partner[1] == segment_id
+        partner_margin = partner[2] if partner is not None else -1.0
+        accepted = (
+            partner_id in contaminated
+            and mutual
+            and similarity >= rescue_threshold
+            and margin >= minimum_margin
+            and partner_margin >= minimum_margin
+        )
+        decisions.append({
+            "segment_id": segment_id,
+            "partner_segment_id": partner_id,
+            "similarity": round(similarity, 6),
+            "margin": round(margin, 6),
+            "mutual_nearest": mutual,
+            "accepted": accepted,
+        })
+        if accepted:
+            rescue[segment_id] = partner_id
+    return rescue, {
+        "policy": "cluster_reference_outlier_mutual_segment_rescue",
+        "contamination_similarity_threshold": contamination_threshold,
+        "rescue_similarity_threshold": rescue_threshold,
+        "minimum_margin": minimum_margin,
+        "contaminated_segments": contaminated,
+        "decisions": decisions,
+        "rescue_partner_ids": rescue,
+    }
+
+
 def build_voice_profiles(
     segments: Sequence[Mapping[str, Any]],
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, List[Tuple[float, float]]]]:
@@ -253,4 +483,3 @@ def conservative_identity_map(
         "merge_decisions": decisions,
     }
     return identity_map, diagnostics
-

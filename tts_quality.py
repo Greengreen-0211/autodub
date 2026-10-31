@@ -201,7 +201,7 @@ def audible_speech_quality(path, *, expected_text: str = "") -> dict:
     # Do not cap this floor.  The old 0.55 s cap let a fragment of a long or
     # multi-clause sentence pass merely because it contained some sound.
     symbol_floor = (
-        cjk_count * float(os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_CJK", "0.085"))
+        cjk_count * float(os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_CJK", "0.095"))
         + word_count * float(os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_WORD", "0.12"))
     )
     clause_floor = clause_count * float(
@@ -218,7 +218,11 @@ def audible_speech_quality(path, *, expected_text: str = "") -> dict:
             min_ratio,
             float(os.getenv("AUTODUB_TTS_MULTI_CLAUSE_MIN_VOICED_RATIO", "0.50")),
         )
-    min_dbfs = float(os.getenv("AUTODUB_TTS_MIN_DBFS", "-42"))
+    # A clip around -39 dBFS can technically contain non-silent samples while
+    # remaining inaudible under a normal backing track.  Treat it as failed so
+    # the router retries another engine instead of reporting a missing line as
+    # a successful mix.
+    min_dbfs = float(os.getenv("AUTODUB_TTS_MIN_DBFS", "-36"))
     reasons = []
     if duration <= 0.0:
         reasons.append("empty_audio")
@@ -387,15 +391,15 @@ def electricity_quality(path):
 
     Policy (env AUTODUB_TTS_ELECTRICITY_POLICY):
       "off"           -> skip the analysis entirely (fast path)
-      "warn" (default)-> compute and record metrics, never fail the segment
-      "block"         -> compute and fail the segment when an artifact is found,
+      "warn"          -> compute and record metrics, never fail the segment
+      "block" (default)-> compute and fail the segment when an artifact is found,
                          which triggers the engine fallback chain in the router
 
     Thresholds are deliberately conservative because a false positive under
     "block" would waste GPU re-synthesis; calibrate them against real 电音
     samples before enabling "block".
     """
-    policy = os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY", "warn").strip().lower()
+    policy = os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY", "block").strip().lower()
     if policy == "off":
         return {"electricity_quality": "skipped", "electricity_policy": policy}
     metrics = electricity_metrics(path)

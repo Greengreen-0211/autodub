@@ -4517,6 +4517,18 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
                     "tts_voice_identity_reused": metadata.get(
                         "voice_identity_reused", False
                     ),
+                    "tts_voice_continuity_group": metadata.get(
+                        "voice_continuity_group"
+                    ),
+                    "tts_reference_override_reason": metadata.get(
+                        "reference_override_reason", ""
+                    ),
+                    "tts_reference_partner_segment_id": metadata.get(
+                        "reference_partner_segment_id"
+                    ),
+                    "tts_voice_reference_diagnostics_path": metadata.get(
+                        "voice_reference_diagnostics_path"
+                    ),
                     "tts_reference_duration": metadata.get(
                         "reference_duration"
                     ),
