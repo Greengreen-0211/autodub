@@ -232,6 +232,52 @@ class ContentCompletenessTests(unittest.TestCase):
             "reference_leakage_blocked",
         )
 
+    def test_chinese_target_blocks_one_word_from_long_reference(self):
+        result = synthesized_content_quality(
+            "踩到栏杆上去。",
+            "那close踩到栏杆上去。",
+            "Now close your eyes.",
+            "zh",
+        )
+        self.assertTrue(result["reference_leakage_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "failed")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+        self.assertAlmostEqual(
+            result["reference_leakage_reference_coverage"], 0.25
+        )
+        self.assertAlmostEqual(
+            result["reference_leakage_recognized_coverage"], 1.0
+        )
+        self.assertIn(
+            "reference_latin_in_chinese_target",
+            result["reference_leakage_reason"],
+        )
+
+    def test_chinese_target_blocks_unexpected_foreign_word_without_ref_match(self):
+        result = synthesized_content_quality(
+            "踩到栏杆上去。",
+            "那hello踩到栏杆上去。",
+            "Step up onto the rail.",
+            "zh",
+        )
+        self.assertTrue(result["reference_leakage_detected"])
+        self.assertTrue(result["cross_language_contamination_detected"])
+        self.assertIn(
+            "unexpected_latin_in_chinese_target",
+            result["reference_leakage_reason"],
+        )
+
+    def test_chinese_target_allows_latin_name_present_in_target_text(self):
+        result = synthesized_content_quality(
+            "你好，Jack。",
+            "你好，Jack。",
+            "Hello, Jack.",
+            "zh",
+        )
+        self.assertFalse(result["reference_leakage_detected"])
+        self.assertFalse(result["cross_language_contamination_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "passed")
+
     def test_english_target_blocks_leaked_chinese_reference_sentence(self):
         result = reference_leakage_quality(
             "Give me your hand.",

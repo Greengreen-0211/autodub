@@ -439,6 +439,15 @@ def _content_audit_fingerprint(item: Dict[str, Any], metadata: Dict[str, Any]) -
         "reference_leak_min_coverage": os.getenv(
             "AUTODUB_TTS_REFERENCE_LEAK_MIN_COVERAGE", "0.50"
         ),
+        "reference_leak_recognized_coverage": os.getenv(
+            "AUTODUB_TTS_REFERENCE_LEAK_RECOGNIZED_COVERAGE", "0.80"
+        ),
+        "cross_script_min_latin_length": os.getenv(
+            "AUTODUB_TTS_CROSS_SCRIPT_MIN_LATIN_LENGTH", "3"
+        ),
+        "cross_script_min_cjk_units": os.getenv(
+            "AUTODUB_TTS_CROSS_SCRIPT_MIN_CJK_UNITS", "2"
+        ),
         "reference_leak_same_language_similarity": os.getenv(
             "AUTODUB_TTS_REFERENCE_LEAK_SAME_LANG_SIMILARITY", "0.82"
         ),

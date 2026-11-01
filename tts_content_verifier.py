@@ -65,7 +65,7 @@ def reference_leakage_quality(
     reference_text: Any,
     language: Any,
 ) -> dict[str, Any]:
-    """Detect source/reference words reproduced by the synthesized speech.
+    """Detect source/reference words or unauthorized script contamination.
 
     Completeness normalization intentionally ignores the opposite script. That
     is correct for checking a translation, but unsafe for voice cloning: a
@@ -75,14 +75,6 @@ def reference_leakage_quality(
     expected_raw = str(expected_text or "").strip()
     recognized_raw = str(recognized_text or "").strip()
     reference_raw = str(reference_text or "").strip()
-    if not reference_raw:
-        return {
-            "reference_leakage_quality": "passed",
-            "reference_leakage_detected": False,
-            "reference_leakage_similarity": 0.0,
-            "reference_leakage_reason": "no_reference_text",
-            "reference_text": "",
-        }
 
     target_language = _language_code(language)
     if target_language == "zh":
@@ -92,9 +84,23 @@ def reference_leakage_quality(
         recognized_units = _subtract_units(
             _latin_units(recognized_raw), _latin_units(expected_raw)
         )
-        meaningful = [unit for unit in reference_units if len(unit) >= 3]
+        minimum_latin_length = max(1, int(os.getenv(
+            "AUTODUB_TTS_CROSS_SCRIPT_MIN_LATIN_LENGTH", "3"
+        )))
+        meaningful = [
+            unit for unit in reference_units
+            if len(unit) >= minimum_latin_length
+            and any("a" <= char <= "z" for char in unit)
+        ]
+        unexpected_cross_script_units = [
+            unit for unit in recognized_units
+            if len(unit) >= minimum_latin_length
+            and any("a" <= char <= "z" for char in unit)
+        ]
         minimum_match = 1 if meaningful else 2
         evidence_kind = "reference_latin_in_chinese_target"
+        contamination_kind = "unexpected_latin_in_chinese_target"
+        cross_script_contamination = bool(unexpected_cross_script_units)
     else:
         reference_units = _subtract_units(
             _cjk_units(reference_raw), _cjk_units(expected_raw)
@@ -102,16 +108,36 @@ def reference_leakage_quality(
         recognized_units = _subtract_units(
             _cjk_units(recognized_raw), _cjk_units(expected_raw)
         )
-        minimum_match = 2
+        minimum_match = max(1, int(os.getenv(
+            "AUTODUB_TTS_CROSS_SCRIPT_MIN_CJK_UNITS", "2"
+        )))
         evidence_kind = "reference_cjk_in_english_target"
+        contamination_kind = "unexpected_cjk_in_english_target"
+        unexpected_cross_script_units = list(recognized_units)
+        cross_script_contamination = bool(
+            len(unexpected_cross_script_units) >= minimum_match
+        )
 
     matched, coverage = _sequence_coverage(reference_units, recognized_units)
-    cross_script_detected = bool(
+    recognized_coverage = (
+        matched / len(recognized_units) if recognized_units else 0.0
+    )
+    # A leak can be a small fraction of a long reference sentence while still
+    # accounting for every unexpected opposite-script token in the generated
+    # audio.  Checking only matched/reference (the historical behaviour) let
+    # one-word leaks such as 1/4 of the reference pass.  Either direction now
+    # provides sufficient evidence.
+    reference_match_detected = bool(
         reference_units
         and matched >= minimum_match
-        and coverage >= float(os.getenv(
-            "AUTODUB_TTS_REFERENCE_LEAK_MIN_COVERAGE", "0.50"
-        ))
+        and (
+            coverage >= float(os.getenv(
+                "AUTODUB_TTS_REFERENCE_LEAK_MIN_COVERAGE", "0.50"
+            ))
+            or recognized_coverage >= float(os.getenv(
+                "AUTODUB_TTS_REFERENCE_LEAK_RECOGNIZED_COVERAGE", "0.80"
+            ))
+        )
     )
 
     # Same-language dubbing has no opposite-script signal. Keep a conservative
@@ -151,21 +177,56 @@ def reference_leakage_quality(
             )
         )
     )
-    detected = cross_script_detected or same_language_detected
-    similarity = max(coverage, same_similarity if same_language_detected else 0.0)
+    # Opposite-script material that the target text did not authorize is
+    # unsuitable even when it cannot be tied to the selected reference (for
+    # example a polluted reference boundary or a model hallucination).  It is
+    # therefore a hard target-language contamination failure as well as a
+    # useful reference-leak signal when the words match the reference.
+    detected = bool(
+        reference_match_detected
+        or cross_script_contamination
+        or same_language_detected
+    )
+    similarity = max(
+        coverage,
+        recognized_coverage,
+        same_similarity if same_language_detected else 0.0,
+    )
     reason = ""
-    if cross_script_detected:
-        reason = f"{evidence_kind}:matched={matched},coverage={coverage:.3f}"
+    if reference_match_detected:
+        reason = (
+            f"{evidence_kind}:matched={matched},"
+            f"reference_coverage={coverage:.3f},"
+            f"recognized_coverage={recognized_coverage:.3f}"
+        )
+    elif cross_script_contamination:
+        visible_units = unexpected_cross_script_units[:5]
+        reason = (
+            f"{contamination_kind}:units="
+            + ",".join(visible_units)
+        )
     elif same_language_detected:
         reason = (
             "reference_phrase_reproduced:"
             f"similarity={same_similarity:.3f},target_similarity={expected_similarity:.3f}"
         )
+    elif not reference_raw:
+        reason = "no_reference_text"
     return {
         "reference_leakage_quality": "failed" if detected else "passed",
         "reference_leakage_detected": detected,
         "reference_leakage_similarity": round(similarity, 6),
         "reference_leakage_reason": reason,
+        "reference_leakage_reference_coverage": round(coverage, 6),
+        "reference_leakage_recognized_coverage": round(
+            recognized_coverage, 6
+        ),
+        "cross_language_contamination_detected": bool(
+            cross_script_contamination
+        ),
+        "cross_language_contamination_units": (
+            unexpected_cross_script_units
+        ),
         "reference_text": reference_raw,
     }
 
