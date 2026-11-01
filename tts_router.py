@@ -293,6 +293,27 @@ def _minimum_pronounceable_duration(text: Any, language: Any = "") -> float:
     )
 
 
+def _audible_failure_is_hard(metrics: Dict[str, Any]) -> bool:
+    """Return whether an audibility failure cannot be used as Agent fallback.
+
+    A low voiced *ratio* alone is not fatal: a valid short utterance can sit in
+    a WAV with substantial leading/trailing silence. Empty, practically
+    inaudible, or implausibly short voiced content is different -- promoting
+    it would turn a quality fallback into a swallowed/missing line.
+    """
+    if str(metrics.get("audible_speech_quality") or "") != "failed":
+        return False
+    reason = str(metrics.get("audible_speech_reason") or "")
+    return any(
+        marker in reason
+        for marker in (
+            "empty_audio",
+            "near_silent_dbfs:",
+            "voiced_too_short:",
+        )
+    )
+
+
 def _request_fingerprint(item: Dict[str, Any]) -> str:
     payload = {
         key: item.get(key)
@@ -1136,7 +1157,10 @@ class TTSRouter:
                 audible_speech_quality(source, expected_text=item.get("text", ""))
             )
         measured.update(generated_audio_safety(source))
-        if measured.get("generated_audio_safety") != "passed":
+        if (
+            measured.get("generated_audio_safety") != "passed"
+            or _audible_failure_is_hard(measured)
+        ):
             return
         if measured.get("audible_leading_silence_seconds") is None:
             try:
@@ -1416,10 +1440,14 @@ class TTSRouter:
         )
         final_electricity = electricity_quality(destination)
         final_hard_audio = generated_audio_safety(destination)
-        # Only corrupted/empty audio is a hard stop after retry exhaustion.
-        # Voice, content, electricity and duration remain explicit degraded
-        # scores so the best generated candidate can finish the deliverable.
-        if final_hard_audio.get("generated_audio_safety") != "passed":
+        # Corrupted/empty audio and a waveform whose voiced content is too
+        # short to contain the requested sentence may never masquerade as a
+        # successful fallback. A low voiced ratio *by itself* remains a soft
+        # degradation because it often just means harmless edge silence.
+        if (
+            final_hard_audio.get("generated_audio_safety") != "passed"
+            or _audible_failure_is_hard(final_audible)
+        ):
             destination.unlink(missing_ok=True)
             return None
         result.update(final_audible)

@@ -779,6 +779,20 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(results[0]["tts_text"],"short")
             self.assertGreaterEqual(len(calls),1)
 
+    def test_low_voiced_ratio_alone_is_not_a_hard_fallback_failure(self):
+        self.assertFalse(tts_router._audible_failure_is_hard({
+            "audible_speech_quality": "failed",
+            "audible_speech_reason": "voiced_ratio_low:0.279<0.350",
+            "voiced_duration": 1.18,
+            "minimum_voiced_duration": 0.48,
+        }))
+        self.assertTrue(tts_router._audible_failure_is_hard({
+            "audible_speech_quality": "failed",
+            "audible_speech_reason": "voiced_too_short:0.100<0.220",
+            "voiced_duration": 0.10,
+            "minimum_voiced_duration": 0.22,
+        }))
+
     def test_unsafe_overlength_generation_uses_engine_fallback(self):
         calls=[]
         def worker(model,plan,result,force=False):
