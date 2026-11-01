@@ -1,4 +1,5 @@
 import os
+import math
 import unittest
 from unittest.mock import patch
 
@@ -8,6 +9,7 @@ from tts_voice_identity import (
     build_voice_profiles,
     conservative_identity_map,
     contaminated_reference_rescue_pairs,
+    segment_profile_identity_overrides,
 )
 
 
@@ -118,6 +120,28 @@ class VoiceIdentityTests(unittest.TestCase):
         self.assertTrue(audit["edges"][0]["accepted"])
         self.assertFalse(audit["edges"][1]["accepted"])
 
+    def test_local_continuity_refuses_transitive_voice_bridge(self):
+        def vector(degrees):
+            radians = math.radians(degrees)
+            return [math.cos(radians), math.sin(radians)]
+
+        segments = [
+            {"id": 0, "speaker": "A", "start": 0.0, "end": 1.0,
+             "wespeaker_tts_embedding": vector(0)},
+            {"id": 1, "speaker": "B", "start": 1.0, "end": 2.0,
+             "wespeaker_tts_embedding": vector(37)},
+            {"id": 2, "speaker": "C", "start": 2.0, "end": 3.0,
+             "wespeaker_tts_embedding": vector(74)},
+        ]
+        with patch.dict(os.environ, {
+            "AUTODUB_TTS_LOCAL_CONTINUITY_SIMILARITY": "0.75",
+            "AUTODUB_TTS_LOCAL_CONTINUITY_COMPONENT_MIN_SIMILARITY": "0.74",
+        }):
+            identity_map, audit = build_local_continuity_groups(segments)
+        self.assertEqual(identity_map["0"], identity_map["1"])
+        self.assertNotIn("2", identity_map)
+        self.assertFalse(audit["edges"][1]["component_guard_passed"])
+
     def test_contaminated_cluster_pair_cross_references_each_other(self):
         segments = [
             {
@@ -138,6 +162,31 @@ class VoiceIdentityTests(unittest.TestCase):
         )
         self.assertEqual(rescue, {"1": "2", "2": "1"})
         self.assertEqual(set(audit["contaminated_segments"]), {"1", "2"})
+
+    def test_low_confidence_sentence_can_reuse_matching_other_profile(self):
+        segments = [
+            {
+                "id": 0, "speaker": "A", "start": 0.0, "end": 1.0,
+                "speaker_assignment_confidence": 0.50,
+                "wespeaker_tts_embedding": [0.0, 1.0],
+            },
+            {
+                "id": 1, "speaker": "A", "start": 2.0, "end": 3.0,
+                "speaker_assignment_confidence": 0.95,
+                "wespeaker_tts_embedding": [1.0, 0.0],
+            },
+            {
+                "id": 2, "speaker": "B", "start": 4.0, "end": 5.0,
+                "speaker_assignment_confidence": 0.95,
+                "wespeaker_tts_embedding": [0.0, 1.0],
+            },
+        ]
+        profiles, intervals = build_voice_profiles(segments)
+        overrides, audit = segment_profile_identity_overrides(
+            segments, profiles, intervals, {"A": "1", "B": "2"}
+        )
+        self.assertEqual(overrides["0"], "B")
+        self.assertTrue(audit["decisions"][0]["accepted"])
 
     def test_wespeaker_low_similarity_warns_without_blocking(self):
         with patch.dict(os.environ, {

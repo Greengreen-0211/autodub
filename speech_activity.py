@@ -357,6 +357,91 @@ def attach_precise_tts_placement(
                 "guarded_start": round(onset, 3),
                 "guarded_end": round(hard_end, 3),
             }
+        # OCR is never a free-standing playback timestamp.  When a stable
+        # subtitle observation and an independent VAD island agree, however,
+        # they can resolve a word-alignment island conflict inside a long
+        # sentence window.  This is intentionally limited to large conflicts
+        # and bounded movement so ordinary precise timestamps remain intact.
+        ocr_vad_fusion = None
+        try:
+            ocr_first_seen = float(segment.get("ocr_subtitle_first_seen"))
+        except (TypeError, ValueError):
+            ocr_first_seen = None
+        try:
+            ocr_last_seen = float(segment.get("ocr_subtitle_last_seen"))
+        except (TypeError, ValueError):
+            ocr_last_seen = None
+        try:
+            ocr_frames = int(segment.get("ocr_recovery_frame_count") or 0)
+        except (TypeError, ValueError):
+            ocr_frames = 0
+        try:
+            ocr_confidence = float(
+                segment.get("ocr_timing_confidence")
+                or segment.get("ocr_correction_confidence")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            ocr_confidence = 0.0
+        stable_ocr_timing = bool(
+            ocr_first_seen is not None
+            and (ocr_frames >= 2 or ocr_confidence >= 0.80)
+        )
+        if stable_ocr_timing and timing_reason != "ambiguous_word_span_ratio_guard":
+            tolerance = float(os.getenv(
+                "AUTODUB_TTS_OCR_VAD_TIMING_TOLERANCE_SECONDS", "0.70"
+            ))
+            maximum_move = float(os.getenv(
+                "AUTODUB_TTS_OCR_VAD_MAX_ONSET_MOVE_SECONDS", "2.00"
+            ))
+            minimum_conflict = float(os.getenv(
+                "AUTODUB_TTS_OCR_VAD_MIN_WORD_CONFLICT_SECONDS", "1.00"
+            ))
+            outer_activity = intersect_ranges(active, [(outer_start, outer_end)])
+            hint_end = (
+                ocr_last_seen if ocr_last_seen is not None
+                else ocr_first_seen + tolerance
+            )
+            candidates = [
+                interval for interval in outer_activity
+                if interval[1] >= ocr_first_seen - tolerance
+                and interval[0] <= hint_end + tolerance
+            ]
+            if candidates:
+                selected = min(
+                    candidates,
+                    key=lambda interval: (
+                        0.0
+                        if interval[0] <= ocr_first_seen <= interval[1]
+                        else abs(interval[0] - ocr_first_seen),
+                        interval[0],
+                    ),
+                )
+                candidate_onset = max(
+                    outer_start, float(selected[0]) - float(pre_roll)
+                )
+                conflict = abs(float(selected[0]) - word_start)
+                movement = abs(candidate_onset - onset)
+                if conflict >= minimum_conflict and movement <= maximum_move:
+                    onset = candidate_onset
+                    aligned_end = min(
+                        outer_end, float(selected[1]) + float(post_roll)
+                    )
+                    speech_islands = [selected]
+                    timing_reason = "ocr_vad_word_conflict_consensus"
+                    ocr_vad_fusion = {
+                        "subtitle_first_seen": round(ocr_first_seen, 3),
+                        "subtitle_last_seen": (
+                            round(ocr_last_seen, 3)
+                            if ocr_last_seen is not None else None
+                        ),
+                        "selected_vad_island": [
+                            round(float(selected[0]), 3),
+                            round(float(selected[1]), 3),
+                        ],
+                        "word_vad_conflict_seconds": round(conflict, 3),
+                        "onset_movement_seconds": round(movement, 3),
+                    }
         # Public sentence bounds are immutable, but they are not always the
         # audible onset. Keep the boundary anchor for ordinary/short lines and
         # move it only when word alignment and VAD provide strong structural
@@ -385,6 +470,8 @@ def attach_precise_tts_placement(
                 # The guard exists specifically because the inherited word
                 # span is not credible as one continuous utterance. Do not
                 # erase its local acoustic anchor by forcing the outer start.
+                onset = unbounded_onset
+            elif timing_reason == "ocr_vad_word_conflict_consensus":
                 onset = unbounded_onset
             elif dominant_island_mode and dominant_word_island is not None:
                 onset = max(
@@ -473,6 +560,8 @@ def attach_precise_tts_placement(
                     if timing_reason == "ambiguous_word_span_ratio_guard"
                     else 0.90
                     if timing_reason == "dominant_island_after_long_pause"
+                    else 0.86
+                    if timing_reason == "ocr_vad_word_conflict_consensus"
                     else 0.88
                     if timing_reason == "trailing_word_island_consensus"
                     else (
@@ -488,6 +577,7 @@ def attach_precise_tts_placement(
             ),
             "tts_timing_reason": timing_reason,
             "tts_timing_ratio_guard": ratio_guard,
+            "tts_ocr_vad_fusion": ocr_vad_fusion,
         })
         audit.append({
             "segment_id": str(segment.get("id")),
@@ -511,6 +601,7 @@ def attach_precise_tts_placement(
             "internal_pauses": internal_pauses,
             "timing_reason": timing_reason,
             "ratio_guard": ratio_guard,
+            "ocr_vad_fusion": ocr_vad_fusion,
         })
         output.append(segment)
     return output, audit

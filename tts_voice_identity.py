@@ -82,12 +82,22 @@ def build_local_continuity_groups(
         "AUTODUB_TTS_LOCAL_CONTINUITY_SAME_LABEL_SIMILARITY", 0.70
     )
     maximum_gap = _env_float("AUTODUB_TTS_LOCAL_CONTINUITY_MAX_GAP", 0.45)
+    component_minimum = _env_float(
+        "AUTODUB_TTS_LOCAL_CONTINUITY_COMPONENT_MIN_SIMILARITY", 0.74
+    )
+    component_guard_enabled = os.getenv(
+        "AUTODUB_TTS_LOCAL_COMPONENT_GUARD_ENABLED", "1"
+    ).strip().lower() in {"1", "true", "yes", "y", "on"}
     ordered = sorted(
         [segment for segment in segments if _segment_interval(segment)],
         key=lambda row: _segment_interval(row) or (float("inf"), float("inf")),
     )
     parent: Dict[str, str] = {
         str(segment.get("id", index)): str(segment.get("id", index))
+        for index, segment in enumerate(ordered)
+    }
+    by_id = {
+        str(segment.get("id", index)): segment
         for index, segment in enumerate(ordered)
     }
 
@@ -101,6 +111,28 @@ def build_local_continuity_groups(
         left_root, right_root = find(left), find(right)
         if left_root != right_root:
             parent[right_root] = left_root
+
+    def component_guard(left: str, right: str) -> Tuple[bool, float | None]:
+        left_root, right_root = find(left), find(right)
+        values = []
+        for left_id in parent:
+            if find(left_id) != left_root:
+                continue
+            for right_id in parent:
+                if find(right_id) != right_root:
+                    continue
+                similarity = cosine_similarity(
+                    _segment_embedding(by_id[left_id]),
+                    _segment_embedding(by_id[right_id]),
+                )
+                if similarity is None:
+                    return False, None
+                values.append(similarity)
+        minimum = min(values) if values else None
+        return (
+            minimum is not None and minimum >= component_minimum,
+            minimum,
+        )
 
     edges: List[Dict[str, Any]] = []
     for left, right in zip(ordered, ordered[1:]):
@@ -118,7 +150,14 @@ def build_local_continuity_groups(
         )
         same_label = str(left.get("speaker")) == str(right.get("speaker"))
         threshold = same_label_threshold if same_label else cross_label_threshold
-        accepted = similarity is not None and similarity >= threshold
+        base_accepted = similarity is not None and similarity >= threshold
+        if base_accepted and component_guard_enabled:
+            guard_passed, component_similarity = component_guard(
+                left_id, right_id
+            )
+        else:
+            guard_passed, component_similarity = base_accepted, similarity
+        accepted = base_accepted and guard_passed
         edges.append({
             "left": left_id,
             "right": right_id,
@@ -126,6 +165,12 @@ def build_local_continuity_groups(
             "similarity": round(similarity, 6) if similarity is not None else None,
             "same_step2_label": same_label,
             "threshold": threshold,
+            "component_minimum_similarity": (
+                round(component_similarity, 6)
+                if component_similarity is not None else None
+            ),
+            "component_guard_threshold": component_minimum,
+            "component_guard_passed": guard_passed,
             "accepted": accepted,
         })
         if accepted:
@@ -155,6 +200,8 @@ def build_local_continuity_groups(
         "cross_label_similarity_threshold": cross_label_threshold,
         "same_label_similarity_threshold": same_label_threshold,
         "maximum_gap_seconds": maximum_gap,
+        "component_minimum_similarity": component_minimum,
+        "component_guard_enabled": component_guard_enabled,
         "edges": edges,
         "groups": groups,
     }
@@ -483,3 +530,110 @@ def conservative_identity_map(
         "merge_decisions": decisions,
     }
     return identity_map, diagnostics
+
+
+def segment_profile_identity_overrides(
+    segments: Sequence[Mapping[str, Any]],
+    profiles: Mapping[str, Mapping[str, Any]],
+    intervals: Mapping[str, Sequence[Tuple[float, float]]],
+    reference_source_ids: Mapping[str, Any],
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Reassign only clear sentence-level outliers for TTS reference use.
+
+    A wrong Step 2 label must not be rewritten here.  This function merely
+    lets one low-confidence/outlier sentence clone the closest reliable voice
+    profile when embedding evidence is strong, high-margin and non-overlapping.
+    Gender/pitch guesses are intentionally not used as an identity classifier.
+    """
+    current_minimum = _env_float(
+        "AUTODUB_TTS_SEGMENT_CURRENT_IDENTITY_MIN_SIMILARITY", 0.62
+    )
+    target_minimum = _env_float(
+        "AUTODUB_TTS_SEGMENT_IDENTITY_REASSIGN_SIMILARITY", 0.80
+    )
+    minimum_margin = _env_float(
+        "AUTODUB_TTS_SEGMENT_IDENTITY_REASSIGN_MARGIN", 0.05
+    )
+    low_confidence = _env_float(
+        "AUTODUB_TTS_SEGMENT_IDENTITY_LOW_CONFIDENCE", 0.65
+    )
+    overlap_tolerance = _env_float(
+        "AUTODUB_TTS_IDENTITY_OVERLAP_TOLERANCE_SECONDS", 0.08
+    )
+    overrides: Dict[str, str] = {}
+    decisions = []
+    for index, segment in enumerate(segments):
+        segment_id = str(segment.get("id", index))
+        embedding = _segment_embedding(segment)
+        interval = _segment_interval(segment)
+        speaker = str(segment.get("speaker", "SPEAKER_00"))
+        if not embedding or interval is None or not _precise_reference_candidate(segment):
+            continue
+        current_profile = profiles.get(speaker, {})
+        current_similarity = cosine_similarity(
+            embedding, current_profile.get("embedding") or []
+        )
+        try:
+            confidence = float(
+                segment.get("speaker_assignment_confidence", 1.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            confidence = 0.0
+        outlier = (
+            current_similarity is None
+            or current_similarity < current_minimum
+            or confidence < low_confidence
+            or bool(segment.get("speaker_boundary_ambiguous"))
+        )
+        if not outlier:
+            continue
+        ranked = []
+        for candidate, profile in profiles.items():
+            if candidate == speaker or candidate not in reference_source_ids:
+                continue
+            # A sentence must not select itself as its cloning reference.
+            if str(reference_source_ids.get(candidate)) == segment_id:
+                continue
+            if _has_temporal_overlap(
+                [interval], intervals.get(candidate, []), overlap_tolerance
+            ):
+                continue
+            similarity = cosine_similarity(
+                embedding, profile.get("embedding") or []
+            )
+            if similarity is not None:
+                ranked.append((similarity, candidate))
+        ranked.sort(reverse=True)
+        if not ranked:
+            continue
+        best_similarity, best_speaker = ranked[0]
+        second_similarity = ranked[1][0] if len(ranked) > 1 else -1.0
+        margin = best_similarity - second_similarity
+        accepted = (
+            best_similarity >= target_minimum and margin >= minimum_margin
+        )
+        decisions.append({
+            "segment_id": segment_id,
+            "step2_speaker": speaker,
+            "current_similarity": (
+                round(current_similarity, 6)
+                if current_similarity is not None else None
+            ),
+            "speaker_assignment_confidence": round(confidence, 6),
+            "candidate_speaker": best_speaker,
+            "candidate_similarity": round(best_similarity, 6),
+            "candidate_margin": round(margin, 6),
+            "accepted": accepted,
+        })
+        if accepted:
+            overrides[segment_id] = best_speaker
+    return overrides, {
+        "policy": "tts_only_segment_profile_outlier_reassignment",
+        "step2_labels_immutable": True,
+        "current_identity_minimum_similarity": current_minimum,
+        "target_identity_minimum_similarity": target_minimum,
+        "minimum_margin": minimum_margin,
+        "low_assignment_confidence": low_confidence,
+        "decisions": decisions,
+        "overrides": overrides,
+    }

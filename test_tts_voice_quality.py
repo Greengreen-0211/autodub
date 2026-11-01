@@ -183,6 +183,40 @@ class VoiceConsistencyTests(unittest.TestCase):
 
 
 class ContentCompletenessTests(unittest.TestCase):
+    def test_content_asr_outage_is_recorded_without_stopping_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            clip = Path(tmp) / "candidate.wav"
+            write_wav(clip, 1.0, sample=tone())
+            item = {
+                "segment_id": "0", "text": "我没有。",
+                "planned_text": "我没有。", "language": "zh",
+                "target_language": "zh", "emotion": "neutral",
+                "speaker": "A", "ref_audio": "speaker.wav",
+                "ref_text": "reference", "target_duration": 1.0,
+                "start": 0.0, "model": "cosyvoice3",
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            results = {"0": {
+                "segment_id": "0", "status": "success",
+                "file": str(clip), "audio_sha256": tts_router._file_sha256(clip),
+                "audible_speech_quality": "passed",
+            }}
+            with patch.object(
+                router, "_content_asr_enabled", return_value=True
+            ), patch("tts_router.subprocess.run", return_value=SimpleNamespace(
+                returncode=1
+            )), patch.object(router, "_remember_candidate"):
+                updated = router._run_content_asr_audit([item], results)
+            self.assertEqual(updated["0"]["status"], "success")
+            self.assertTrue(updated["0"]["content_asr_unavailable"])
+            self.assertEqual(
+                updated["0"]["reference_leakage_quality"], "unverified"
+            )
+
     def test_chinese_target_blocks_leaked_english_reference_sentence(self):
         result = synthesized_content_quality(
             "你好，杰克。",
@@ -422,7 +456,7 @@ class ContentCompletenessTests(unittest.TestCase):
             }, "content_audit")
             self.assertIsNone(router._adopt_best_generated_candidate(item))
 
-    def test_agent_fallback_never_force_compresses_unsafe_candidate(self):
+    def test_agent_fallback_uses_bounded_fit_for_unsafe_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
             router = tts_router.TTSRouter(
                 SimpleNamespace(temp_dir=tmp), scheme="scheme3"
@@ -454,12 +488,20 @@ class ContentCompletenessTests(unittest.TestCase):
                     "voice_consistency_quality": "passed",
                     "electricity_quality": "passed",
                 }, "content_audit")
-            with patch("tts_router._apply_atempo_exact") as exact:
+            with patch(
+                "tts_router._apply_atempo_exact",
+                return_value={
+                    "forced_duration_fit": True,
+                    "forced_atempo_factor": 1.18,
+                },
+            ) as exact:
                 adopted = router._adopt_best_generated_candidate(item)
-            self.assertIsNone(adopted)
-            exact.assert_not_called()
+            self.assertIsNotNone(adopted)
+            self.assertTrue(adopted["agent_degraded_candidate"])
+            self.assertTrue(adopted["agent_unsafe_duration_fallback"])
+            exact.assert_called_once()
 
-    def test_agent_fallback_rejects_content_failed_candidate(self):
+    def test_agent_fallback_can_use_content_degraded_candidate_after_retries(self):
         with tempfile.TemporaryDirectory() as tmp:
             router = tts_router.TTSRouter(
                 SimpleNamespace(temp_dir=tmp), scheme="scheme3"
@@ -490,7 +532,70 @@ class ContentCompletenessTests(unittest.TestCase):
                     "voice_consistency_quality": "passed",
                     "electricity_quality": "passed",
                 }, "content_audit")
+            adopted = router._adopt_best_generated_candidate(item)
+            self.assertIsNotNone(adopted)
+            self.assertTrue(adopted["agent_degraded_candidate"])
+            self.assertEqual(adopted["content_completeness_quality"], "failed")
+
+    def test_agent_fallback_rejects_completely_silent_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            clip = Path(tmp) / "silent.wav"
+            write_wav(clip, 1.0)
+            item = {
+                "segment_id": "0", "text": "我没有。",
+                "planned_text": "我没有。", "language": "zh",
+                "target_language": "zh", "emotion": "neutral",
+                "speaker": "A", "ref_audio": "speaker.wav",
+                "ref_text": "reference", "target_duration": 1.0,
+                "start": 0.0, "model": "cosyvoice3",
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            router._remember_candidate(item, {
+                "file": str(clip), "actual_duration": 1.0,
+                "audible_speech_quality": "failed",
+                "reference_leakage_quality": "passed",
+                "reference_leakage_detected": False,
+            }, "engine_generation")
             self.assertIsNone(router._adopt_best_generated_candidate(item))
+
+    def test_raw_generation_survives_postprocess_failure_as_agent_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            raw = Path(tmp) / "raw.wav"
+            write_wav(raw, 1.0, sample=tone())
+            item = {
+                "segment_id": "0", "text": "我没有。",
+                "planned_text": "我没有。", "language": "zh",
+                "target_language": "zh", "emotion": "neutral",
+                "speaker": "A", "ref_audio": "speaker.wav",
+                "ref_text": "reference", "target_duration": 1.0,
+                "start": 0.0, "model": "cosyvoice3",
+                "raw_path": str(raw),
+                "final_path": str(Path(tmp) / "missing-final.wav"),
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            router._remember_candidate(item, {
+                "status": "failed",
+                "error": "postprocess_failed",
+                "reference_leakage_quality": "passed",
+                "reference_leakage_detected": False,
+            }, "engine_generation")
+            with patch.object(
+                router, "_content_asr_enabled", return_value=False
+            ):
+                adopted = router._adopt_best_generated_candidate(item)
+            self.assertIsNotNone(adopted)
+            self.assertEqual(adopted["status"], "success")
+            self.assertTrue(adopted["agent_degraded_candidate"])
 
 
 def write_wav(path, duration_s, rate=16000, sample=None):
@@ -567,6 +672,43 @@ class AtempoFactorTests(unittest.TestCase):
         factors = [float(part.split("=")[1]) for part in chain.split(",")]
         self.assertTrue(all(0.5 <= factor <= 2.0 for factor in factors))
         self.assertAlmostEqual(math.prod(factors), 5.0, places=6)
+
+
+class AdvancedArtifactGateTests(unittest.TestCase):
+    def test_two_independent_artifact_signals_trigger_retry(self):
+        metrics = {
+            "spectral_flatness": 0.01,
+            "hf_energy_ratio": 0.01,
+            "spectral_flux": 0.80,
+            "pitch_jump_ratio": 0.40,
+            "clipping_ratio": 0.0,
+            "rms": 0.2,
+            "duration": 1.0,
+            "sample_rate": 16000,
+        }
+        with patch("tts_quality.electricity_metrics", return_value=metrics), patch.dict(
+            os.environ, {"AUTODUB_TTS_ADVANCED_ARTIFACT_GATE_ENABLED": "1"}
+        ):
+            result = electricity_quality("unused.wav")
+        self.assertEqual(result["electricity_quality"], "failed")
+        self.assertEqual(len(result["electricity_artifact_indicators"]), 2)
+
+    def test_one_advisory_artifact_signal_does_not_block(self):
+        metrics = {
+            "spectral_flatness": 0.01,
+            "hf_energy_ratio": 0.01,
+            "spectral_flux": 0.80,
+            "pitch_jump_ratio": 0.0,
+            "clipping_ratio": 0.0,
+            "rms": 0.2,
+            "duration": 1.0,
+            "sample_rate": 16000,
+        }
+        with patch("tts_quality.electricity_metrics", return_value=metrics), patch.dict(
+            os.environ, {"AUTODUB_TTS_ADVANCED_ARTIFACT_GATE_ENABLED": "1"}
+        ):
+            result = electricity_quality("unused.wav")
+        self.assertEqual(result["electricity_quality"], "passed")
 
 
 class TrimSilenceTests(unittest.TestCase):

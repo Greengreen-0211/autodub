@@ -1,9 +1,32 @@
 import unittest
 
-from mix_timing import plan_mix_windows, validate_mix_audit
+from mix_timing import plan_mix_windows, plan_speech_gain, validate_mix_audit
 
 
 class MixTimingTests(unittest.TestCase):
+    def test_quiet_dialogue_receives_bounded_headroom_safe_gain(self):
+        plan = plan_speech_gain(
+            -24.0, -25.0, -8.0,
+            target_margin_db=6.0,
+            minimum_margin_db=3.0,
+            maximum_gain_db=6.0,
+            peak_ceiling_dbfs=-1.0,
+        )
+        self.assertEqual(plan["speech_gain_db"], 5.0)
+        self.assertEqual(plan["speech_margin_db"], 6.0)
+        self.assertEqual(plan["mix_audibility_quality"], "passed")
+
+    def test_gain_never_crosses_peak_ceiling_and_reports_degradation(self):
+        plan = plan_speech_gain(
+            -24.0, -22.0, -2.0,
+            target_margin_db=6.0,
+            minimum_margin_db=3.0,
+            maximum_gain_db=6.0,
+            peak_ceiling_dbfs=-1.0,
+        )
+        self.assertEqual(plan["speech_gain_db"], 1.0)
+        self.assertEqual(plan["mix_audibility_quality"], "degraded")
+
     def test_non_overlapping_clips_are_bounded_by_next_onset(self):
         planned = plan_mix_windows([
             {"segment_id": 1, "start": 1.0, "end": 4.0},
@@ -57,6 +80,14 @@ class MixTimingTests(unittest.TestCase):
             "original_wav_duration": 1.0, "clip_rms": 100,
             "mix_verified": True,
         }])
+
+    def test_agent_mode_records_tail_trim_without_blocking_delivery(self):
+        issues = validate_mix_audit(["1"], [{
+            "segment_id": "1", "audible_duration": 0.7,
+            "original_wav_duration": 1.0, "clip_rms": 100,
+            "mix_verified": True,
+        }], allow_degraded=True)
+        self.assertTrue(any("would trim" in issue for issue in issues))
 
 
 if __name__ == "__main__":

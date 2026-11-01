@@ -31,6 +31,7 @@ from tts_quality import (
     duration_adaptation_safety,
     duration_quality,
     electricity_quality,
+    generated_audio_safety,
     natural_duration_fit,
     voice_consistency_quality,
 )
@@ -39,6 +40,7 @@ from tts_voice_identity import (
     build_local_continuity_groups,
     conservative_identity_map,
     contaminated_reference_rescue_pairs,
+    segment_profile_identity_overrides,
 )
 
 
@@ -382,7 +384,15 @@ def _content_audit_fingerprint(item: Dict[str, Any], metadata: Dict[str, Any]) -
     Changing ASR verification policy must re-audit an existing WAV, not cause
     every stochastic TTS backend to synthesize the whole project again.
     """
-    path = Path(str(metadata.get("file") or item.get("final_path") or ""))
+    path = next((
+        candidate
+        for candidate in (
+            Path(str(metadata.get("file") or "")),
+            Path(str(item.get("final_path") or "")),
+            Path(str(item.get("raw_path") or "")),
+        )
+        if str(candidate) not in {"", "."} and candidate.is_file()
+    ), Path(""))
     audio_sha = str(metadata.get("audio_sha256") or "")
     if not audio_sha and path.is_file():
         audio_sha = _file_sha256(path)
@@ -1101,19 +1111,42 @@ class TTSRouter:
     def _remember_candidate(
         self, item: Dict[str, Any], metadata: Dict[str, Any], stage: str
     ) -> None:
-        """Persist every audible synthesis so later retries cannot erase it."""
-        source = Path(str(metadata.get("file") or item.get("final_path") or ""))
-        if not source.is_file() or not source.stat().st_size:
+        """Persist every non-empty synthesis so retries cannot erase it.
+
+        Strict quality checks decide whether another attempt is worthwhile;
+        they do not erase a generated candidate that an autonomous Agent may
+        need after exhausting its five-attempt budget.
+        """
+        source = next((
+            path
+            for path in (
+                Path(str(metadata.get("file") or "")),
+                Path(str(item.get("final_path") or "")),
+                Path(str(item.get("raw_path") or "")),
+            )
+            if str(path) not in {"", "."}
+            and path.is_file()
+            and path.stat().st_size
+        ), None)
+        if source is None:
             return
         measured = dict(metadata)
         if not measured.get("audible_speech_quality"):
             measured.update(
                 audible_speech_quality(source, expected_text=item.get("text", ""))
             )
-        if measured.get("audible_speech_quality") != "passed":
+        measured.update(generated_audio_safety(source))
+        if measured.get("generated_audio_safety") != "passed":
             return
         if measured.get("audible_leading_silence_seconds") is None:
-            edge_metrics = _edge_silence_metrics(source)
+            try:
+                edge_metrics = _edge_silence_metrics(source)
+            except Exception as exc:
+                edge_metrics = {
+                    "detected_leading_silence_seconds": 0.0,
+                    "detected_trailing_silence_seconds": 0.0,
+                    "edge_silence_audit_unavailable": type(exc).__name__,
+                }
             measured.update(edge_metrics)
             measured["audible_leading_silence_seconds"] = edge_metrics[
                 "detected_leading_silence_seconds"
@@ -1140,6 +1173,11 @@ class TTSRouter:
             "file": str(archived),
             "audio_sha256": audio_sha,
             "candidate_stage": stage,
+            "candidate_source_kind": (
+                "raw_generation"
+                if source == Path(str(item.get("raw_path") or ""))
+                else "postprocessed_generation"
+            ),
             "candidate_text": str(item.get("text") or ""),
             "planned_text": str(item.get("planned_text") or ""),
             "reference_audio_sha256": reference_sha,
@@ -1178,6 +1216,7 @@ class TTSRouter:
             "failed": 3,
         }.get(str(candidate.get("voice_consistency_quality") or ""), 2)
         electricity_rank = int(candidate.get("electricity_quality") == "failed")
+        audible_rank = int(candidate.get("audible_speech_quality") != "passed")
         try:
             leading_silence = max(
                 0.0,
@@ -1199,6 +1238,7 @@ class TTSRouter:
         return (
             content_rank,
             semantic_selection_rank,
+            audible_rank,
             voice_rank,
             electricity_rank,
             leading_silence_rank,
@@ -1231,28 +1271,17 @@ class TTSRouter:
                 or candidate.get("reference_leakage_quality") == "failed"
             ):
                 continue
-            # A gross speaker-embedding mismatch is the voice equivalent of
-            # reference leakage: it cannot become the autonomous fallback
-            # merely because its text and duration are convenient.
-            if bool(candidate.get("voice_gross_mismatch")):
+            hard_audio = generated_audio_safety(path)
+            if hard_audio.get("generated_audio_safety") != "passed":
                 continue
-            # A best-effort fallback still has to contain an intelligible,
-            # audible target sentence.  "Some waveform exists" is not enough
-            # to promote near-silence or an ASR-confirmed swallowed sentence.
-            if candidate.get("audible_speech_quality") != "passed":
-                continue
-            if candidate.get("content_completeness_quality") == "failed":
-                continue
-            if candidate.get("electricity_quality") == "failed":
-                continue
+            # Legacy vault entries that predate leakage auditing are never
+            # silently promoted.  A candidate explicitly marked unverified by
+            # the current run's unavailable ASR service may still be used as
+            # an autonomous last resort; positively detected leakage cannot.
             if (
                 self._content_asr_enabled()
                 and candidate.get("reference_leakage_quality") != "passed"
-            ):
-                continue
-            if (
-                self._content_asr_enabled()
-                and candidate.get("content_completeness_quality") != "passed"
+                and not bool(candidate.get("content_asr_unavailable"))
             ):
                 continue
             if current_text not in {
@@ -1299,13 +1328,11 @@ class TTSRouter:
                 duration, target
             )["safe_to_force_fit"]:
                 safely_adaptable.append(candidate)
-        # Never hide an impossible candidate behind extreme time compression.
-        # Additional engines are tried before this method; if none produced a
-        # safely placeable utterance, returning None is safer than converting
-        # five seconds of speech into one second of unintelligible audio.
-        if not safely_adaptable:
-            return None
-        candidate_pool = safely_adaptable
+        # Prefer a naturally placeable candidate.  If all five attempts miss
+        # the timing window, automatic mode still selects the closest safe
+        # waveform and lets Step 5 apply a bounded fit/truncation policy rather
+        # than stopping the complete deliverable.
+        candidate_pool = safely_adaptable or compatible
         chosen = min(
             candidate_pool,
             key=lambda row: self._candidate_score(
@@ -1331,23 +1358,55 @@ class TTSRouter:
         # degraded candidate is allowed back into the mix.
         retrimmed = destination.with_name(destination.stem + ".retrim.wav")
         try:
-            _trim_silence(destination, retrimmed)
-            os.replace(retrimmed, destination)
+            try:
+                _trim_silence(destination, retrimmed)
+                os.replace(retrimmed, destination)
+            except Exception as exc:
+                # Silence trimming is a quality refinement.  The already
+                # copied, decodable candidate remains a valid Agent fallback.
+                result_trim_error = type(exc).__name__
+            else:
+                result_trim_error = ""
         finally:
             retrimmed.unlink(missing_ok=True)
         fit = {}
         actual = _wav_duration(destination)
         fallback_safety = duration_adaptation_safety(actual, target)
         if target > 0.04 and actual > target + 0.01:
-            if not fallback_safety["safe_to_force_fit"]:
-                destination.unlink(missing_ok=True)
-                return None
-            fit = _apply_atempo_exact(destination, destination, target)
-            actual = _wav_duration(destination)
+            if fallback_safety["safe_to_force_fit"]:
+                fit = _apply_atempo_exact(destination, destination, target)
+                actual = _wav_duration(destination)
+            else:
+                # Apply only the maximum naturalness-safe speed-up.  The
+                # mixer may have to trim the remaining tail, but the Agent
+                # will report that degradation instead of abusing atempo or
+                # aborting the video.
+                maximum = float(
+                    fallback_safety.get("maximum_safe_compression_ratio") or 1.0
+                )
+                if maximum > 1.0:
+                    bounded_target = actual / maximum
+                    fit = _apply_atempo_exact(
+                        destination, destination, bounded_target
+                    )
+                    actual = _wav_duration(destination)
+                fit.update(
+                    agent_unsafe_duration_fallback=True,
+                    agent_remaining_duration_overflow=max(0.0, actual - target),
+                )
         item["final_path"] = str(destination)
         item["request_fingerprint"] = _request_fingerprint(item)
         result = dict(chosen)
-        edge_metrics = _edge_silence_metrics(destination)
+        try:
+            edge_metrics = _edge_silence_metrics(destination)
+        except Exception as exc:
+            edge_metrics = {
+                "detected_leading_silence_seconds": 0.0,
+                "detected_trailing_silence_seconds": 0.0,
+                "edge_silence_audit_unavailable": type(exc).__name__,
+            }
+        if result_trim_error:
+            edge_metrics["agent_retrim_unavailable"] = result_trim_error
         result.update(edge_metrics)
         final_audible = audible_speech_quality(
             destination, expected_text=item.get("text", "")
@@ -1356,19 +1415,17 @@ class TTSRouter:
             Path(str(item.get("ref_audio") or "")), destination
         )
         final_electricity = electricity_quality(destination)
-        # Candidate-vault metadata describes the pre-adoption waveform. A
-        # retrimmed/time-scaled final file must pass the basic audible gate and
-        # may never cross the gross voice-mismatch boundary.
-        if (
-            final_audible.get("audible_speech_quality") == "failed"
-            or final_voice.get("voice_gross_mismatch")
-            or final_electricity.get("electricity_quality") == "failed"
-        ):
+        final_hard_audio = generated_audio_safety(destination)
+        # Only corrupted/empty audio is a hard stop after retry exhaustion.
+        # Voice, content, electricity and duration remain explicit degraded
+        # scores so the best generated candidate can finish the deliverable.
+        if final_hard_audio.get("generated_audio_safety") != "passed":
             destination.unlink(missing_ok=True)
             return None
         result.update(final_audible)
         result.update(final_voice)
         result.update(final_electricity)
+        result.update(final_hard_audio)
         result["audible_leading_silence_seconds"] = edge_metrics[
             "detected_leading_silence_seconds"
         ]
@@ -1423,10 +1480,21 @@ class TTSRouter:
         pending = []
         for item in items:
             metadata = updated.get(item["segment_id"], {})
-            if (
-                metadata.get("status") != "success"
-                and metadata.get("audible_speech_quality") != "passed"
-            ):
+            path = next((
+                candidate
+                for candidate in (
+                    Path(str(metadata.get("file") or "")),
+                    Path(str(item.get("final_path") or "")),
+                    Path(str(item.get("raw_path") or "")),
+                )
+                if str(candidate) not in {"", "."}
+                and candidate.is_file()
+                and candidate.stat().st_size
+            ), None)
+            if path is None:
+                continue
+            hard_audio = generated_audio_safety(path)
+            if hard_audio.get("generated_audio_safety") != "passed":
                 continue
             audit_fingerprint = _content_audit_fingerprint(item, metadata)
             if (
@@ -1436,17 +1504,15 @@ class TTSRouter:
                 == audit_fingerprint
             ):
                 continue
-            path = Path(str(metadata.get("file") or item.get("final_path") or ""))
-            if path.is_file():
-                pending.append({
-                    "segment_id": item["segment_id"],
-                    "text": item["text"],
-                    "reference_text": item.get("ref_text", ""),
-                    "language": item["target_language"],
-                    "file": str(path),
-                    "request_fingerprint": item["request_fingerprint"],
-                    "content_audit_fingerprint": audit_fingerprint,
-                })
+            pending.append({
+                "segment_id": item["segment_id"],
+                "text": item["text"],
+                "reference_text": item.get("ref_text", ""),
+                "language": item["target_language"],
+                "file": str(path),
+                "request_fingerprint": item["request_fingerprint"],
+                "content_audit_fingerprint": audit_fingerprint,
+            })
         if not pending:
             return updated
         plan = self.root / "content_asr_plan.json"
@@ -1462,16 +1528,53 @@ class TTSRouter:
             env=os.environ.copy(),
         )
         if completed.returncode != 0 or not output.is_file():
-            raise RuntimeError(
-                "TTS content ASR verification failed; refusing an unchecked final video"
-            )
+            # The verifier is a quality service, not a delivery dependency.
+            # Keep the engine result available for later retries/final ranking
+            # and make the missing audit explicit.  A positively detected
+            # reference leak is still a hard veto everywhere else.
+            for row in pending:
+                sid = str(row["segment_id"])
+                metadata = dict(updated.get(sid, {}))
+                metadata.update(
+                    content_completeness_quality="unverified",
+                    content_completeness_reason="content_asr_unavailable",
+                    reference_leakage_quality="unverified",
+                    reference_leakage_detected=False,
+                    content_asr_unavailable=True,
+                )
+                updated[sid] = metadata
+                matching = next(
+                    (item for item in items if item["segment_id"] == sid), None
+                )
+                if matching is not None:
+                    self._remember_candidate(
+                        matching, metadata, "content_audit_unavailable"
+                    )
+            _atomic_json(self.result_path, updated)
+            print("TTS 内容 ASR 暂不可用；保留已生成候选并继续自动流程。")
+            return updated
         audits = json.loads(output.read_text(encoding="utf-8"))
         for row in pending:
             sid = str(row["segment_id"])
             metadata = dict(updated.get(sid, {}))
             audit = dict(audits.get(sid) or {})
             if not audit:
-                raise RuntimeError(f"TTS content ASR omitted segment {sid}")
+                metadata.update(
+                    content_completeness_quality="unverified",
+                    content_completeness_reason="content_asr_result_missing",
+                    reference_leakage_quality="unverified",
+                    reference_leakage_detected=False,
+                    content_asr_unavailable=True,
+                )
+                updated[sid] = metadata
+                matching = next(
+                    (item for item in items if item["segment_id"] == sid), None
+                )
+                if matching is not None:
+                    self._remember_candidate(
+                        matching, metadata, "content_audit_result_missing"
+                    )
+                continue
             metadata.update(audit)
             metadata["content_asr_request_fingerprint"] = row[
                 "content_audit_fingerprint"
@@ -2035,6 +2138,21 @@ class TTSRouter:
         rescue_pairs, rescue_audit = contaminated_reference_rescue_pairs(
             segments, source_ids
         )
+        if _env_bool("AUTODUB_TTS_SEGMENT_PROFILE_REASSIGN_ENABLED", True):
+            profiles, speaker_intervals = build_voice_profiles(segments)
+            profile_overrides, profile_override_audit = (
+                segment_profile_identity_overrides(
+                    segments, profiles, speaker_intervals, source_ids
+                )
+            )
+        else:
+            profile_overrides = {}
+            profile_override_audit = {
+                "policy": "tts_only_segment_profile_outlier_reassignment",
+                "enabled": False,
+                "overrides": {},
+                "decisions": [],
+            }
         by_id = {
             str(segment.get("id", index)): segment
             for index, segment in enumerate(segments)
@@ -2068,6 +2186,25 @@ class TTSRouter:
                     ),
                 }
 
+        # A clear low-confidence sentence outlier may borrow a different
+        # reliable speaker reference without mutating its Step 2 label.
+        for segment_id, target_speaker in profile_overrides.items():
+            reference = references.get(target_speaker)
+            if reference is None:
+                continue
+            overrides[segment_id] = {
+                **dict(reference),
+                "voice_identity": reference.get(
+                    "voice_identity", target_speaker
+                ),
+                "voice_identity_reused": True,
+                "reference_mode": "segment_profile_reassignment",
+                "reference_override_reason": (
+                    "segment_embedding_matches_other_reliable_voice_profile"
+                ),
+                "reference_profile_speaker": target_speaker,
+            }
+
         # If a label's selected reference is acoustically inconsistent with a
         # mutually matching pair inside that label, cross-reference the pair.
         # This preserves the real voice without using the sentence's own audio.
@@ -2090,6 +2227,7 @@ class TTSRouter:
         self.voice_reference_diagnostics = {
             "step2_labels_immutable": True,
             "continuity": continuity_audit,
+            "segment_profile_reassignment": profile_override_audit,
             "contaminated_reference_rescue": rescue_audit,
             "applied_overrides": {
                 segment_id: {
@@ -2670,7 +2808,14 @@ class TTSRouter:
             sid = item["segment_id"]
             if previous.get(sid, {}).get("status") == "success":
                 continue
-            adopted = self._adopt_best_generated_candidate(item)
+            try:
+                adopted = self._adopt_best_generated_candidate(item)
+            except Exception as exc:
+                adopted = None
+                print(
+                    f"⚠️ segment={sid} 最佳候选自动收敛失败；"
+                    f"记录后继续其他句子: {type(exc).__name__}: {exc}"
+                )
             if adopted is not None:
                 previous[sid] = adopted
         _atomic_json(self.result_path, previous)

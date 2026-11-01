@@ -453,6 +453,28 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertTrue(row["tts_trailing_word_island_mode"])
         self.assertFalse(audit[0]["onset_shift_limited"])
 
+    def test_stable_ocr_and_vad_can_resolve_large_word_island_conflict(self):
+        segment = {
+            "id": 20, "start": 10.0, "end": 15.0,
+            "text": "A complete sentence.", "timestamp_precision": "word",
+            "ocr_subtitle_first_seen": 13.0,
+            "ocr_subtitle_last_seen": 13.8,
+            "ocr_recovery_frame_count": 3,
+            "qwen3_time_stamps": [
+                {"text": "wrong", "start": 11.3, "end": 11.7},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(11.28, 11.72), (13.18, 14.02)]
+        )
+        row = refined[0]
+        self.assertEqual(
+            row["tts_timing_reason"], "ocr_vad_word_conflict_consensus"
+        )
+        self.assertAlmostEqual(row["tts_placement_start"], 13.12)
+        self.assertEqual(row["tts_speech_islands"], [[13.18, 14.02]])
+        self.assertIsNotNone(audit[0]["ocr_vad_fusion"])
+
     def test_long_interval_with_trailing_room_keeps_sentence_anchor(self):
         segment = {
             "id": 5, "start": 37.32, "end": 41.20,

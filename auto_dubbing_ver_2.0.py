@@ -3619,12 +3619,41 @@ class Mixer:
     def __init__(self, config: DubbingConfig):
         self.config = config
 
-    def run(self, audio_clips_info: List[Dict[str, Any]], accomp_path: str, original_video: str, duration: float) -> None:
+    @staticmethod
+    def _voiced_dbfs(clip: AudioSegment) -> float:
+        """Measure dialogue level without letting edge silence dominate it."""
+        if len(clip) <= 0 or clip.rms <= 0:
+            return -120.0
+        base = float(clip.dBFS) if clip.dBFS != float("-inf") else -120.0
+        threshold = max(-48.0, base - 18.0)
+        ranges = silence.detect_nonsilent(
+            clip,
+            min_silence_len=60,
+            silence_thresh=threshold,
+            seek_step=5,
+        )
+        if not ranges:
+            return base
+        voiced = AudioSegment.empty()
+        for start, end in ranges:
+            voiced += clip[max(0, start):min(len(clip), end)]
+        if len(voiced) <= 0 or voiced.rms <= 0:
+            return base
+        return float(voiced.dBFS)
+
+    def run(self, audio_clips_info: List[Dict[str, Any]], accomp_path: str, original_video: str, duration: float) -> Dict[str, Any]:
         print("--- [Step 5] 混音 ---")
         final_audio = AudioSegment.silent(duration=int(duration * 1000))
-        from mix_timing import plan_mix_windows, validate_mix_audit
+        from mix_timing import (
+            plan_mix_windows,
+            plan_speech_gain,
+            validate_mix_audit,
+        )
 
         ordered_clips = plan_mix_windows(audio_clips_info, duration)
+        bg_mix = None
+        if os.path.exists(accomp_path):
+            bg_mix = AudioSegment.from_wav(accomp_path) - 6
         bounded_count = 0
         mix_audit = []
         for index, item in enumerate(ordered_clips):
@@ -3646,6 +3675,52 @@ class Mixer:
                     if fade_ms:
                         clip = clip.fade_out(fade_ms)
                     bounded_count += 1
+                start_ms = int(round(start * 1000))
+                background_window = (
+                    bg_mix[start_ms:start_ms + len(clip)]
+                    if bg_mix is not None else AudioSegment.silent(len(clip))
+                )
+                voice_dbfs = self._voiced_dbfs(clip)
+                background_dbfs = (
+                    float(background_window.dBFS)
+                    if len(background_window) > 0
+                    and background_window.dBFS != float("-inf")
+                    else -120.0
+                )
+                peak_dbfs = (
+                    float(clip.max_dBFS)
+                    if clip.max_dBFS != float("-inf") else -120.0
+                )
+                if _env_bool("AUTODUB_TTS_MIX_AUDIBILITY_ENABLED", True):
+                    gain_plan = plan_speech_gain(
+                        voice_dbfs,
+                        background_dbfs,
+                        peak_dbfs,
+                        target_margin_db=float(os.getenv(
+                            "AUTODUB_TTS_MIX_TARGET_MARGIN_DB", "6"
+                        )),
+                        minimum_margin_db=float(os.getenv(
+                            "AUTODUB_TTS_MIX_MINIMUM_MARGIN_DB", "3"
+                        )),
+                        maximum_gain_db=float(os.getenv(
+                            "AUTODUB_TTS_MIX_MAX_GAIN_DB", "6"
+                        )),
+                        peak_ceiling_dbfs=float(os.getenv(
+                            "AUTODUB_TTS_MIX_PEAK_CEILING_DBFS", "-1"
+                        )),
+                    )
+                else:
+                    gain_plan = {
+                        "voice_dbfs_before_gain": round(voice_dbfs, 3),
+                        "background_dbfs": round(background_dbfs, 3),
+                        "speech_margin_db_before_gain": None,
+                        "speech_gain_db": 0.0,
+                        "speech_margin_db": None,
+                        "mix_audibility_quality": "skipped",
+                        "mix_audibility_reason": "disabled",
+                    }
+                if gain_plan["speech_gain_db"] > 0.01:
+                    clip = clip.apply_gain(gain_plan["speech_gain_db"])
                 audible_duration = len(clip) / 1000.0
                 next_start = (
                     float(ordered_clips[index + 1]["start"])
@@ -3675,6 +3750,7 @@ class Mixer:
                     ),
                     "truncated_to_window": original_duration > audible_duration + 0.001,
                     "clip_rms": int(clip.rms),
+                    **gain_plan,
                 })
                 final_audio = final_audio.overlay(
                     clip, position=int(round(start * 1000))
@@ -3684,20 +3760,25 @@ class Mixer:
             window_end = int(round(float(row["audible_end"]) * 1000))
             row["stem_window_rms"] = int(final_audio[window_start:window_end].rms)
             row["mix_verified"] = row["stem_window_rms"] > 0
-        validate_mix_audit(
+        mix_quality_issues = validate_mix_audit(
             [item.get("segment_id", index) for index, item in enumerate(ordered_clips)],
             mix_audit,
             maximum_trim_seconds=float(
                 os.getenv("AUTODUB_TTS_MAX_STEP5_TRIM_SECONDS", "0.03")
             ),
+            allow_degraded=True,
         )
+        if mix_quality_issues:
+            print(
+                "⚠️ Step 5 混音质量降级但继续成片: "
+                + "; ".join(mix_quality_issues)
+            )
         if bounded_count:
             print(
                 f"ℹ️ {bounded_count} 个 TTS 片段仅进行了不超过允许阈值的尾部取整。"
             )
-        if os.path.exists(accomp_path):
-            bg = AudioSegment.from_wav(accomp_path)
-            final_audio = final_audio.overlay(bg - 6)
+        if bg_mix is not None:
+            final_audio = final_audio.overlay(bg_mix)
         output_wav = os.path.join(self.config.output_dir, "final_audio.wav")
         output_video = os.path.join(self.config.output_dir, "final_video.mp4")
         mix_audit_path = os.path.join(
@@ -3714,6 +3795,13 @@ class Mixer:
             output_video,
         ], check=True)
         print(f"🎉 全部完成！输出文件: {output_video}")
+        return {
+            "output_video": output_video,
+            "output_audio": output_wav,
+            "mix_timing_audit_path": mix_audit_path,
+            "mix_audit": mix_audit,
+            "mix_quality_issues": mix_quality_issues,
+        }
 
 # ================= 主流程控制 =================
 
@@ -4678,7 +4766,60 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
                 "不会插回原声，Agent 将记录缺失并继续完成成片。"
             )
     mixer = Mixer(config)
-    mixer.run(state["audio_clips"], restore_skipped_vocals(state, config), input_file, state["duration"])
+    mix_result = mixer.run(
+        state["audio_clips"],
+        restore_skipped_vocals(state, config),
+        input_file,
+        state["duration"],
+    ) or {}
+    tts_rows = list(state.get("tts_router_results") or [])
+    degraded_tts_ids = sorted({
+        str(row.get("segment_id"))
+        for row in tts_rows
+        if bool(row.get("agent_degraded_candidate"))
+    })
+    mix_degraded_ids = sorted({
+        str(row.get("segment_id"))
+        for row in mix_result.get("mix_audit", [])
+        if (
+            row.get("mix_audibility_quality") == "degraded"
+            or bool(row.get("truncated_to_window"))
+        )
+    })
+    failed_ids = sorted({
+        item.split(":", 1)[0]
+        for item in quality_issues
+        if ":" in item and item.split(":", 1)[0].isdigit()
+    }, key=int)
+    degraded = bool(
+        quality_issues
+        or degraded_tts_ids
+        or mix_degraded_ids
+        or mix_result.get("mix_quality_issues")
+    )
+    state_mgr.save({
+        "agent_delivery_report": {
+            "status": (
+                "completed_with_degradation" if degraded else "completed"
+            ),
+            "output_video": mix_result.get("output_video"),
+            "failed_tts_segment_ids": failed_ids,
+            "degraded_tts_segment_ids": degraded_tts_ids,
+            "mix_degraded_segment_ids": mix_degraded_ids,
+            "quality_issues": quality_issues,
+            "mix_quality_issues": mix_result.get("mix_quality_issues", []),
+            "mix_timing_audit_path": mix_result.get(
+                "mix_timing_audit_path"
+            ),
+            "fallback": (
+                "no_audible_generated_candidate" if failed_ids else
+                "best_generated_candidate" if degraded_tts_ids else
+                "not_needed"
+            ),
+            "requires_user_decision": False,
+            "source_audio_fallback_used": False,
+        }
+    })
 
 
 def main() -> None:

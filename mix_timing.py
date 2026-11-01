@@ -5,6 +5,56 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Mapping
 
 
+def plan_speech_gain(
+    voice_dbfs: float,
+    background_dbfs: float,
+    peak_dbfs: float,
+    *,
+    target_margin_db: float = 6.0,
+    minimum_margin_db: float = 3.0,
+    maximum_gain_db: float = 6.0,
+    peak_ceiling_dbfs: float = -1.0,
+) -> Dict[str, Any]:
+    """Plan bounded dialogue gain against the actual accompaniment window.
+
+    This is intentionally a gain-only operation.  It never compresses time or
+    changes sentence placement, and peak headroom prevents a quiet sentence
+    from being made audible by clipping it.
+    """
+    voice = float(voice_dbfs)
+    background = float(background_dbfs)
+    peak = float(peak_dbfs)
+    target = max(float(minimum_margin_db), float(target_margin_db))
+    maximum = max(0.0, float(maximum_gain_db))
+    headroom = max(0.0, float(peak_ceiling_dbfs) - peak)
+    if background <= -119.0:
+        required = 0.0
+        before = float("inf")
+    else:
+        before = voice - background
+        required = max(0.0, target - before)
+    gain = min(required, maximum, headroom)
+    after = before + gain if before != float("inf") else before
+    passed = after == float("inf") or after >= float(minimum_margin_db)
+    return {
+        "voice_dbfs_before_gain": round(voice, 3),
+        "background_dbfs": round(background, 3),
+        "speech_margin_db_before_gain": (
+            None if before == float("inf") else round(before, 3)
+        ),
+        "speech_gain_db": round(gain, 3),
+        "speech_margin_db": None if after == float("inf") else round(after, 3),
+        "speech_margin_target_db": round(target, 3),
+        "speech_margin_minimum_db": round(float(minimum_margin_db), 3),
+        "speech_gain_maximum_db": round(maximum, 3),
+        "speech_peak_ceiling_dbfs": round(float(peak_ceiling_dbfs), 3),
+        "mix_audibility_quality": "passed" if passed else "degraded",
+        "mix_audibility_reason": "" if passed else (
+            "insufficient_margin_after_bounded_gain"
+        ),
+    }
+
+
 def plan_mix_windows(
     clips: Iterable[Mapping[str, Any]], video_duration: float
 ) -> List[Dict[str, Any]]:
@@ -49,7 +99,8 @@ def validate_mix_audit(
     audit_rows: Iterable[Mapping[str, Any]],
     *,
     maximum_trim_seconds: float = 0.03,
-) -> None:
+    allow_degraded: bool = False,
+) -> List[str]:
     """Fail when a verified TTS clip did not actually reach the mix stem.
 
     Step 4 already owns duration adaptation. Step 5 must not silently repair a
@@ -63,12 +114,12 @@ def validate_mix_audit(
         raise RuntimeError("Step5 mix audit found duplicate segment IDs")
     missing = sorted(set(expected) - set(actual))
     unexpected = sorted(set(actual) - set(expected))
+    failures = []
     if missing or unexpected:
-        raise RuntimeError(
-            "Step5 mix audit coverage mismatch: "
+        failures.append(
+            "coverage mismatch: "
             f"missing={missing or 'none'} unexpected={unexpected or 'none'}"
         )
-    failures = []
     for row in rows:
         sid = str(row.get("segment_id"))
         if float(row.get("audible_duration") or 0.0) <= 0.0:
@@ -87,4 +138,7 @@ def validate_mix_audit(
                 f"{sid}:would trim {trimmed:.3f}s at the sentence tail"
             )
     if failures:
+        if allow_degraded:
+            return failures
         raise RuntimeError("Step5 mix audit failed: " + "; ".join(failures))
+    return []

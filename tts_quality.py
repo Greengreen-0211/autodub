@@ -170,25 +170,34 @@ def audible_speech_quality(path, *, expected_text: str = "") -> dict:
     try:
         from pydub import AudioSegment, silence
         clip = AudioSegment.from_file(str(path))
-    except Exception as exc:
-        return {
-            "audible_speech_quality": "failed",
-            "audible_speech_reason": f"unreadable_audio:{type(exc).__name__}",
-        }
-    duration = len(clip) / 1000.0
-    dbfs = float(clip.dBFS) if clip.dBFS != float("-inf") else -120.0
-    threshold = max(
-        float(os.getenv("AUTODUB_TTS_AUDIBLE_ABSOLUTE_DBFS", "-48")),
-        dbfs - float(os.getenv("AUTODUB_TTS_AUDIBLE_RELATIVE_DB", "18")),
-    )
-    ranges = silence.detect_nonsilent(
-        clip,
-        min_silence_len=int(os.getenv("AUTODUB_TTS_AUDIBLE_MIN_SILENCE_MS", "80")),
-        silence_thresh=threshold,
-    )
-    voiced_ms = sum(max(0, end - start) for start, end in ranges)
-    voiced = voiced_ms / 1000.0
-    voiced_ratio = voiced / duration if duration > 0 else 0.0
+        duration = len(clip) / 1000.0
+        dbfs = float(clip.dBFS) if clip.dBFS != float("-inf") else -120.0
+        threshold = max(
+            float(os.getenv("AUTODUB_TTS_AUDIBLE_ABSOLUTE_DBFS", "-48")),
+            dbfs - float(os.getenv("AUTODUB_TTS_AUDIBLE_RELATIVE_DB", "18")),
+        )
+        ranges = silence.detect_nonsilent(
+            clip,
+            min_silence_len=int(os.getenv(
+                "AUTODUB_TTS_AUDIBLE_MIN_SILENCE_MS", "80"
+            )),
+            silence_thresh=threshold,
+        )
+        voiced_ms = sum(max(0, end - start) for start, end in ranges)
+        voiced = voiced_ms / 1000.0
+        voiced_ratio = voiced / duration if duration > 0 else 0.0
+    except Exception:
+        # Keep the gate functional for ordinary PCM WAV checkpoints even when
+        # optional pydub/ffmpeg diagnostics are unavailable.
+        hard_audio = generated_audio_safety(path)
+        duration = float(hard_audio.get("generated_audio_duration") or 0.0)
+        dbfs = float(hard_audio.get("generated_audio_dbfs") or -120.0)
+        if hard_audio.get("generated_audio_safety") == "passed":
+            voiced = duration
+            voiced_ratio = 1.0 if duration > 0.0 else 0.0
+        else:
+            voiced = 0.0
+            voiced_ratio = 0.0
     expected = str(expected_text or "").strip()
     cjk_count = sum("\u4e00" <= char <= "\u9fff" for char in expected)
     word_count = len(re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", expected))
@@ -245,6 +254,84 @@ def audible_speech_quality(path, *, expected_text: str = "") -> dict:
         "expected_words": word_count,
         "expected_clause_count": clause_count,
         "acoustic_completeness_quality": "failed" if reasons else "passed",
+    }
+
+
+def generated_audio_safety(path) -> dict:
+    """Return the small set of audio failures that may never reach a mix.
+
+    The normal audible/content/voice checks are ranking signals for an
+    autonomous delivery Agent: after its retry budget is exhausted it still
+    has to choose the best generated result.  This helper deliberately answers
+    a narrower question -- whether a decodable waveform containing real
+    signal exists at all.  Reference-speech leakage remains a separate hard
+    veto in the router.
+    """
+    try:
+        from pydub import AudioSegment
+
+        clip = AudioSegment.from_file(str(path))
+        duration = len(clip) / 1000.0
+        dbfs = float(clip.dBFS) if clip.dBFS != float("-inf") else -120.0
+        rms = int(clip.rms or 0)
+    except Exception as primary_exc:
+        # WAV checkpoints can still be verified without ffmpeg/pydub.  This
+        # fallback also keeps offline unit tests representative of production.
+        try:
+            import array
+            import sys
+            import wave
+
+            with wave.open(str(path), "rb") as handle:
+                frame_rate = int(handle.getframerate())
+                frame_count = int(handle.getnframes())
+                sample_width = int(handle.getsampwidth())
+                frames = handle.readframes(frame_count)
+            duration = frame_count / frame_rate if frame_rate > 0 else 0.0
+            if sample_width == 1:
+                samples = [value - 128 for value in frames]
+            elif sample_width in {2, 4}:
+                typecode = "h" if sample_width == 2 else "i"
+                values = array.array(typecode)
+                values.frombytes(frames)
+                if sys.byteorder != "little":
+                    values.byteswap()
+                samples = values
+            else:
+                raise ValueError(f"unsupported PCM sample width: {sample_width}")
+            rms = int(math.sqrt(
+                sum(float(value) * float(value) for value in samples)
+                / max(1, len(samples))
+            )) if samples else 0
+            full_scale = float((1 << (8 * sample_width - 1)) - 1)
+            dbfs = (
+                20.0 * math.log10(max(rms, 1) / full_scale)
+                if rms > 0 and full_scale > 0 else -120.0
+            )
+        except Exception as fallback_exc:
+            return {
+                "generated_audio_safety": "failed",
+                "generated_audio_safety_reason": (
+                    "unreadable_audio:"
+                    f"{type(primary_exc).__name__}/{type(fallback_exc).__name__}"
+                ),
+            }
+    minimum_duration = max(
+        0.01,
+        float(os.getenv("AUTODUB_TTS_HARD_MIN_AUDIO_SECONDS", "0.05")),
+    )
+    minimum_dbfs = float(os.getenv("AUTODUB_TTS_HARD_MIN_SIGNAL_DBFS", "-70"))
+    reasons = []
+    if duration < minimum_duration:
+        reasons.append(f"audio_too_short:{duration:.3f}<{minimum_duration:.3f}")
+    if rms <= 0 or dbfs < minimum_dbfs:
+        reasons.append(f"no_audible_signal:dbfs={dbfs:.2f},rms={rms}")
+    return {
+        "generated_audio_safety": "failed" if reasons else "passed",
+        "generated_audio_safety_reason": ";".join(reasons),
+        "generated_audio_duration": round(duration, 4),
+        "generated_audio_dbfs": round(dbfs, 3),
+        "generated_audio_rms": rms,
     }
 
 
@@ -371,15 +458,43 @@ def electricity_metrics(path):
                 "rms": 0.0, "duration": round(len(y) / sr, 4), "sample_rate": sr,
                 "skipped": "silent"}
     n_fft = 2048
-    power = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=512)) ** 2
+    magnitude = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=512))
+    power = magnitude ** 2
     eps = 1e-12
     flatness = np.exp(np.mean(np.log(power + eps), axis=0)) / (np.mean(power, axis=0) + eps)
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
     hf_mask = freqs >= 8000
     hf_ratio = float(power[hf_mask].sum() / (power.sum() + eps)) if hf_mask.any() else 0.0
+    normalized = magnitude / (np.sum(magnitude, axis=0, keepdims=True) + eps)
+    spectral_flux = (
+        float(np.median(np.sqrt(np.sum(np.diff(normalized, axis=1) ** 2, axis=0))))
+        if normalized.shape[1] > 1 else 0.0
+    )
+    clipping_ratio = float(np.mean(np.abs(y) >= 0.995))
+    pitch_jump_ratio = 0.0
+    try:
+        f0 = librosa.yin(
+            y,
+            fmin=float(os.getenv("AUTODUB_TTS_ARTIFACT_F0_MIN", "65")),
+            fmax=float(os.getenv("AUTODUB_TTS_ARTIFACT_F0_MAX", "500")),
+            sr=sr,
+            frame_length=min(2048, max(512, len(y))),
+            hop_length=256,
+        )
+        f0 = np.asarray(f0, dtype=float)
+        valid = np.isfinite(f0) & (f0 > 0.0)
+        values = f0[valid]
+        if values.size > 1:
+            octave_jumps = np.abs(np.diff(np.log2(values + eps)))
+            pitch_jump_ratio = float(np.mean(octave_jumps > 0.75))
+    except Exception:
+        pitch_jump_ratio = 0.0
     return {
         "spectral_flatness": round(float(np.median(flatness)), 6),
         "hf_energy_ratio": round(hf_ratio, 6),
+        "spectral_flux": round(spectral_flux, 6),
+        "pitch_jump_ratio": round(pitch_jump_ratio, 6),
+        "clipping_ratio": round(clipping_ratio, 6),
         "rms": round(rms, 6),
         "duration": round(len(y) / sr, 4),
         "sample_rate": sr,
@@ -413,14 +528,44 @@ def electricity_quality(path):
     max_hf = float(os.getenv("AUTODUB_TTS_MAX_HF_ENERGY_RATIO", "0.08"))
     sf = metrics["spectral_flatness"] or 0.0
     hf = metrics["hf_energy_ratio"] or 0.0
-    failed = sf > max_sf and hf > max_hf
+    max_flux = float(os.getenv("AUTODUB_TTS_MAX_SPECTRAL_FLUX", "0.45"))
+    max_pitch_jumps = float(os.getenv(
+        "AUTODUB_TTS_MAX_PITCH_JUMP_RATIO", "0.25"
+    ))
+    max_clipping = float(os.getenv("AUTODUB_TTS_MAX_CLIPPING_RATIO", "0.02"))
+    advanced_enabled = os.getenv(
+        "AUTODUB_TTS_ADVANCED_ARTIFACT_GATE_ENABLED", "1"
+    ).strip().lower() in {"1", "true", "yes", "y", "on"}
+    indicators = []
+    if sf > max_sf:
+        indicators.append(f"spectral_flatness={sf:.4f}>{max_sf}")
+    if hf > max_hf:
+        indicators.append(f"hf_energy_ratio={hf:.4f}>{max_hf}")
+    if advanced_enabled and float(metrics.get("spectral_flux") or 0.0) > max_flux:
+        indicators.append(
+            f"spectral_flux={float(metrics['spectral_flux']):.4f}>{max_flux}"
+        )
+    if advanced_enabled and float(metrics.get("pitch_jump_ratio") or 0.0) > max_pitch_jumps:
+        indicators.append(
+            "pitch_jump_ratio="
+            f"{float(metrics['pitch_jump_ratio']):.4f}>{max_pitch_jumps}"
+        )
+    if advanced_enabled and float(metrics.get("clipping_ratio") or 0.0) > max_clipping:
+        indicators.append(
+            f"clipping_ratio={float(metrics['clipping_ratio']):.4f}>{max_clipping}"
+        )
+    # One unusual metric is advisory; two independent artifact signals are
+    # required before spending another synthesis attempt.  After all retries,
+    # the same result becomes a ranking penalty rather than a pipeline stop.
+    failed = len(indicators) >= 2
     reason = ""
     if failed:
-        reason = (f"spectral_flatness={sf:.4f}>{max_sf} and "
-                  f"hf_energy_ratio={hf:.4f}>{max_hf}")
+        reason = "; ".join(indicators)
     return {"electricity_quality": "failed" if failed else "passed",
             "electricity_policy": policy,
             "electricity_reason": reason,
+            "electricity_artifact_indicators": indicators,
+            "advanced_artifact_gate_enabled": advanced_enabled,
             **metrics}
 
 
@@ -566,6 +711,9 @@ def stage_fingerprint(state, config, backend):
                  "candidate_policy":os.getenv("AUTODUB_TTS_WESPEAKER_VOICE_POLICY","warn"),
                  "candidate_similarity":os.getenv("AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY","0.55"),
                  "gross_candidate_similarity":os.getenv("AUTODUB_TTS_MIN_WESPEAKER_GROSS_VOICE_SIMILARITY","0.30"),
+                 "segment_identity_similarity":os.getenv("AUTODUB_TTS_SEGMENT_IDENTITY_REASSIGN_SIMILARITY","0.80"),
+                 "segment_identity_margin":os.getenv("AUTODUB_TTS_SEGMENT_IDENTITY_REASSIGN_MARGIN","0.05"),
+                 "local_component_similarity":os.getenv("AUTODUB_TTS_LOCAL_CONTINUITY_COMPONENT_MIN_SIMILARITY","0.74"),
                  "preserve_sentence_start":os.getenv("AUTODUB_TTS_PRESERVE_SENTENCE_START","1"),
                  "dominant_island_share":os.getenv("AUTODUB_TTS_DOMINANT_ISLAND_MIN_SHARE","0.65"),
                  "trailing_island_leading_seconds":os.getenv("AUTODUB_TTS_TRAILING_ISLAND_MIN_LEADING_SECONDS","0.75"),
@@ -575,6 +723,14 @@ def stage_fingerprint(state, config, backend):
                  "maximum_audible_leading_silence":os.getenv("AUTODUB_TTS_MAX_AUDIBLE_LEADING_SILENCE_SECONDS","0.18"),
                  "maximum_safe_compression":os.getenv("AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO","1.25"),
                  "maximum_safe_short_compression":os.getenv("AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO","1.18"),
+                 "hard_min_audio_seconds":os.getenv("AUTODUB_TTS_HARD_MIN_AUDIO_SECONDS","0.05"),
+                 "hard_min_signal_dbfs":os.getenv("AUTODUB_TTS_HARD_MIN_SIGNAL_DBFS","-70"),
+                 "maximum_spectral_flux":os.getenv("AUTODUB_TTS_MAX_SPECTRAL_FLUX","0.45"),
+                 "maximum_pitch_jump_ratio":os.getenv("AUTODUB_TTS_MAX_PITCH_JUMP_RATIO","0.25"),
+                 "maximum_clipping_ratio":os.getenv("AUTODUB_TTS_MAX_CLIPPING_RATIO","0.02"),
+                 "advanced_artifact_gate":os.getenv("AUTODUB_TTS_ADVANCED_ARTIFACT_GATE_ENABLED","1"),
+                 "segment_profile_reassignment":os.getenv("AUTODUB_TTS_SEGMENT_PROFILE_REASSIGN_ENABLED","1"),
+                 "local_component_guard":os.getenv("AUTODUB_TTS_LOCAL_COMPONENT_GUARD_ENABLED","1"),
              }}
     return hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
 
@@ -609,7 +765,23 @@ def validate_mix_state(state, config, *, allow_missing=False, filter_missing=Tru
         if result.get("status")!="success" or not path.is_file() or not path.stat().st_size:
             quality_issues.append(f"{sid}:missing or unsuccessful WAV")
             continue
-        if result.get("audible_speech_quality") != "passed":
+        if (
+            bool(result.get("reference_leakage_detected"))
+            or result.get("reference_leakage_quality") == "failed"
+        ):
+            quality_issues.append(f"{sid}:reference speech leakage detected")
+            continue
+        hard_audio = generated_audio_safety(path)
+        if hard_audio.get("generated_audio_safety") != "passed":
+            quality_issues.append(
+                f"{sid}:no usable generated waveform "
+                f"({hard_audio.get('generated_audio_safety_reason', '')})"
+            )
+            continue
+        if (
+            result.get("audible_speech_quality") != "passed"
+            and not bool(result.get("agent_degraded_candidate"))
+        ):
             quality_issues.append(
                 f"{sid}:audible speech audit failed or missing "
                 f"({result.get('audible_speech_reason', 'not audited')})"
@@ -645,7 +817,16 @@ def validate_mix_state(state, config, *, allow_missing=False, filter_missing=Tru
             valid=[]
             for c in clips:
                 try:
-                    if _wav_duration(Path(c["file"]))>0:
+                    sid = str(c.get("segment_id"))
+                    result = results.get(sid, {})
+                    path = Path(c["file"])
+                    hard_audio = generated_audio_safety(path)
+                    if (
+                        _wav_duration(path)>0
+                        and hard_audio.get("generated_audio_safety") == "passed"
+                        and not bool(result.get("reference_leakage_detected"))
+                        and result.get("reference_leakage_quality") != "failed"
+                    ):
                         valid.append(c)
                 except Exception:
                     pass
