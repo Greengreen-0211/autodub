@@ -131,6 +131,7 @@ class CosyVoiceBackend:
     def generate(self, item: dict[str, Any], destination: Path) -> float:
         emotion = str(item.get("emotion") or "neutral").lower()
         if emotion == "neutral":
+            item["emotion_control_mode"] = "reference_only"
             ref_text = str(item.get("ref_text") or "").strip()
             if not ref_text:
                 raise RuntimeError("CosyVoice3 zero-shot requires reference text")
@@ -139,6 +140,7 @@ class CosyVoiceBackend:
                 item["ref_audio"], stream=False,
             )
         else:
+            item["emotion_control_mode"] = "cosyvoice3_instruct2"
             generator = self.model.inference_instruct2(
                 item["text"], cosy_instruction(item["language"], emotion),
                 item["ref_audio"], stream=False,
@@ -212,7 +214,11 @@ class F5TTSBackend:
         }
         parameters = inspect.signature(self.model.infer).parameters
         target_duration = float(item.get("target_duration") or 0.0)
-        if "fix_duration" in parameters and target_duration > 0:
+        if (
+            "fix_duration" in parameters
+            and target_duration > 0
+            and not bool(item.get("measure_natural_duration", False))
+        ):
             from f5_tts.infer.utils_infer import preprocess_ref_audio_text
             # F5's duration includes the *processed* reference, not just output.
             # Keep ref_file unchanged so infer() hits its preprocessing cache.
@@ -259,12 +265,40 @@ class IndexTTSBackend:
         self.model = IndexTTS2(**kwargs)
 
     def generate(self, item: dict[str, Any], destination: Path) -> float:
-        self.model.infer(
-            spk_audio_prompt=item["ref_audio"],
-            text=item["text"],
-            output_path=str(destination),
-            verbose=False,
-        )
+        parameters = inspect.signature(self.model.infer).parameters
+        kwargs: dict[str, Any] = {
+            "spk_audio_prompt": item["ref_audio"],
+            "text": item["text"],
+            "output_path": str(destination),
+            "verbose": False,
+        }
+        emotion = str(item.get("emotion") or "neutral").lower()
+        emotion_audio = Path(str(item.get("emotion_audio") or ""))
+        control_mode = "reference_only"
+        # IndexTTS2 releases differ slightly. Use the source utterance as a
+        # prosody prompt only when the installed runtime explicitly exposes
+        # that argument; otherwise fall back to its supported emotion-text
+        # interface. The normal post-generation leakage audit remains a hard
+        # veto for either route.
+        if emotion != "neutral" and emotion_audio.is_file():
+            if "emo_audio_prompt" in parameters:
+                kwargs["emo_audio_prompt"] = str(emotion_audio)
+                if "emo_alpha" in parameters:
+                    kwargs["emo_alpha"] = float(os.getenv(
+                        "AUTODUB_INDEXTTS_EMOTION_ALPHA", "0.85"
+                    ))
+                control_mode = "indextts2_source_emotion_audio"
+        if emotion != "neutral" and control_mode == "reference_only":
+            if "use_emo_text" in parameters and "emo_text" in parameters:
+                kwargs["use_emo_text"] = True
+                kwargs["emo_text"] = EMOTION_ZH.get(
+                    emotion, emotion
+                ) if str(item.get("language") or "").lower() == "zh" else EMOTION_EN.get(
+                    emotion, emotion
+                )
+                control_mode = "indextts2_emotion_text"
+        item["emotion_control_mode"] = control_mode
+        self.model.infer(**kwargs)
         if not destination.is_file():
             raise RuntimeError("IndexTTS2 returned without creating a WAV")
         return wav_duration(destination)
@@ -286,6 +320,7 @@ class ConfuciusBackend:
 
     def generate(self, item: dict[str, Any], destination: Path) -> float:
         language = str(item.get("language") or "en").lower()
+        item["emotion_control_mode"] = "reference_only"
         audio = self.model.generate(
             text=item["text"],
             lang=language if language in {"zh", "en"} else "en",
@@ -413,6 +448,9 @@ def main() -> None:
                 "generated_duration": float(generated_duration),
                 "inference_seconds": elapsed,
                 "rtf": elapsed / generated_duration if generated_duration > 0 else None,
+                "emotion_control_mode": item.get(
+                    "emotion_control_mode", "reference_only"
+                ),
                 "error": "",
             }
         except Exception as exc:

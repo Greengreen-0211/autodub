@@ -97,6 +97,146 @@ class OfflineTests(unittest.TestCase):
 
 
 class DurationTests(unittest.TestCase):
+    def test_segment_reference_mode_uses_each_utterance_and_is_reversible(self):
+        from pydub import AudioSegment
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp, "vocals.wav")
+            AudioSegment.silent(duration=6000).export(source, format="wav")
+            segments = [
+                {
+                    "id": 10,
+                    "start": 0.0,
+                    "end": 2.0,
+                    "speaker": "SAME_CLUSTER",
+                    "original_text": "First source sentence.",
+                    "timestamp_precision": "word",
+                },
+                {
+                    "id": 11,
+                    "start": 3.0,
+                    "end": 5.5,
+                    "speaker": "SAME_CLUSTER",
+                    "original_text": "Second source sentence.",
+                    "timestamp_precision": "word",
+                },
+            ]
+            with patch.dict(
+                os.environ,
+                {"AUTODUB_TTS_REFERENCE_MODE": "segment"},
+            ):
+                router = tts_router.TTSRouter(
+                    SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+                )
+                references = router._segment_references(segments, str(source))
+
+            self.assertEqual(router.reference_mode, "segment")
+            self.assertEqual(set(references), {"10", "11"})
+            self.assertEqual(
+                references["10"]["text"], "First source sentence."
+            )
+            self.assertEqual(
+                references["11"]["text"], "Second source sentence."
+            )
+            self.assertNotEqual(
+                references["10"]["audio"], references["11"]["audio"]
+            )
+            self.assertEqual(references["10"]["voice_identity"], "SEGMENT_10")
+            self.assertEqual(references["11"]["voice_identity"], "SEGMENT_11")
+            manifest = json.loads(
+                (router.root / "reference_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["reference_mode"], "segment")
+
+            with patch.dict(os.environ, {}, clear=True):
+                restored = tts_router.TTSRouter(
+                    SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+                )
+            self.assertEqual(restored.reference_mode, "speaker")
+
+    def test_reference_uses_pure_components_from_reassembled_identity(self):
+        class FakeAudio:
+            dBFS = -20.0
+
+            def __init__(self, length=30000):
+                self.length = int(length)
+
+            def __len__(self):
+                return self.length
+
+            def __getitem__(self, item):
+                start = int(item.start or 0)
+                stop = int(item.stop if item.stop is not None else self.length)
+                return FakeAudio(max(0, stop - start))
+
+            def export(self, path, format="wav"):
+                Path(path).write_bytes(b"RIFF")
+
+        fake_pydub = ModuleType("pydub")
+        fake_pydub.AudioSegment = SimpleNamespace(
+            from_wav=lambda path: FakeAudio()
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            sys.modules, {"pydub": fake_pydub}
+        ):
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            router._reference_quality = lambda segment, clip: (
+                float(segment["end"]), clip, {}, 0, len(clip)
+            )
+            segments = [{
+                "id": 9, "start": 0.0, "end": 8.0, "speaker": "A",
+                "text": "joined", "speaker_reference_mixed_raw": True,
+                "speaker_reference_components": [
+                    {"id": "9:0", "start": 0.0, "end": 3.0,
+                     "text": "first", "speaker_assignment_confidence": 0.9},
+                    {"id": "9:1", "start": 3.2, "end": 8.0,
+                     "text": "second", "speaker_assignment_confidence": 0.9},
+                ],
+            }]
+            reference = router._speaker_references(segments, "unused.wav")["A"]
+            self.assertEqual(reference["source_segment_id"], "9:1")
+            self.assertEqual(reference["text"], "second")
+            manifest = json.loads(
+                (router.root / "reference_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(manifest["speakers"]["A"]["concatenated"])
+
+    def test_voice_identity_reuse_does_not_change_sentence_speaker_labels(self):
+        class FakeAudio:
+            dBFS = -20.0
+            def __init__(self, length=10000): self.length = int(length)
+            def __len__(self): return self.length
+            def __getitem__(self, item):
+                return FakeAudio(max(0, int(item.stop) - int(item.start or 0)))
+            def export(self, path, format="wav"): Path(path).write_bytes(b"RIFF")
+
+        fake_pydub = ModuleType("pydub")
+        fake_pydub.AudioSegment = SimpleNamespace(from_wav=lambda _path: FakeAudio())
+        fake_pydub.silence = SimpleNamespace(detect_nonsilent=lambda *_a, **_k: [[0, 1000]])
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            sys.modules, {"pydub": fake_pydub}
+        ):
+            router = tts_router.TTSRouter(SimpleNamespace(temp_dir=tmp), scheme="scheme3")
+            router._reference_quality = lambda _segment, clip: (
+                len(clip) / 1000.0, clip, {}, 0, len(clip)
+            )
+            segments = [
+                {"id": 0, "start": 0.0, "end": 1.0, "speaker": "A",
+                 "text": "one", "wespeaker_tts_embedding": [1.0, 0.0]},
+                {"id": 1, "start": 2.0, "end": 5.0, "speaker": "B",
+                 "text": "two", "wespeaker_tts_embedding": [0.99, 0.01]},
+            ]
+            references = router._speaker_references(segments, "unused.wav")
+            self.assertEqual([row["speaker"] for row in segments], ["A", "B"])
+            self.assertEqual(references["A"]["voice_identity"], "B")
+            self.assertTrue(references["A"]["voice_identity_reused"])
+            manifest = json.loads((router.root / "reference_manifest.json").read_text())
+            self.assertEqual(manifest["voice_identity_map"]["A"], "B")
+
     def test_reference_precision_gate_only_rejects_coarse_recovery(self):
         self.assertTrue(tts_router._is_precise_reference_segment({}))
         self.assertTrue(tts_router._is_precise_reference_segment({
@@ -107,6 +247,15 @@ class DurationTests(unittest.TestCase):
         }))
         self.assertFalse(tts_router._is_precise_reference_segment({
             "asr_recovery_status": "accepted_coarse"
+        }))
+        self.assertFalse(tts_router._is_precise_reference_segment({
+            "speaker_boundary_ambiguous": True
+        }))
+        self.assertTrue(tts_router._is_precise_reference_segment({
+            "speaker_assignment_confidence": 0.60
+        }))
+        self.assertTrue(tts_router._is_precise_reference_segment({
+            "speaker_assignment_confidence": 0.90
         }))
 
     def test_f5_native_duration_includes_processed_reference(self):
@@ -131,6 +280,30 @@ class DurationTests(unittest.TestCase):
                     self.assertAlmostEqual(duration, target, places=2)
                     self.assertAlmostEqual(calls[-1][2], 6.2 + target)
                     self.assertEqual(calls[-1][0], str(raw))
+
+    def test_f5_duration_loop_measures_unconstrained_natural_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = Path(tmp, "reference.wav")
+            wav(raw, 4.0)
+            observed = []
+
+            class Model:
+                def infer(
+                    self, ref_file, ref_text, gen_text, file_wave,
+                    show_info, fix_duration=None,
+                ):
+                    observed.append(fix_duration)
+                    wav(file_wave, 1.7)
+
+            backend = tts_worker.F5TTSBackend.__new__(tts_worker.F5TTSBackend)
+            backend.model = Model()
+            duration = backend.generate({
+                "ref_audio": str(raw), "ref_text": "Reference.",
+                "text": "Natural words", "target_duration": 1.0,
+                "measure_natural_duration": True,
+            }, Path(tmp, "natural.wav"))
+            self.assertEqual(observed, [None])
+            self.assertAlmostEqual(duration, 1.7, places=2)
 
     def test_f5_legacy_api_without_duration_keeps_existing_call(self):
         with tempfile.TemporaryDirectory() as tmp:

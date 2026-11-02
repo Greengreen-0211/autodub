@@ -393,6 +393,23 @@ class OCRV211Client:
         return outputs
 
 
+def preserve_speaker_timing_skeleton(
+    source: Mapping[str, Any], result: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Keep pre-OCR timing as boundary evidence, not corrected token timing."""
+    if str(source.get("text") or "") == str(result.get("text") or ""):
+        return result
+    stamps = source.get("qwen3_time_stamps") or []
+    if not stamps:
+        return result
+    result["speaker_timing_text"] = str(source.get("text") or "")
+    result["speaker_timing_time_stamps"] = deepcopy(stamps)
+    result["speaker_timing_skeleton_valid"] = True
+    result["speaker_timing_skeleton_source"] = "pre_ocr_qwen3_asr"
+    result["corrected_token_alignment_valid"] = False
+    return result
+
+
 class OCRV211Corrector:
     """Frozen B candidate inventory, classifier, and complete gate chain."""
 
@@ -412,7 +429,7 @@ class OCRV211Corrector:
             legacy = self.legacy_corrector_cls(self.config).correct(
                 [segment.copy() for segment in segments], ocr_texts
             )
-            return [
+            corrected = [
                 _ocr_update_segment(source, {
                     "accepted": changed["text"] != source["text"],
                     "corrected_text": changed["text"],
@@ -420,6 +437,9 @@ class OCRV211Corrector:
                 })
                 for source, changed in zip(segments, legacy)
             ]
+            for source, result in zip(segments, corrected):
+                preserve_speaker_timing_skeleton(source, result)
+            return corrected
         requests = []
         for segment in segments:
             text = str(segment.get("text") or "")
@@ -463,6 +483,15 @@ class OCRV211Corrector:
             _ocr_update_segment(segment, decisions[str(segment["id"])])
             for segment in segments
         ]
+        # OCR may fix a few characters while leaving the utterance and its
+        # acoustic timing unchanged.  The frozen updater correctly removes
+        # token timestamps from the rewritten text because those tokens no
+        # longer have an exact character mapping.  Preserve a separate copy of
+        # the original ASR timing skeleton for speaker-boundary detection.  It
+        # is deliberately not restored as qwen3_time_stamps: downstream code
+        # must not pretend that rewritten OCR tokens have word-level timing.
+        for source, result in zip(segments, corrected):
+            preserve_speaker_timing_skeleton(source, result)
         accepted = sum(before["text"] != after["text"] for before, after in zip(segments, corrected))
         print(f"✅ 冻结 B OCR 纠错完成: 实际采纳 {accepted}/{len(segments)}")
         return corrected
@@ -778,11 +807,166 @@ def _implementation_binding(main_path: Path) -> str:
     })
 
 
+def ocr_recovery_timing_plausibility(
+    text: str, start: float, end: float
+) -> Dict[str, Any]:
+    """Audit whether coarse OCR text can physically fit its speech interval."""
+    duration = max(0.0, float(end) - float(start))
+    han_count = len(re.findall(r"[\u3400-\u9fff]", str(text or "")))
+    word_count = len(
+        re.findall(r"[^\W_]+(?:['’][^\W_]+)?", str(text or ""))
+    )
+    lexical_count = han_count if han_count else word_count
+    max_rate = 12.0 if han_count else 6.0
+    rate = lexical_count / max(duration, 0.001)
+    plausible = bool(
+        lexical_count > 0
+        and duration >= (0.16 if lexical_count <= 3 else 0.35)
+        and rate <= max_rate
+    )
+    return {
+        "plausible": plausible,
+        "duration": round(duration, 3),
+        "lexical_count": lexical_count,
+        "lexical_rate": round(rate, 3),
+        "max_lexical_rate": max_rate,
+    }
+
+
+def persistent_ocr_overlay_texts(
+    frame_records: Sequence[Mapping[str, Any]],
+) -> List[str]:
+    """Find globally repeated static overlays that are not dialogue subtitles."""
+    from asr_recovery import _ocr_lines, normalize_text
+
+    observations: Dict[str, Dict[str, Any]] = {}
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        segment_id = str(record.get("segment_id") or "")
+        for line in _ocr_lines(str(record.get("text") or "")):
+            key = normalize_text(line)
+            if len(key) < 2:
+                continue
+            item = observations.setdefault(key, {
+                "text": line,
+                "timestamps": set(),
+                "segment_ids": set(),
+            })
+            item["timestamps"].add(round(timestamp, 3))
+            if segment_id:
+                item["segment_ids"].add(segment_id)
+
+    persistent = []
+    for item in observations.values():
+        timestamps = sorted(item["timestamps"])
+        if len(timestamps) < 3:
+            continue
+        span = timestamps[-1] - timestamps[0]
+        independent_regions = len(item["segment_ids"])
+        if (
+            independent_regions >= 3 and span >= 5.0
+            or independent_regions >= 2 and len(timestamps) >= 5 and span >= 8.0
+        ):
+            persistent.append(str(item["text"]))
+    return persistent
+
+
+def filter_unsupported_recovered_micro_segments(
+    segments: Sequence[Mapping[str, Any]],
+    frame_records: Sequence[Mapping[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Quarantine unsupported one-character recovery transcripts.
+
+    Coverage retry runs the same ASR model over two audio views. Exact
+    agreement is useful, but for a one-Han-character fragment both views can
+    repeat the same hallucination. Such a fragment is kept only when stable
+    OCR independently supports it inside the same interval.
+
+    Primary ASR is deliberately outside this gate, so genuine short replies
+    and interjections are not removed merely because they are one character.
+    """
+    from asr_recovery import _ocr_lines, normalize_text
+
+    observations: Dict[str, List[float]] = {}
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        for line in _ocr_lines(str(record.get("text") or "")):
+            key = normalize_text(line)
+            if key:
+                observations.setdefault(key, []).append(timestamp)
+
+    kept: List[Dict[str, Any]] = []
+    quarantined: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    recovery_prefixes = ("coverage_retry_", "primary_alignment_repair_")
+    for raw_segment in segments:
+        segment = dict(raw_segment)
+        origin = str(segment.get("asr_origin") or "")
+        text = str(segment.get("text") or "").strip()
+        key = normalize_text(text)
+        is_recovery = origin.startswith(recovery_prefixes)
+        is_single_han = bool(
+            len(key) == 1 and re.fullmatch(r"[\u3400-\u9fff]", key)
+        )
+        if not (is_recovery and is_single_han):
+            kept.append(segment)
+            continue
+
+        start = float(segment.get("start", 0.0))
+        end = float(segment.get("end", start))
+        support = sorted({
+            round(timestamp, 3)
+            for timestamp in observations.get(key, [])
+            if start - 0.35 <= timestamp <= end + 0.35
+        })
+        accepted = len(support) >= 2
+        decision = {
+            "segment_id": segment.get("id"),
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": text,
+            "asr_origin": origin,
+            "accepted": accepted,
+            "ocr_frame_support": len(support),
+            "ocr_timestamps": support,
+            "reason": (
+                "stable_matching_ocr_support"
+                if accepted
+                else "single_character_recovery_without_independent_support"
+            ),
+        }
+        audit.append(decision)
+        if accepted:
+            segment["recovery_micro_fragment_audit"] = decision
+            kept.append(segment)
+            continue
+        quarantined.append({
+            "id": f"recovery-micro-{segment.get('id', len(quarantined))}",
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "original_text": text,
+            "dialogue_evidence": False,
+            "acoustic_candidate": True,
+            "asr_recovery_status": "unresolved_uncertain",
+            "candidate_kind": "unsupported_recovered_micro_fragment",
+            "reason": [decision["reason"]],
+            "preserve_original_vocal": False,
+        })
+    return kept, quarantined, audit
+
+
 def _recover_deferred_from_ocr(
     deferred_regions: Sequence[Dict[str, Any]],
     frame_records: Dict[str, List[Dict[str, Any]]],
     source_language: str,
     known_segments: Sequence[Dict[str, Any]] = (),
+    persistent_overlay_texts: Sequence[str] = (),
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Promote stable ordered subtitle events to coarse ASR segments."""
     from asr_recovery import coarse_segment, ocr_source_events
@@ -806,7 +990,7 @@ def _recover_deferred_from_ocr(
             source_language,
             region_start=float(region["start"]),
             region_end=float(region["end"]),
-            exclude_texts=known_neighbor_texts,
+            exclude_texts=[*known_neighbor_texts, *persistent_overlay_texts],
         )
         record = {
             "id": region_id,
@@ -835,10 +1019,51 @@ def _recover_deferred_from_ocr(
             audit.append(record)
             continue
         event_records = []
+        rejected_events = []
+        region_recovered: List[Dict[str, Any]] = []
         for event_index, event in enumerate(events):
+            text = str(event["text"])
+            timing = ocr_recovery_timing_plausibility(
+                text, float(event["start"]), float(event["end"])
+            )
+            if not timing["plausible"]:
+                rejected_events.append({
+                    "text": text,
+                    "start": event["start"],
+                    "end": event["end"],
+                    **timing,
+                    "reason": "ocr_text_duration_implausible",
+                })
+                continue
+            # OCR punctuation is generated by OCR itself, so it cannot prove
+            # that a visible string is spoken dialogue.  For an acoustic-only
+            # gap, require either changing subtitle events or independently
+            # strong vocal evidence.  Single-character OCR-only text remains
+            # retry evidence but is never promoted directly.
+            upstream_text_evidence = bool(region.get("dialogue_evidence"))
+            dynamic_subtitle_sequence = len(events) > 1
+            strong_vocal_support = bool(
+                region.get("acoustic_candidate")
+                and float(region.get("acoustic_dialogue_score") or 0.0) >= 0.55
+                and int(event.get("frame_count") or 0) >= 2
+                and int(timing.get("lexical_count") or 0) >= 2
+            )
+            if not (
+                upstream_text_evidence
+                or dynamic_subtitle_sequence
+                or strong_vocal_support
+            ):
+                rejected_events.append({
+                    "text": text,
+                    "start": event["start"],
+                    "end": event["end"],
+                    **timing,
+                    "reason": "ocr_only_text_without_independent_vocal_evidence",
+                })
+                continue
             seed = {
                 "id": -1,
-                "text": str(event["text"]),
+                "text": text,
                 "asr_model": "qwen3+ocr",
                 "asr_repair_source": "stable_ocr_timeline",
                 "ocr_recovered": True,
@@ -860,6 +1085,7 @@ def _recover_deferred_from_ocr(
             segment["asr_recovered_parent_start"] = round(float(region["start"]), 3)
             segment["asr_recovered_parent_end"] = round(float(region["end"]), 3)
             recovered.append(segment)
+            region_recovered.append(segment)
             event_records.append(
                 {
                     "text": event["text"],
@@ -868,7 +1094,49 @@ def _recover_deferred_from_ocr(
                     "frame_count": event.get("frame_count", 0),
                 }
             )
-        record.update({"status": "accepted_coarse", "events": event_records})
+        if rejected_events:
+            record["rejected_events"] = rejected_events
+        if not event_records:
+            confirmed_dialogue = bool(region.get("dialogue_evidence"))
+            rejection_reasons = sorted({
+                str(item.get("reason") or "ocr_event_rejected")
+                for item in rejected_events
+            })
+            remaining.append(dict(
+                region,
+                dialogue_evidence=confirmed_dialogue,
+                asr_recovery_status=(
+                    "unresolved_blocking"
+                    if confirmed_dialogue else "unresolved_uncertain"
+                ),
+                ocr_recovery_rejection="+".join(rejection_reasons),
+                requires_contextual_asr_retry=True,
+            ))
+            record["status"] = (
+                "rejected_implausible_timing"
+                if rejection_reasons == ["ocr_text_duration_implausible"]
+                else "rejected_unverified_ocr_text"
+            )
+        else:
+            if rejected_events:
+                # A partially accepted parent is not fully covered.  Limit
+                # each accepted range to its own event and keep rejected event
+                # intervals in the unresolved inventory for contextual ASR.
+                for segment in region_recovered:
+                    segment["asr_recovered_parent_start"] = segment["start"]
+                    segment["asr_recovered_parent_end"] = segment["end"]
+                for rejected in rejected_events:
+                    remaining.append(dict(
+                        region,
+                        id=f"{region_id}:ocr_rejected:{len(remaining)}",
+                        start=round(float(rejected["start"]), 3),
+                        end=round(float(rejected["end"]), 3),
+                        dialogue_evidence=True,
+                        asr_recovery_status="unresolved_blocking",
+                        ocr_recovery_rejection="ocr_text_duration_implausible",
+                        requires_contextual_asr_retry=True,
+                    ))
+            record.update({"status": "accepted_coarse", "events": event_records})
         audit.append(record)
     return recovered, remaining, audit
 
@@ -1055,6 +1323,7 @@ def run_step_1b_optimized(
                 deferred_frame_records,
                 str(config.ocr_source_language or state.get("src_lang", "")),
                 segments,
+                persistent_ocr_overlay_texts(all_frame_records),
             )
         )
         if recovered_segments:
@@ -1148,6 +1417,21 @@ def run_step_1b_optimized(
                 "多帧稳定的人名拼写修复。"
             )
 
+    # Run after every text recovery/correction, but before Step 1 becomes the
+    # timing skeleton for diarization. This catches short retry-ASR
+    # hallucinations without changing primary ASR behavior.
+    segments, quarantined_micro_regions, micro_fragment_audit = (
+        filter_unsupported_recovered_micro_segments(segments, all_frame_records)
+    )
+    if quarantined_micro_regions:
+        remaining_deferred = [*remaining_deferred, *quarantined_micro_regions]
+        for index, segment in enumerate(segments):
+            segment["id"] = index
+        print(
+            f"⚠️ 恢复短片段验收: {len(quarantined_micro_regions)} 个"
+            "无独立证据的单字恢复结果已转入不确定审计。"
+        )
+
     from speech_activity import attach_coarse_tts_placement, detect_speech_regions
 
     recovery_timing_audit: List[Dict[str, Any]] = []
@@ -1204,6 +1488,7 @@ def run_step_1b_optimized(
         "asr_ocr_recovery_report": ocr_recovery_audit,
         "asr_boundary_repair_report": boundary_repair_audit,
         "asr_ocr_entity_correction_report": entity_correction_audit,
+        "asr_recovery_micro_fragment_report": micro_fragment_audit,
         "asr_recovery_timing_report": recovery_timing_audit,
         "asr_recovery_report": combined_recovery_report,
         "asr_unresolved_dialogue_regions": blocking_regions,

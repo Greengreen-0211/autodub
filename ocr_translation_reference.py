@@ -17,7 +17,7 @@ import re
 from typing import Any
 
 
-REFERENCE_VERSION = "ocr-translation-reference-v9-repeated-clause"
+REFERENCE_VERSION = "ocr-translation-reference-v10-adaptive-time"
 _REF_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
@@ -607,25 +607,40 @@ def prepare_ocr_translation_references(
         asr = str(segment.get("text", ""))
         grouped: dict[tuple[str, str], dict[str, Any]] = {}
         for pair in pairs:
-            if pair["timestamp"] < start - 0.8 or pair["timestamp"] > end + 0.8:
+            timestamp = float(pair["timestamp"])
+            outside_seconds = max(start - timestamp, timestamp - end, 0.0)
+            if outside_seconds > 1.6:
                 continue
             source_similarity = _source_similarity(asr, pair["source_text"])
             if source_similarity < 0.42:
                 continue
             source_coverage = _source_ordered_coverage(asr, pair["source_text"])
-            time_score = _time_score(pair["timestamp"], start, end)
+            adaptive_time_match = outside_seconds > 0.8
+            # Expanded temporal admission is content-led: a boundary may be
+            # wrong, but a merely similar neighbouring subtitle must never be
+            # pulled into the current sentence.
+            if adaptive_time_match and not (
+                source_similarity >= 0.82 and source_coverage >= 0.82
+            ):
+                continue
+            time_score = _time_score(timestamp, start, end)
             score = (0.72 * source_similarity + 0.18 * time_score
                      + 0.10 * float(pair["spatial_score"]))
             key = (_normalize(pair["source_text"]), _normalize(pair["target_text"]))
             group = grouped.setdefault(key, {
                 "source_text": pair["source_text"], "target_text": pair["target_text"],
                 "scores": [], "source_similarities": [], "source_coverages": [],
-                "timestamps": [],
+                "timestamps": [], "adaptive_time_match": False,
+                "outside_seconds": [],
             })
             group["scores"].append(score)
             group["source_similarities"].append(source_similarity)
             group["source_coverages"].append(source_coverage)
-            group["timestamps"].append(pair["timestamp"])
+            group["timestamps"].append(timestamp)
+            group["adaptive_time_match"] = bool(
+                group.get("adaptive_time_match") or adaptive_time_match
+            )
+            group["outside_seconds"].append(outside_seconds)
         for group in _composed_groups(pairs, start, end, asr):
             key = (_normalize(group["source_text"]), _normalize(group["target_text"]))
             existing = grouped.get(key)
@@ -675,6 +690,10 @@ def prepare_ocr_translation_references(
                 "boundary_cost": round(boundary["boundary_cost"], 6),
                 "source_length_delta": subtitle_token_count - asr_token_count,
                 "time_alignment": round(_time_score(midpoint, start, end), 6),
+                "adaptive_time_match": bool(group.get("adaptive_time_match", False)),
+                "temporal_outside_seconds": round(
+                    max(group.get("outside_seconds", [0.0]) or [0.0]), 6
+                ),
                 "composed": bool(group.get("composed", False)),
                 "timestamps": timestamps,
                 "subtitle_cards": group.get("subtitle_cards", []),
@@ -779,6 +798,7 @@ def prepare_ocr_translation_references(
                     "extra_rate", "boundary_cost", "composed", "timestamps",
                     "subtitle_cards", "source_clauses", "covered_clause_indices",
                     "uncovered_source_clauses", "repetition_count_mismatch",
+                    "adaptive_time_match", "temporal_outside_seconds",
                 )}
                 hint["confidence"] = "medium"
                 hint["reference_tier"] = "ambiguous_hint"
@@ -797,7 +817,8 @@ def prepare_ocr_translation_references(
                     "missing_rate", "extra_rate", "boundary_cost", "composed",
                     "timestamps", "subtitle_cards", "source_clauses",
                     "covered_clause_indices", "uncovered_source_clauses",
-                    "repetition_count_mismatch",
+                    "repetition_count_mismatch", "adaptive_time_match",
+                    "temporal_outside_seconds",
                 )}
                 reference["reference_tier"] = "exact" if perfect else "trusted"
                 if perfect:

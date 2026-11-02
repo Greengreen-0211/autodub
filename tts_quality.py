@@ -3,16 +3,570 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import math
+import re
 from pathlib import Path
+
+
+_WESPEAKER_ONNX_SESSIONS = {}
 
 
 def duration_quality(actual: float, target: float) -> dict:
     absolute=abs(actual-target)
     ratio=actual/target if target>0 else 0.0
-    limit=max(float(os.getenv("AUTODUB_TTS_MAX_DURATION_ERROR", "0.6")),
-              target*float(os.getenv("AUTODUB_TTS_MAX_DURATION_RATIO_ERROR", "0.25")))
+    # A fixed 0.6 s allowance is enormous for sub-second dialogue: a 0.45 s
+    # fragment used to pass a 0.70 s slot.  Judge short clips by percentage and
+    # reserve the absolute allowance for longer sentences where it is useful.
+    if target < 1.0:
+        lower = float(os.getenv("AUTODUB_TTS_FINAL_MIN_RATIO_TINY", "0.78"))
+        upper = float(os.getenv("AUTODUB_TTS_FINAL_MAX_RATIO_TINY", "1.22"))
+        passed = actual > 0 and target > 0 and lower <= ratio <= upper
+        rule = "tiny_ratio"
+        limit = target * max(1.0 - lower, upper - 1.0)
+    elif target < 2.0:
+        lower = float(os.getenv("AUTODUB_TTS_FINAL_MIN_RATIO_SHORT", "0.80"))
+        upper = float(os.getenv("AUTODUB_TTS_FINAL_MAX_RATIO_SHORT", "1.20"))
+        passed = actual > 0 and target > 0 and lower <= ratio <= upper
+        rule = "short_ratio"
+        limit = target * max(1.0 - lower, upper - 1.0)
+    else:
+        lower = 0.0
+        upper = float("inf")
+        limit=max(float(os.getenv("AUTODUB_TTS_MAX_DURATION_ERROR", "0.6")),
+                  target*float(os.getenv("AUTODUB_TTS_MAX_DURATION_RATIO_ERROR", "0.25")))
+        passed = actual>0 and target>0 and absolute<=limit
+        rule = "absolute_or_ratio"
     return {"duration_error":actual-target,"duration_ratio":ratio,
-            "duration_quality":"passed" if actual>0 and target>0 and absolute<=limit else "failed"}
+            "duration_quality":"passed" if passed else "failed",
+            "duration_quality_rule": rule,
+            "duration_quality_lower_ratio": lower,
+            "duration_quality_upper_ratio": upper,
+            "duration_quality_limit_seconds": limit}
+
+
+def duration_adaptation_safety(actual: float, target: float) -> dict:
+    """Describe whether a generated clip can be time-scaled without abuse.
+
+    ``actual / target`` is deliberately the single source of truth.  A very
+    long utterance is often more than a timing problem: it can contain model
+    babble, copied reference speech, or added words.  Hiding that evidence
+    behind a 5-10x ``atempo`` chain produces an apparently valid WAV whose
+    content is no longer intelligible.  Such a result must be retried or
+    exposed as a degraded preview, never silently force-fitted.
+    """
+    actual = float(actual or 0.0)
+    target = float(target or 0.0)
+    ratio = actual / target if actual > 0.0 and target > 0.0 else 0.0
+    maximum_compression = max(
+        1.0,
+        float(os.getenv("AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO", "1.25")),
+    )
+    short_threshold = max(
+        0.1,
+        float(os.getenv("AUTODUB_TTS_SHORT_DURATION_THRESHOLD", "2.00")),
+    )
+    if 0.0 < target <= short_threshold:
+        maximum_compression = min(
+            maximum_compression,
+            max(
+                1.0,
+                float(os.getenv(
+                    "AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO", "1.18"
+                )),
+            ),
+        )
+    maximum_slowdown = max(
+        1.0,
+        float(os.getenv("AUTODUB_TTS_MAX_SAFE_SLOWDOWN_RATIO", "1.25")),
+    )
+    required_speed = ratio
+    required_slowdown = (1.0 / ratio) if ratio > 0.0 else 0.0
+    compression_safe = 0.0 < ratio <= maximum_compression
+    slowdown_safe = ratio > 0.0 and required_slowdown <= maximum_slowdown
+    return {
+        "duration_ratio": ratio,
+        "required_atempo_factor": required_speed,
+        "required_slowdown_factor": required_slowdown,
+        "maximum_safe_compression_ratio": maximum_compression,
+        "short_duration_threshold": short_threshold,
+        "short_duration_compression_policy": bool(
+            0.0 < target <= short_threshold
+        ),
+        "maximum_safe_slowdown_ratio": maximum_slowdown,
+        "safe_to_force_fit": bool(compression_safe and slowdown_safe),
+        "unsafe_duration_compression": bool(ratio > maximum_compression),
+        "unsafe_duration_slowdown": bool(
+            ratio > 0.0 and required_slowdown > maximum_slowdown
+        ),
+        "duration_anomaly": bool(
+            ratio
+            > float(os.getenv("AUTODUB_TTS_GENERATION_ANOMALY_RATIO", "2.00"))
+        ),
+    }
+
+
+def natural_duration_fit(actual: float, target: float, provenance: str = "") -> dict:
+    """Judge unwarped, silence-trimmed TTS against the source speech window.
+
+    Every decision is expressed as ``synthesized / source-slot``.  Trusted OCR
+    wording receives a wider *naturalness* band, but never a wider physical
+    collision window.  This decision must be made before atempo;
+    postprocessed audio is not evidence that the translation itself fits
+    naturally.
+    """
+    actual = float(actual or 0.0)
+    target = float(target or 0.0)
+    ratio = actual / target if actual > 0.0 and target > 0.0 else 0.0
+    absolute = abs(actual - target)
+    trusted_ocr = str(provenance or "").lower() in {
+        "ocr_direct", "ocr_repaired", "ocr_hybrid", "ocr_assisted",
+    }
+    if trusted_ocr:
+        lower = float(os.getenv("AUTODUB_TTS_OCR_NATURAL_MIN_RATIO", "0.68"))
+        upper = float(os.getenv("AUTODUB_TTS_OCR_NATURAL_MAX_RATIO", "1.35"))
+        rule = "trusted_ocr_ratio"
+    elif target < 1.0:
+        lower = float(os.getenv("AUTODUB_TTS_NATURAL_MIN_RATIO_TINY", "0.78"))
+        upper = float(os.getenv("AUTODUB_TTS_NATURAL_MAX_RATIO_TINY", "1.25"))
+        rule = "tiny_ratio"
+    elif target < 2.0:
+        lower = float(os.getenv("AUTODUB_TTS_NATURAL_MIN_RATIO_SHORT", "0.75"))
+        upper = float(os.getenv("AUTODUB_TTS_NATURAL_MAX_RATIO_SHORT", "1.25"))
+        rule = "short_ratio"
+    else:
+        lower = float(os.getenv("AUTODUB_TTS_NATURAL_MIN_RATIO", "0.80"))
+        upper = float(os.getenv("AUTODUB_TTS_NATURAL_MAX_RATIO", "1.20"))
+        passed = lower <= ratio <= upper
+        rule = "standard_ratio"
+    passed = actual > 0.0 and lower <= ratio <= upper
+    direction = "suitable"
+    if not passed:
+        direction = "expand" if actual < target else "compress"
+    distance = abs(math.log(max(ratio, 1e-6))) if ratio > 0.0 else float("inf")
+    return {
+        "natural_duration": actual,
+        "target_duration": target,
+        "natural_duration_ratio": ratio,
+        "natural_duration_error": actual - target,
+        "natural_duration_absolute_error": absolute,
+        "natural_duration_lower_ratio": lower,
+        "natural_duration_upper_ratio": upper,
+        "natural_duration_rule": rule,
+        "natural_duration_provenance": str(provenance or "standard"),
+        "natural_duration_fit": "passed" if passed else "failed",
+        "duration_rewrite_direction": direction,
+        "duration_log_distance": distance,
+    }
+
+
+def audible_speech_quality(path, *, expected_text: str = "") -> dict:
+    """Reject silent, near-silent and implausibly tiny synthesized clips.
+
+    Worker success only proves that a WAV was written.  It does not prove that
+    the WAV contains audible speech.  This lightweight gate deliberately uses
+    signal evidence available in every TTS environment; optional ASR/content
+    verification can be layered on top without weakening this baseline.
+    """
+    try:
+        from pydub import AudioSegment, silence
+        clip = AudioSegment.from_file(str(path))
+        duration = len(clip) / 1000.0
+        dbfs = float(clip.dBFS) if clip.dBFS != float("-inf") else -120.0
+        threshold = max(
+            float(os.getenv("AUTODUB_TTS_AUDIBLE_ABSOLUTE_DBFS", "-48")),
+            dbfs - float(os.getenv("AUTODUB_TTS_AUDIBLE_RELATIVE_DB", "18")),
+        )
+        ranges = silence.detect_nonsilent(
+            clip,
+            min_silence_len=int(os.getenv(
+                "AUTODUB_TTS_AUDIBLE_MIN_SILENCE_MS", "80"
+            )),
+            silence_thresh=threshold,
+        )
+        voiced_ms = sum(max(0, end - start) for start, end in ranges)
+        voiced = voiced_ms / 1000.0
+        voiced_ratio = voiced / duration if duration > 0 else 0.0
+    except Exception:
+        # Keep the gate functional for ordinary PCM WAV checkpoints even when
+        # optional pydub/ffmpeg diagnostics are unavailable.
+        hard_audio = generated_audio_safety(path)
+        duration = float(hard_audio.get("generated_audio_duration") or 0.0)
+        dbfs = float(hard_audio.get("generated_audio_dbfs") or -120.0)
+        if hard_audio.get("generated_audio_safety") == "passed":
+            voiced = duration
+            voiced_ratio = 1.0 if duration > 0.0 else 0.0
+        else:
+            voiced = 0.0
+            voiced_ratio = 0.0
+    expected = str(expected_text or "").strip()
+    cjk_count = sum("\u4e00" <= char <= "\u9fff" for char in expected)
+    word_count = len(re.findall(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*", expected))
+    lexical_units = cjk_count + word_count
+    clauses = [
+        part for part in re.split(r"[，,。.!！？?；;：:]+", expected)
+        if any(char.isalnum() or "\u4e00" <= char <= "\u9fff" for char in part)
+    ]
+    clause_count = max(1, len(clauses)) if lexical_units else 0
+    # Do not cap this floor.  The old 0.55 s cap let a fragment of a long or
+    # multi-clause sentence pass merely because it contained some sound.
+    symbol_floor = (
+        cjk_count * float(os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_CJK", "0.095"))
+        + word_count * float(os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_WORD", "0.12"))
+    )
+    clause_floor = clause_count * float(
+        os.getenv("AUTODUB_TTS_MIN_SECONDS_PER_CLAUSE", "0.22")
+    )
+    min_voiced = max(
+        float(os.getenv("AUTODUB_TTS_MIN_VOICED_SECONDS", "0.16")),
+        symbol_floor,
+        clause_floor,
+    )
+    min_ratio = float(os.getenv("AUTODUB_TTS_MIN_VOICED_RATIO", "0.35"))
+    if clause_count > 1:
+        min_ratio = max(
+            min_ratio,
+            float(os.getenv("AUTODUB_TTS_MULTI_CLAUSE_MIN_VOICED_RATIO", "0.50")),
+        )
+    # A clip around -39 dBFS can technically contain non-silent samples while
+    # remaining inaudible under a normal backing track.  Treat it as failed so
+    # the router retries another engine instead of reporting a missing line as
+    # a successful mix.
+    min_dbfs = float(os.getenv("AUTODUB_TTS_MIN_DBFS", "-36"))
+    reasons = []
+    if duration <= 0.0:
+        reasons.append("empty_audio")
+    if dbfs < min_dbfs:
+        reasons.append(f"near_silent_dbfs:{dbfs:.2f}")
+    if voiced < min_voiced:
+        reasons.append(f"voiced_too_short:{voiced:.3f}<{min_voiced:.3f}")
+    if voiced_ratio < min_ratio:
+        reasons.append(f"voiced_ratio_low:{voiced_ratio:.3f}<{min_ratio:.3f}")
+    return {
+        "audible_speech_quality": "failed" if reasons else "passed",
+        "audible_speech_reason": ";".join(reasons),
+        "audio_dbfs": round(dbfs, 3),
+        "audio_duration": round(duration, 4),
+        "voiced_duration": round(voiced, 4),
+        "voiced_ratio": round(voiced_ratio, 4),
+        "minimum_voiced_duration": round(min_voiced, 4),
+        "minimum_voiced_ratio": round(min_ratio, 4),
+        "expected_cjk_characters": cjk_count,
+        "expected_words": word_count,
+        "expected_clause_count": clause_count,
+        "acoustic_completeness_quality": "failed" if reasons else "passed",
+    }
+
+
+def generated_audio_safety(path) -> dict:
+    """Return the small set of audio failures that may never reach a mix.
+
+    The normal audible/content/voice checks are ranking signals for an
+    autonomous delivery Agent: after its retry budget is exhausted it still
+    has to choose the best generated result.  This helper deliberately answers
+    a narrower question -- whether a decodable waveform containing real
+    signal exists at all.  Reference-speech leakage remains a separate hard
+    veto in the router.
+    """
+    try:
+        from pydub import AudioSegment
+
+        clip = AudioSegment.from_file(str(path))
+        duration = len(clip) / 1000.0
+        dbfs = float(clip.dBFS) if clip.dBFS != float("-inf") else -120.0
+        rms = int(clip.rms or 0)
+    except Exception as primary_exc:
+        # WAV checkpoints can still be verified without ffmpeg/pydub.  This
+        # fallback also keeps offline unit tests representative of production.
+        try:
+            import array
+            import sys
+            import wave
+
+            with wave.open(str(path), "rb") as handle:
+                frame_rate = int(handle.getframerate())
+                frame_count = int(handle.getnframes())
+                sample_width = int(handle.getsampwidth())
+                frames = handle.readframes(frame_count)
+            duration = frame_count / frame_rate if frame_rate > 0 else 0.0
+            if sample_width == 1:
+                samples = [value - 128 for value in frames]
+            elif sample_width in {2, 4}:
+                typecode = "h" if sample_width == 2 else "i"
+                values = array.array(typecode)
+                values.frombytes(frames)
+                if sys.byteorder != "little":
+                    values.byteswap()
+                samples = values
+            else:
+                raise ValueError(f"unsupported PCM sample width: {sample_width}")
+            rms = int(math.sqrt(
+                sum(float(value) * float(value) for value in samples)
+                / max(1, len(samples))
+            )) if samples else 0
+            full_scale = float((1 << (8 * sample_width - 1)) - 1)
+            dbfs = (
+                20.0 * math.log10(max(rms, 1) / full_scale)
+                if rms > 0 and full_scale > 0 else -120.0
+            )
+        except Exception as fallback_exc:
+            return {
+                "generated_audio_safety": "failed",
+                "generated_audio_safety_reason": (
+                    "unreadable_audio:"
+                    f"{type(primary_exc).__name__}/{type(fallback_exc).__name__}"
+                ),
+            }
+    minimum_duration = max(
+        0.01,
+        float(os.getenv("AUTODUB_TTS_HARD_MIN_AUDIO_SECONDS", "0.05")),
+    )
+    minimum_dbfs = float(os.getenv("AUTODUB_TTS_HARD_MIN_SIGNAL_DBFS", "-70"))
+    reasons = []
+    if duration < minimum_duration:
+        reasons.append(f"audio_too_short:{duration:.3f}<{minimum_duration:.3f}")
+    if rms <= 0 or dbfs < minimum_dbfs:
+        reasons.append(f"no_audible_signal:dbfs={dbfs:.2f},rms={rms}")
+    return {
+        "generated_audio_safety": "failed" if reasons else "passed",
+        "generated_audio_safety_reason": ";".join(reasons),
+        "generated_audio_duration": round(duration, 4),
+        "generated_audio_dbfs": round(dbfs, 3),
+        "generated_audio_rms": rms,
+    }
+
+
+def prosody_similarity_quality(source_path, synthesized_path) -> dict:
+    """Compare broad source/target prosody without requiring matching words.
+
+    Dubbing languages need not share phonemes or duration, so this deliberately
+    compares normalized pitch and energy *shape* instead of raw values.  The
+    result is a ranking signal only: missing optional audio dependencies or a
+    low score must never stop an autonomous render.
+    """
+    if os.getenv("AUTODUB_TTS_PROSODY_AUDIT", "1").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return {
+            "prosody_quality": "unavailable",
+            "prosody_reason": "disabled",
+            "prosody_similarity": None,
+        }
+    try:
+        import numpy as np
+        import librosa
+
+        def features(path):
+            audio, sample_rate = librosa.load(str(path), sr=16000, mono=True)
+            audio = np.asarray(audio, dtype=np.float32)
+            if audio.size < int(0.18 * sample_rate):
+                raise ValueError("audio_too_short")
+            trimmed, _ = librosa.effects.trim(audio, top_db=35)
+            if trimmed.size < int(0.15 * sample_rate):
+                trimmed = audio
+            hop = 160
+            frame = 640
+            energy = librosa.feature.rms(
+                y=trimmed, frame_length=frame, hop_length=hop,
+            )[0]
+            if energy.size < 3 or float(np.max(energy)) <= 1e-6:
+                raise ValueError("insufficient_energy")
+            pitch = librosa.yin(
+                trimmed,
+                fmin=float(os.getenv("AUTODUB_TTS_PROSODY_F0_MIN", "65")),
+                fmax=float(os.getenv("AUTODUB_TTS_PROSODY_F0_MAX", "500")),
+                sr=sample_rate,
+                frame_length=2048,
+                hop_length=hop,
+            )
+            length = min(len(energy), len(pitch))
+            energy = np.asarray(energy[:length], dtype=float)
+            pitch = np.asarray(pitch[:length], dtype=float)
+            voiced = (
+                np.isfinite(pitch)
+                & (pitch > 0.0)
+                & (energy > max(1e-6, float(np.percentile(energy, 25)) * 0.65))
+            )
+
+            def normalized_curve(values, mask=None):
+                values = np.asarray(values, dtype=float)
+                if mask is not None:
+                    indices = np.flatnonzero(mask)
+                    if indices.size < 3:
+                        return None
+                    values = np.interp(
+                        np.arange(len(values)), indices, values[indices]
+                    )
+                x_old = np.linspace(0.0, 1.0, num=len(values))
+                x_new = np.linspace(0.0, 1.0, num=64)
+                curve = np.interp(x_new, x_old, values)
+                median = float(np.median(curve))
+                spread = float(np.std(curve))
+                return (curve - median) / max(spread, 1e-6)
+
+            energy_curve = normalized_curve(np.log1p(energy * 1000.0))
+            pitch_curve = normalized_curve(np.log2(np.maximum(pitch, 1.0)), voiced)
+            duration = len(trimmed) / float(sample_rate)
+            # Energy changes per second are a language-independent proxy for
+            # delivery activity, not a literal syllable counter.
+            activity = float(np.mean(np.abs(np.diff(energy_curve)))) / max(
+                duration, 0.1
+            )
+            return energy_curve, pitch_curve, duration, activity
+
+        source_energy, source_pitch, source_duration, source_activity = features(
+            source_path
+        )
+        target_energy, target_pitch, target_duration, target_activity = features(
+            synthesized_path
+        )
+
+        def correlation(left, right):
+            value = float(np.corrcoef(left, right)[0, 1])
+            if not math.isfinite(value):
+                return None
+            return max(-1.0, min(1.0, value))
+
+        energy_corr = correlation(source_energy, target_energy)
+        pitch_corr = (
+            correlation(source_pitch, target_pitch)
+            if source_pitch is not None and target_pitch is not None
+            else None
+        )
+        components = [value for value in (energy_corr, pitch_corr) if value is not None]
+        if not components:
+            raise ValueError("no_comparable_contours")
+        contour = (
+            0.55 * energy_corr + 0.45 * pitch_corr
+            if pitch_corr is not None and energy_corr is not None
+            else components[0]
+        )
+        activity_ratio = (
+            target_activity / source_activity if source_activity > 1e-6 else 1.0
+        )
+        activity_score = math.exp(-abs(math.log(max(activity_ratio, 1e-6))))
+        similarity = max(0.0, min(1.0, 0.85 * ((contour + 1.0) / 2.0) + 0.15 * activity_score))
+        minimum = float(os.getenv("AUTODUB_TTS_MIN_PROSODY_SIMILARITY", "0.35"))
+        return {
+            "prosody_quality": "passed" if similarity >= minimum else "degraded",
+            "prosody_reason": "" if similarity >= minimum else (
+                f"prosody_similarity_low:{similarity:.3f}<{minimum:.3f}"
+            ),
+            "prosody_similarity": round(similarity, 6),
+            "prosody_energy_correlation": (
+                round(energy_corr, 6) if energy_corr is not None else None
+            ),
+            "prosody_pitch_correlation": (
+                round(pitch_corr, 6) if pitch_corr is not None else None
+            ),
+            "prosody_activity_ratio": round(activity_ratio, 6),
+            "prosody_source_duration": round(source_duration, 4),
+            "prosody_target_duration": round(target_duration, 4),
+            "prosody_minimum_similarity": minimum,
+        }
+    except Exception as exc:
+        return {
+            "prosody_quality": "unavailable",
+            "prosody_reason": f"{type(exc).__name__}:{exc}",
+            "prosody_similarity": None,
+        }
+
+
+def _wespeaker_embedding(path):
+    """Extract a SimAMResNet100 voice vector when the runtime is available."""
+    model_path = os.getenv(
+        "SIMAM_MODEL_PATH",
+        "/data0/goldenseed/models/wespeaker_simamresnet100/speaker-embedding.onnx",
+    )
+    if not model_path or not Path(model_path).is_file():
+        return None
+    try:
+        import numpy as np
+        import onnxruntime as ort
+        import soundfile as sf
+        import torch
+        import torchaudio
+        import torchaudio.compliance.kaldi as kaldi
+    except Exception:
+        return None
+    try:
+        session = _WESPEAKER_ONNX_SESSIONS.get(model_path)
+        if session is None:
+            configured = os.getenv(
+                "AUTODUB_TTS_WESPEAKER_ONNX_PROVIDER", "CPUExecutionProvider"
+            ).strip()
+            providers = [configured] if configured else ["CPUExecutionProvider"]
+            session = ort.InferenceSession(model_path, providers=providers)
+            _WESPEAKER_ONNX_SESSIONS[model_path] = session
+        audio, sample_rate = sf.read(str(path), dtype="float32")
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+        if audio.size < max(400, int(sample_rate * 0.20)):
+            return None
+        waveform = torch.from_numpy(audio).reshape(1, -1)
+        if int(sample_rate) != 16000:
+            waveform = torchaudio.functional.resample(
+                waveform, int(sample_rate), 16000
+            )
+        sample_rate = 16000
+        window_samples = int(1.5 * sample_rate)
+        period_samples = int(0.75 * sample_rate)
+        starts = list(range(0, max(1, waveform.shape[-1] - window_samples + 1), period_samples))
+        if not starts or starts[-1] + window_samples < waveform.shape[-1] - period_samples:
+            starts.append(max(0, waveform.shape[-1] - window_samples))
+        vectors = []
+        input_name = session.get_inputs()[0].name
+        for start in sorted(set(starts)):
+            chunk = waveform[:, start:min(waveform.shape[-1], start + window_samples)]
+            if chunk.shape[-1] < int(0.20 * sample_rate):
+                continue
+            features = kaldi.fbank(
+                chunk,
+                htk_compat=True,
+                sample_frequency=sample_rate,
+                use_energy=False,
+                window_type="hanning",
+                num_mel_bins=80,
+                dither=0.0,
+                frame_shift=10,
+            )
+            features = features - features.mean(dim=0, keepdim=True)
+            output = session.run(
+                None, {input_name: features.unsqueeze(0).numpy()}
+            )[0]
+            vector = np.asarray(output, dtype=np.float32).reshape(-1)
+            norm = float(np.linalg.norm(vector))
+            if norm > 1e-9:
+                vectors.append(vector / norm)
+        if not vectors:
+            return None
+        pooled = np.mean(np.stack(vectors), axis=0)
+        norm = float(np.linalg.norm(pooled))
+        return pooled / norm if norm > 1e-9 else None
+    except Exception:
+        return None
+
+
+def _preferred_voice_embedding(path):
+    embedding = _wespeaker_embedding(path)
+    if embedding is not None:
+        return embedding, "wespeaker_simamresnet100"
+    embedding = _voice_proxy_embedding(path)
+    if embedding is not None:
+        return embedding, "mfcc_proxy_fallback"
+    return None, "unavailable"
+
+
+def voice_reference_similarity(left_path, right_path):
+    """Return voice similarity, preferring the real WeSpeaker encoder."""
+    left, left_backend = _preferred_voice_embedding(left_path)
+    right, right_backend = _preferred_voice_embedding(right_path)
+    if left_backend != right_backend:
+        left = _voice_proxy_embedding(left_path)
+        right = _voice_proxy_embedding(right_path)
+    if left is None or right is None:
+        return None
+    return float(left @ right)
 
 
 def electricity_metrics(path):
@@ -40,15 +594,43 @@ def electricity_metrics(path):
                 "rms": 0.0, "duration": round(len(y) / sr, 4), "sample_rate": sr,
                 "skipped": "silent"}
     n_fft = 2048
-    power = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=512)) ** 2
+    magnitude = np.abs(librosa.stft(y, n_fft=n_fft, hop_length=512))
+    power = magnitude ** 2
     eps = 1e-12
     flatness = np.exp(np.mean(np.log(power + eps), axis=0)) / (np.mean(power, axis=0) + eps)
     freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
     hf_mask = freqs >= 8000
     hf_ratio = float(power[hf_mask].sum() / (power.sum() + eps)) if hf_mask.any() else 0.0
+    normalized = magnitude / (np.sum(magnitude, axis=0, keepdims=True) + eps)
+    spectral_flux = (
+        float(np.median(np.sqrt(np.sum(np.diff(normalized, axis=1) ** 2, axis=0))))
+        if normalized.shape[1] > 1 else 0.0
+    )
+    clipping_ratio = float(np.mean(np.abs(y) >= 0.995))
+    pitch_jump_ratio = 0.0
+    try:
+        f0 = librosa.yin(
+            y,
+            fmin=float(os.getenv("AUTODUB_TTS_ARTIFACT_F0_MIN", "65")),
+            fmax=float(os.getenv("AUTODUB_TTS_ARTIFACT_F0_MAX", "500")),
+            sr=sr,
+            frame_length=min(2048, max(512, len(y))),
+            hop_length=256,
+        )
+        f0 = np.asarray(f0, dtype=float)
+        valid = np.isfinite(f0) & (f0 > 0.0)
+        values = f0[valid]
+        if values.size > 1:
+            octave_jumps = np.abs(np.diff(np.log2(values + eps)))
+            pitch_jump_ratio = float(np.mean(octave_jumps > 0.75))
+    except Exception:
+        pitch_jump_ratio = 0.0
     return {
         "spectral_flatness": round(float(np.median(flatness)), 6),
         "hf_energy_ratio": round(hf_ratio, 6),
+        "spectral_flux": round(spectral_flux, 6),
+        "pitch_jump_ratio": round(pitch_jump_ratio, 6),
+        "clipping_ratio": round(clipping_ratio, 6),
         "rms": round(rms, 6),
         "duration": round(len(y) / sr, 4),
         "sample_rate": sr,
@@ -60,15 +642,15 @@ def electricity_quality(path):
 
     Policy (env AUTODUB_TTS_ELECTRICITY_POLICY):
       "off"           -> skip the analysis entirely (fast path)
-      "warn" (default)-> compute and record metrics, never fail the segment
-      "block"         -> compute and fail the segment when an artifact is found,
+      "warn"          -> compute and record metrics, never fail the segment
+      "block" (default)-> compute and fail the segment when an artifact is found,
                          which triggers the engine fallback chain in the router
 
     Thresholds are deliberately conservative because a false positive under
     "block" would waste GPU re-synthesis; calibrate them against real 电音
     samples before enabling "block".
     """
-    policy = os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY", "warn").strip().lower()
+    policy = os.getenv("AUTODUB_TTS_ELECTRICITY_POLICY", "block").strip().lower()
     if policy == "off":
         return {"electricity_quality": "skipped", "electricity_policy": policy}
     metrics = electricity_metrics(path)
@@ -82,30 +664,210 @@ def electricity_quality(path):
     max_hf = float(os.getenv("AUTODUB_TTS_MAX_HF_ENERGY_RATIO", "0.08"))
     sf = metrics["spectral_flatness"] or 0.0
     hf = metrics["hf_energy_ratio"] or 0.0
-    failed = sf > max_sf and hf > max_hf
+    max_flux = float(os.getenv("AUTODUB_TTS_MAX_SPECTRAL_FLUX", "0.45"))
+    max_pitch_jumps = float(os.getenv(
+        "AUTODUB_TTS_MAX_PITCH_JUMP_RATIO", "0.25"
+    ))
+    max_clipping = float(os.getenv("AUTODUB_TTS_MAX_CLIPPING_RATIO", "0.02"))
+    advanced_enabled = os.getenv(
+        "AUTODUB_TTS_ADVANCED_ARTIFACT_GATE_ENABLED", "1"
+    ).strip().lower() in {"1", "true", "yes", "y", "on"}
+    indicators = []
+    if sf > max_sf:
+        indicators.append(f"spectral_flatness={sf:.4f}>{max_sf}")
+    if hf > max_hf:
+        indicators.append(f"hf_energy_ratio={hf:.4f}>{max_hf}")
+    if advanced_enabled and float(metrics.get("spectral_flux") or 0.0) > max_flux:
+        indicators.append(
+            f"spectral_flux={float(metrics['spectral_flux']):.4f}>{max_flux}"
+        )
+    if advanced_enabled and float(metrics.get("pitch_jump_ratio") or 0.0) > max_pitch_jumps:
+        indicators.append(
+            "pitch_jump_ratio="
+            f"{float(metrics['pitch_jump_ratio']):.4f}>{max_pitch_jumps}"
+        )
+    if advanced_enabled and float(metrics.get("clipping_ratio") or 0.0) > max_clipping:
+        indicators.append(
+            f"clipping_ratio={float(metrics['clipping_ratio']):.4f}>{max_clipping}"
+        )
+    # One unusual metric is advisory; two independent artifact signals are
+    # required before spending another synthesis attempt.  After all retries,
+    # the same result becomes a ranking penalty rather than a pipeline stop.
+    failed = len(indicators) >= 2
     reason = ""
     if failed:
-        reason = (f"spectral_flatness={sf:.4f}>{max_sf} and "
-                  f"hf_energy_ratio={hf:.4f}>{max_hf}")
+        reason = "; ".join(indicators)
     return {"electricity_quality": "failed" if failed else "passed",
             "electricity_policy": policy,
             "electricity_reason": reason,
+            "electricity_artifact_indicators": indicators,
+            "advanced_artifact_gate_enabled": advanced_enabled,
             **metrics}
+
+
+def _voice_proxy_embedding(path):
+    """Return a lightweight timbre embedding for post-TTS consistency audit.
+
+    This is intentionally a proxy built from normalized MFCC statistics, not
+    a replacement for WeSpeaker clustering. It is language-independent enough
+    to catch gross reference/voice mismatches and remains advisory by default.
+    """
+    try:
+        import numpy as np
+        import librosa
+        y, sr = librosa.load(str(path), sr=16000, mono=True)
+    except Exception:
+        return None
+    if y is None or len(y) < 1600:
+        return None
+    try:
+        y, _ = librosa.effects.trim(y, top_db=35)
+        if len(y) < 1600:
+            return None
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+        delta = librosa.feature.delta(mfcc)
+        vector = np.concatenate([
+            np.mean(mfcc, axis=1),
+            np.std(mfcc, axis=1),
+            np.mean(delta, axis=1),
+            np.std(delta, axis=1),
+        ]).astype(float)
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 1e-9 else None
+    except Exception:
+        return None
+
+
+def voice_consistency_quality(reference_path, synthesized_path):
+    """Audit whether synthesized timbre remains close to its chosen reference.
+
+    Policy mirrors the electric-artifact gate. ``warn`` records the result;
+    ``block`` lets the router try its existing fallback chain. The conservative
+    default threshold should be calibrated with production samples before
+    enabling blocking.
+    """
+    global_policy = os.getenv(
+        "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY", "block"
+    ).strip().lower()
+    if global_policy == "off":
+        return {
+            "voice_consistency_quality": "skipped",
+            "voice_consistency_policy": "off",
+        }
+    reference, reference_backend = _preferred_voice_embedding(reference_path)
+    synthesized, synthesized_backend = _preferred_voice_embedding(synthesized_path)
+    backend = (
+        reference_backend
+        if reference_backend == synthesized_backend else "mfcc_proxy_fallback"
+    )
+    if backend == "wespeaker_simamresnet100":
+        policy = os.getenv(
+            "AUTODUB_TTS_WESPEAKER_VOICE_POLICY", "warn"
+        ).strip().lower()
+        minimum = float(os.getenv(
+            "AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY", "0.55"
+        ))
+        gross_minimum = float(os.getenv(
+            "AUTODUB_TTS_MIN_WESPEAKER_GROSS_VOICE_SIMILARITY", "0.30"
+        ))
+    else:
+        policy = global_policy
+        minimum = float(os.getenv(
+            "AUTODUB_TTS_MIN_VOICE_CONSISTENCY", "0.45"
+        ))
+        gross_minimum = float(os.getenv(
+            "AUTODUB_TTS_MIN_GROSS_VOICE_CONSISTENCY", "0.25"
+        ))
+    if policy == "off":
+        return {
+            "voice_consistency_quality": "skipped",
+            "voice_consistency_policy": policy,
+        }
+    if reference is None or synthesized is None:
+        return {
+            "voice_consistency_quality": "skipped",
+            "voice_consistency_policy": policy,
+            "voice_consistency_reason": "feature extraction unavailable",
+            "voice_consistency_backend": backend,
+        }
+    similarity = float(reference @ synthesized)
+    failed = similarity < minimum
+    gross_mismatch = similarity < min(minimum, gross_minimum)
+    quality = "passed"
+    effective_policy = "block" if gross_mismatch else policy
+    if gross_mismatch:
+        quality = "failed"
+    elif failed:
+        quality = "failed" if policy == "block" else "degraded"
+    return {
+        "voice_consistency_quality": quality,
+        "voice_consistency_policy": effective_policy,
+        "voice_consistency_similarity": round(similarity, 6),
+        "voice_consistency_threshold": minimum,
+        "voice_gross_mismatch": gross_mismatch,
+        "voice_gross_mismatch_threshold": gross_minimum,
+        "voice_consistency_backend": backend,
+        "voice_consistency_reason": (
+            (
+                f"gross_voice_mismatch={similarity:.4f}<"
+                f"{gross_minimum:.4f}"
+            )
+            if gross_mismatch else
+            f"voice_similarity={similarity:.4f}<{minimum:.4f}"
+            if failed else ""
+        ),
+    }
 
 
 def stage_fingerprint(state, config, backend):
     segments=[{k:s.get(k) for k in ("id","text","start","end","speaker","emotion","tts_engine",
-                                   "translation_request_fingerprint")} for s in state.get("segments_step3",[])]
+                                   "translation_request_fingerprint", "tts_placement_start",
+                                   "tts_hard_end", "tts_target_duration",
+                                   "tts_timing_precision", "tts_timing_reason",
+                                   "speaker_boundary_ambiguous",
+                                   "wespeaker_tts_embedding",
+                                   "wespeaker_tts_embedding_windows",
+                                   "wespeaker_tts_embedding_cohesion",
+                                   "translation_selection_source")} for s in state.get("segments_step3",[])]
     media={}
     for key in ("vocals_path","accomp_path"):
         path=Path(str(state.get(key) or ""))
         if path.is_file():
             info=path.stat()
             media[key]={"path":str(path.resolve()),"size":info.st_size,"mtime_ns":info.st_mtime_ns}
-    payload={"version":"tts-stage-v2.2.1","segments":segments,"media":media,"backend":backend,
+    payload={"version":"tts-stage-v2.11.0-adaptive-onset-voice-duration","segments":segments,"media":media,"backend":backend,
              "input_file":state.get("input_file"),
              "target_lang":str(config.target_lang).lower(),
-             "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs")))}
+             "separator":state.get("separator",state.get("separator_backend",os.getenv("AUTODUB_SEPARATOR","htdemucs"))),
+             "voice_policy":{
+                 "reference_mode":os.getenv("AUTODUB_TTS_REFERENCE_MODE","speaker"),
+                 "identity_reuse_mode":os.getenv("AUTODUB_TTS_IDENTITY_REUSE_MODE","apply"),
+                 "identity_similarity":os.getenv("AUTODUB_TTS_WESPEAKER_IDENTITY_SIMILARITY","0.78"),
+                 "identity_margin":os.getenv("AUTODUB_TTS_WESPEAKER_IDENTITY_MARGIN","0.06"),
+                 "candidate_policy":os.getenv("AUTODUB_TTS_WESPEAKER_VOICE_POLICY","warn"),
+                 "candidate_similarity":os.getenv("AUTODUB_TTS_MIN_WESPEAKER_VOICE_SIMILARITY","0.55"),
+                 "gross_candidate_similarity":os.getenv("AUTODUB_TTS_MIN_WESPEAKER_GROSS_VOICE_SIMILARITY","0.30"),
+                 "segment_identity_similarity":os.getenv("AUTODUB_TTS_SEGMENT_IDENTITY_REASSIGN_SIMILARITY","0.80"),
+                 "segment_identity_margin":os.getenv("AUTODUB_TTS_SEGMENT_IDENTITY_REASSIGN_MARGIN","0.05"),
+                 "local_component_similarity":os.getenv("AUTODUB_TTS_LOCAL_CONTINUITY_COMPONENT_MIN_SIMILARITY","0.74"),
+                 "preserve_sentence_start":os.getenv("AUTODUB_TTS_PRESERVE_SENTENCE_START","1"),
+                 "dominant_island_share":os.getenv("AUTODUB_TTS_DOMINANT_ISLAND_MIN_SHARE","0.65"),
+                 "trailing_island_leading_seconds":os.getenv("AUTODUB_TTS_TRAILING_ISLAND_MIN_LEADING_SECONDS","0.75"),
+                 "silence_absolute_dbfs":os.getenv("AUTODUB_TTS_SILENCE_THRESH_DBFS","-45"),
+                 "silence_relative_db":os.getenv("AUTODUB_TTS_SILENCE_RELATIVE_DB","16"),
+                 "silence_leading_pad_ms":os.getenv("AUTODUB_TTS_SILENCE_LEADING_PAD_MS","70"),
+                 "maximum_audible_leading_silence":os.getenv("AUTODUB_TTS_MAX_AUDIBLE_LEADING_SILENCE_SECONDS","0.18"),
+                 "maximum_safe_compression":os.getenv("AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO","1.25"),
+                 "maximum_safe_short_compression":os.getenv("AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO","1.18"),
+                 "hard_min_audio_seconds":os.getenv("AUTODUB_TTS_HARD_MIN_AUDIO_SECONDS","0.05"),
+                 "hard_min_signal_dbfs":os.getenv("AUTODUB_TTS_HARD_MIN_SIGNAL_DBFS","-70"),
+                 "maximum_spectral_flux":os.getenv("AUTODUB_TTS_MAX_SPECTRAL_FLUX","0.45"),
+                 "maximum_pitch_jump_ratio":os.getenv("AUTODUB_TTS_MAX_PITCH_JUMP_RATIO","0.25"),
+                 "maximum_clipping_ratio":os.getenv("AUTODUB_TTS_MAX_CLIPPING_RATIO","0.02"),
+                 "advanced_artifact_gate":os.getenv("AUTODUB_TTS_ADVANCED_ARTIFACT_GATE_ENABLED","1"),
+                 "segment_profile_reassignment":os.getenv("AUTODUB_TTS_SEGMENT_PROFILE_REASSIGN_ENABLED","1"),
+                 "local_component_guard":os.getenv("AUTODUB_TTS_LOCAL_COMPONENT_GUARD_ENABLED","1"),
+             }}
     return hashlib.sha256(json.dumps(payload,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
 
 
@@ -139,6 +901,28 @@ def validate_mix_state(state, config, *, allow_missing=False, filter_missing=Tru
         if result.get("status")!="success" or not path.is_file() or not path.stat().st_size:
             quality_issues.append(f"{sid}:missing or unsuccessful WAV")
             continue
+        if (
+            bool(result.get("reference_leakage_detected"))
+            or result.get("reference_leakage_quality") == "failed"
+        ):
+            quality_issues.append(f"{sid}:reference speech leakage detected")
+            continue
+        hard_audio = generated_audio_safety(path)
+        if hard_audio.get("generated_audio_safety") != "passed":
+            quality_issues.append(
+                f"{sid}:no usable generated waveform "
+                f"({hard_audio.get('generated_audio_safety_reason', '')})"
+            )
+            continue
+        if (
+            result.get("audible_speech_quality") != "passed"
+            and not bool(result.get("agent_degraded_candidate"))
+        ):
+            quality_issues.append(
+                f"{sid}:audible speech audit failed or missing "
+                f"({result.get('audible_speech_reason', 'not audited')})"
+            )
+            continue
         try:
             if _wav_duration(path)<=0:
                 quality_issues.append(f"{sid}:empty WAV")
@@ -158,13 +942,27 @@ def validate_mix_state(state, config, *, allow_missing=False, filter_missing=Tru
     if integrity_issues:
         raise RuntimeError("Step5 blocked by integrity error: " + "; ".join(integrity_issues))
     if quality_issues:
-        print("⚠️ Step5 发现可降级的 TTS 缺失:",quality_issues)
+        if not allow_missing:
+            raise RuntimeError(
+                "Step5 blocked by incomplete TTS; rerun Step4 or explicitly "
+                "pass --allow-missing-tts: " + "; ".join(quality_issues)
+            )
+        print("⚠️ Step5 将按成片降级策略处理 TTS 缺失:",quality_issues)
         # Only verified readable clips may reach the mixer.
         if filter_missing:
             valid=[]
             for c in clips:
                 try:
-                    if _wav_duration(Path(c["file"]))>0:
+                    sid = str(c.get("segment_id"))
+                    result = results.get(sid, {})
+                    path = Path(c["file"])
+                    hard_audio = generated_audio_safety(path)
+                    if (
+                        _wav_duration(path)>0
+                        and hard_audio.get("generated_audio_safety") == "passed"
+                        and not bool(result.get("reference_leakage_detected"))
+                        and result.get("reference_leakage_quality") != "failed"
+                    ):
                         valid.append(c)
                 except Exception:
                     pass

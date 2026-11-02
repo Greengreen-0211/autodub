@@ -8,10 +8,32 @@ SAD mask.  It never creates sentence boundaries by itself.
 from __future__ import annotations
 
 import math
+import os
+import re
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 
 TimeRange = Tuple[float, float]
+
+
+def _spoken_duration_prior(text: Any) -> Tuple[float, float]:
+    """Return a soft centre/ceiling for detecting impossible word spans.
+
+    This never creates a timestamp on its own.  It only prevents an ambiguous
+    five-word sentence from inheriting several seconds of unrelated activity.
+    """
+    value = str(text or "")
+    cjk = len(re.findall(r"[\u3400-\u9fff]", value))
+    words = len(re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)?", value))
+    if cjk:
+        centre = cjk / 4.2
+    elif words:
+        centre = words / 2.5
+    else:
+        centre = max(0.35, len(value.strip()) / 8.0)
+    centre = max(0.35, centre)
+    ceiling = max(0.75, centre * 1.65 + 0.15)
+    return centre, ceiling
 
 
 def merge_ranges(ranges: Iterable[TimeRange], max_gap: float = 0.0) -> List[TimeRange]:
@@ -75,6 +97,516 @@ def intersect_ranges(
     return intersections
 
 
+def fuse_speech_regions(
+    primary: Sequence[TimeRange],
+    secondary: Sequence[TimeRange],
+    *,
+    edge_extension: float = 0.18,
+) -> List[TimeRange]:
+    """Use the source track to restore clipped vocal edges, not add music.
+
+    Demucs vocals are the authoritative activity detector.  A source-track
+    region may only extend an already detected vocal island by a small amount;
+    an unrelated source-only region can therefore never create an early dub.
+    """
+    fused: List[TimeRange] = []
+    secondary_ranges = merge_ranges(secondary, max_gap=0.08)
+    for start, end in merge_ranges(primary, max_gap=0.08):
+        refined_start, refined_end = start, end
+        for other_start, other_end in secondary_ranges:
+            if other_end < start - edge_extension or other_start > end + edge_extension:
+                continue
+            refined_start = min(refined_start, max(start - edge_extension, other_start))
+            refined_end = max(refined_end, min(end + edge_extension, other_end))
+        fused.append((refined_start, refined_end))
+    return merge_ranges(fused, max_gap=0.10)
+
+
+def attach_precise_tts_placement(
+    segments: Sequence[Mapping[str, Any]],
+    speech_ranges: Sequence[TimeRange],
+    *,
+    word_gap_seconds: float = 0.42,
+    pre_roll: float = 0.06,
+    post_roll: float = 0.08,
+    max_onset_shift_seconds: float | None = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Attach an ideal speech duration and a separate collision boundary.
+
+    Public sentence bounds remain immutable.  Long pauses between aligned
+    words are retained as diagnostics but are not counted as speech that a
+    translation must fill.  Acoustic activity refines both the natural-duration
+    estimate and, when the evidence is strong, the playback anchor.  Short
+    contiguous sentences stay at their public boundary so alignment refinement
+    plus TTS-internal silence cannot make them late.  A dominant lexical island
+    after a long pause, or aligned words concentrated at the tail of a long
+    outer interval, instead uses its evidenced audible onset.  Anchoring either
+    shape at the public boundary makes the translated line audibly early.
+    """
+    if max_onset_shift_seconds is None:
+        max_onset_shift_seconds = float(os.getenv(
+            "AUTODUB_TTS_MAX_ONSET_SHIFT_SECONDS", "0.30"
+        ))
+    max_onset_shift_seconds = max(0.0, float(max_onset_shift_seconds))
+    preserve_sentence_start = os.getenv(
+        "AUTODUB_TTS_PRESERVE_SENTENCE_START", "1"
+    ).strip().lower() in {"1", "true", "yes", "y", "on"}
+    active = merge_ranges(speech_ranges, max_gap=0.10)
+    output: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    for source in segments:
+        segment = dict(source)
+        if str(segment.get("timestamp_precision") or "").lower() != "word":
+            output.append(segment)
+            continue
+        items = []
+        for collection in (
+            segment.get("qwen3_time_stamps") or [],
+            segment.get("speaker_timing_time_stamps") or [],
+        ):
+            for item in collection:
+                if not isinstance(item, Mapping):
+                    continue
+                try:
+                    start = float(item.get("start"))
+                    end = float(item.get("end", start))
+                except (TypeError, ValueError):
+                    continue
+                if end > start and str(item.get("text", "")).strip():
+                    items.append((start, end))
+        if not items:
+            output.append(segment)
+            continue
+        outer_start = float(segment.get("start", 0.0))
+        outer_end = float(segment.get("end", outer_start))
+        word_ranges = merge_ranges(
+            [
+                (max(outer_start, start), min(outer_end, end))
+                for start, end in items
+                if end > outer_start and start < outer_end
+            ],
+            max_gap=float(word_gap_seconds),
+        )
+        if not word_ranges:
+            output.append(segment)
+            continue
+        internal_pause_threshold = max(
+            float(word_gap_seconds),
+            float(os.getenv(
+                "AUTODUB_TTS_DOMINANT_ISLAND_MIN_PAUSE_SECONDS", "1.00"
+            )),
+        )
+        internal_pauses = [
+            [round(left[1], 3), round(right[0], 3)]
+            for left, right in zip(word_ranges, word_ranges[1:])
+            if right[0] - left[1] > float(word_gap_seconds)
+        ]
+        long_internal_pauses = [
+            (left, right)
+            for left, right in zip(word_ranges, word_ranges[1:])
+            if right[0] - left[1] >= internal_pause_threshold
+        ]
+        word_start = word_ranges[0][0]
+        word_end = word_ranges[-1][1]
+        acoustic = intersect_ranges(active, [(word_start - 0.25, word_end + 0.25)])
+        onset = max(outer_start, word_start - float(pre_roll))
+        # ``aligned_end`` is evidence for how long the source actually spoke;
+        # it is not the physical end of the dubbing slot.  Keeping those two
+        # concepts in one variable used to collapse a short interjection to a
+        # 0.15 s hard window even when the sentence owned trailing silence.
+        # The router will still clip the physical window at the next dub onset,
+        # so exposing the remainder of this sentence cannot create a new
+        # collision.
+        aligned_end = min(outer_end, word_end + float(post_roll))
+        hard_end = aligned_end
+        if acoustic:
+            first_acoustic = acoustic[0][0]
+            if abs(first_acoustic - word_start) <= 0.25:
+                # Energy VAD frequently starts after an unvoiced consonant.
+                # It may refine a loose pre-roll but must never push dubbing
+                # past the first aligned word onset and make a short line late.
+                onset = min(word_start, max(onset, first_acoustic - 0.03))
+        ambiguous = bool(segment.get("speaker_boundary_ambiguous"))
+        duration_centre, duration_ceiling = _spoken_duration_prior(
+            segment.get("text", "")
+        )
+        original_onset = onset
+        leading_slack_used = 0.0
+        dominant_word_island = None
+        dominant_island_mode = False
+        if long_internal_pauses:
+            # A translated sentence is synthesized as one continuous clip. If
+            # most source speech lives after a long pause, starting that clip
+            # at the outer sentence boundary moves its main meaning several
+            # seconds early. Keep the island in diagnostics even when it is
+            # not dominant enough to move the final anchor.
+            dominant_index, dominant_range = max(
+                enumerate(word_ranges),
+                key=lambda indexed: (
+                    indexed[1][1] - indexed[1][0],
+                    indexed[0],
+                ),
+            )
+            dominant_start, dominant_end = dominant_range
+            dominant_word_island = {
+                "index": dominant_index,
+                "start": round(dominant_start, 3),
+                "end": round(dominant_end, 3),
+                "duration": round(dominant_end - dominant_start, 3),
+            }
+            total_word_activity = sum(
+                max(0.0, end - start) for start, end in word_ranges
+            )
+            dominant_share = (
+                (dominant_end - dominant_start) / total_word_activity
+                if total_word_activity > 0.0 else 0.0
+            )
+            dominant_word_island["activity_share"] = round(
+                dominant_share, 4
+            )
+            dominant_activity = intersect_ranges(
+                active,
+                [(dominant_start - 0.25, dominant_end + 0.25)],
+            )
+            dominant_island_mode = bool(
+                dominant_activity
+                and dominant_index > 0
+                and dominant_start - outer_start >= float(os.getenv(
+                    "AUTODUB_TTS_DOMINANT_ISLAND_MIN_OFFSET_SECONDS", "0.80"
+                ))
+                and dominant_share >= float(os.getenv(
+                    "AUTODUB_TTS_DOMINANT_ISLAND_MIN_SHARE", "0.65"
+                ))
+            )
+        # A complete short sentence can own useful silence before its first
+        # aligned word.  When the remaining slot is shorter than a conservative
+        # pronunciation prior, borrow only the amount required, stay inside
+        # the immutable sentence boundary, and cap the advance.  Ambiguous
+        # speaker boundaries never receive this adjustment.
+        available_after_onset = max(0.0, outer_end - onset)
+        needed_leading_slack = max(
+            0.0,
+            min(duration_centre, outer_end - outer_start)
+            - available_after_onset,
+        )
+        if not ambiguous and needed_leading_slack > 0.0:
+            maximum_leading_slack = max(
+                0.0,
+                float(os.getenv(
+                    "AUTODUB_TTS_MAX_LEADING_SLACK_SECONDS", "0.35"
+                )),
+            )
+            leading_slack_used = min(
+                needed_leading_slack,
+                maximum_leading_slack,
+                max(0.0, onset - outer_start),
+            )
+            onset -= leading_slack_used
+        speech_islands = intersect_ranges(active, [(onset, aligned_end)]) or (
+            [tuple(word_ranges[dominant_word_island["index"]])]
+            if dominant_island_mode and dominant_word_island is not None
+            else word_ranges
+        )
+        timing_reason = "word_vad_consensus"
+        ratio_guard = None
+        word_span = max(0.0, word_end - word_start)
+        # Speaker ambiguity means the inherited word skeleton may still be
+        # structurally valid while owning activity from a neighbouring turn.
+        # When its span is implausible for the sentence, retain the median word
+        # anchor but limit it to a local acoustic window.  Public sentence
+        # bounds remain untouched.
+        if ambiguous and word_span > duration_ceiling and not dominant_island_mode:
+            midpoints = sorted((start + end) / 2.0 for start, end in items)
+            word_centre = midpoints[len(midpoints) // 2]
+            guarded_duration = min(
+                duration_ceiling,
+                max(0.45, duration_centre * 1.25),
+            )
+            guarded_start = max(
+                outer_start,
+                word_centre - guarded_duration / 2.0,
+            )
+            guarded_end = min(
+                outer_end,
+                guarded_start + guarded_duration,
+            )
+            if guarded_end - guarded_start < guarded_duration:
+                guarded_start = max(outer_start, guarded_end - guarded_duration)
+            guarded_activity = intersect_ranges(
+                speech_islands, [(guarded_start, guarded_end)]
+            )
+            if guarded_activity:
+                onset = max(
+                    outer_start,
+                    guarded_activity[0][0] - float(pre_roll),
+                )
+                hard_end = min(
+                    outer_end,
+                    guarded_activity[-1][1] + float(post_roll),
+                )
+                speech_islands = guarded_activity
+            else:
+                onset, hard_end = guarded_start, guarded_end
+                speech_islands = [(guarded_start, guarded_end)]
+            timing_reason = "ambiguous_word_span_ratio_guard"
+            aligned_end = hard_end
+            ratio_guard = {
+                "word_span": round(word_span, 3),
+                "text_duration_centre": round(duration_centre, 3),
+                "text_duration_ceiling": round(duration_ceiling, 3),
+                "guarded_start": round(onset, 3),
+                "guarded_end": round(hard_end, 3),
+            }
+        # OCR is never a free-standing playback timestamp.  When a stable
+        # subtitle observation and an independent VAD island agree, however,
+        # they can resolve a word-alignment island conflict inside a long
+        # sentence window.  This is intentionally limited to large conflicts
+        # and bounded movement so ordinary precise timestamps remain intact.
+        ocr_vad_fusion = None
+        try:
+            ocr_first_seen = float(segment.get("ocr_subtitle_first_seen"))
+        except (TypeError, ValueError):
+            ocr_first_seen = None
+        try:
+            ocr_last_seen = float(segment.get("ocr_subtitle_last_seen"))
+        except (TypeError, ValueError):
+            ocr_last_seen = None
+        try:
+            ocr_frames = int(segment.get("ocr_recovery_frame_count") or 0)
+        except (TypeError, ValueError):
+            ocr_frames = 0
+        try:
+            ocr_confidence = float(
+                segment.get("ocr_timing_confidence")
+                or segment.get("ocr_correction_confidence")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            ocr_confidence = 0.0
+        stable_ocr_timing = bool(
+            ocr_first_seen is not None
+            and (ocr_frames >= 2 or ocr_confidence >= 0.80)
+        )
+        if stable_ocr_timing and timing_reason != "ambiguous_word_span_ratio_guard":
+            tolerance = float(os.getenv(
+                "AUTODUB_TTS_OCR_VAD_TIMING_TOLERANCE_SECONDS", "0.70"
+            ))
+            maximum_move = float(os.getenv(
+                "AUTODUB_TTS_OCR_VAD_MAX_ONSET_MOVE_SECONDS", "2.00"
+            ))
+            minimum_conflict = float(os.getenv(
+                "AUTODUB_TTS_OCR_VAD_MIN_WORD_CONFLICT_SECONDS", "1.00"
+            ))
+            outer_activity = intersect_ranges(active, [(outer_start, outer_end)])
+            hint_end = (
+                ocr_last_seen if ocr_last_seen is not None
+                else ocr_first_seen + tolerance
+            )
+            candidates = [
+                interval for interval in outer_activity
+                if interval[1] >= ocr_first_seen - tolerance
+                and interval[0] <= hint_end + tolerance
+            ]
+            if candidates:
+                selected = min(
+                    candidates,
+                    key=lambda interval: (
+                        0.0
+                        if interval[0] <= ocr_first_seen <= interval[1]
+                        else abs(interval[0] - ocr_first_seen),
+                        interval[0],
+                    ),
+                )
+                candidate_onset = max(
+                    outer_start, float(selected[0]) - float(pre_roll)
+                )
+                conflict = abs(float(selected[0]) - word_start)
+                movement = abs(candidate_onset - onset)
+                if conflict >= minimum_conflict and movement <= maximum_move:
+                    onset = candidate_onset
+                    aligned_end = min(
+                        outer_end, float(selected[1]) + float(post_roll)
+                    )
+                    speech_islands = [selected]
+                    timing_reason = "ocr_vad_word_conflict_consensus"
+                    ocr_vad_fusion = {
+                        "subtitle_first_seen": round(ocr_first_seen, 3),
+                        "subtitle_last_seen": (
+                            round(ocr_last_seen, 3)
+                            if ocr_last_seen is not None else None
+                        ),
+                        "selected_vad_island": [
+                            round(float(selected[0]), 3),
+                            round(float(selected[1]), 3),
+                        ],
+                        "word_vad_conflict_seconds": round(conflict, 3),
+                        "onset_movement_seconds": round(movement, 3),
+                    }
+        # Public sentence bounds are immutable, but they are not always the
+        # audible onset. Keep the boundary anchor for ordinary/short lines and
+        # move it only when word alignment and VAD provide strong structural
+        # evidence. This avoids both the old blanket +0.30 s delay and the
+        # newer failure where speech at the end of a multi-second interval was
+        # played from the interval's beginning.
+        unbounded_onset = onset
+        outer_duration = max(0.0, outer_end - outer_start)
+        leading_word_gap = max(0.0, word_start - outer_start)
+        trailing_word_gap = max(0.0, outer_end - word_end)
+        trailing_word_island_mode = bool(
+            acoustic
+            and not dominant_island_mode
+            and outer_duration >= float(os.getenv(
+                "AUTODUB_TTS_TRAILING_ISLAND_MIN_OUTER_SECONDS", "2.00"
+            ))
+            and leading_word_gap >= float(os.getenv(
+                "AUTODUB_TTS_TRAILING_ISLAND_MIN_LEADING_SECONDS", "0.75"
+            ))
+            and trailing_word_gap <= float(os.getenv(
+                "AUTODUB_TTS_TRAILING_ISLAND_MAX_TRAILING_SECONDS", "0.45"
+            ))
+        )
+        if preserve_sentence_start:
+            if timing_reason == "ambiguous_word_span_ratio_guard":
+                # The guard exists specifically because the inherited word
+                # span is not credible as one continuous utterance. Do not
+                # erase its local acoustic anchor by forcing the outer start.
+                onset = unbounded_onset
+            elif timing_reason == "ocr_vad_word_conflict_consensus":
+                onset = unbounded_onset
+            elif dominant_island_mode and dominant_word_island is not None:
+                onset = max(
+                    outer_start,
+                    float(dominant_word_island["start"]) - float(pre_roll),
+                )
+                timing_reason = "dominant_island_after_long_pause"
+            elif trailing_word_island_mode:
+                onset = unbounded_onset
+                timing_reason = "trailing_word_island_consensus"
+            else:
+                onset = outer_start
+                timing_reason = "sentence_start_anchor"
+        else:
+            onset_ceiling = min(
+                outer_end,
+                outer_start + max_onset_shift_seconds,
+            )
+            onset = min(onset, onset_ceiling)
+            timing_reason = "legacy_bounded_word_vad_shift"
+        sentence_start_anchored = abs(onset - outer_start) <= 1e-9
+        onset_shift_limited = onset < unbounded_onset - 1e-9
+        effective = sum(max(0.0, end - start) for start, end in speech_islands)
+        word_effective = sum(max(0.0, end - start) for start, end in word_ranges)
+        # Energy VAD can clip unvoiced consonants.  Never budget less than the
+        # aligned word evidence, while still removing long internal silence.
+        if timing_reason == "ambiguous_word_span_ratio_guard":
+            # The word span is the evidence being rejected; do not re-expand
+            # the target duration from that same span.
+            effective = min(
+                max(effective, min(duration_centre, hard_end - onset)),
+                hard_end - onset,
+            )
+        else:
+            effective = max(effective, word_effective)
+        # A word/VAD span may be shorter than a humanly pronounceable version
+        # of the complete sentence (especially unvoiced consonants and one-word
+        # turns).  It remains a natural-duration target, not permission to
+        # overlap the next turn.
+        minimum_basis = (
+            word_effective + float(pre_roll) + float(post_roll)
+            if dominant_island_mode else duration_centre
+        )
+        minimum_pronounceable = min(
+            max(0.1, minimum_basis),
+            max(0.1, outer_end - onset),
+        )
+        effective = max(effective + pre_roll + post_roll, minimum_pronounceable)
+        effective = min(max(0.1, effective), max(0.1, outer_end - onset))
+        # Make trailing silence owned by the sentence available for fitting.
+        # The chronological collision pass in TTSRouter remains authoritative
+        # and will reduce this to the next onset when necessary.
+        hard_end = outer_end
+        segment.update({
+            "tts_placement_start": round(onset, 3),
+            "tts_hard_end": round(hard_end, 3),
+            "tts_target_duration": round(effective, 3),
+            "tts_aligned_speech_end": round(aligned_end, 3),
+            "tts_minimum_pronounceable_duration": round(
+                minimum_pronounceable, 3
+            ),
+            "tts_original_placement_start": round(original_onset, 3),
+            "tts_unbounded_placement_start": round(unbounded_onset, 3),
+            "tts_sentence_anchor_start": round(outer_start, 3),
+            "tts_sentence_start_anchored": sentence_start_anchored,
+            "tts_sentence_start_policy_enabled": preserve_sentence_start,
+            "tts_leading_word_gap": round(leading_word_gap, 3),
+            "tts_trailing_word_gap": round(trailing_word_gap, 3),
+            "tts_trailing_word_island_mode": trailing_word_island_mode,
+            "tts_max_onset_shift_seconds": round(max_onset_shift_seconds, 3),
+            "tts_onset_shift_limited": onset_shift_limited,
+            "tts_leading_slack_used": round(leading_slack_used, 3),
+            "tts_leading_slack_policy": (
+                "bounded_sentence_internal_leading_slack"
+                if leading_slack_used > 0.0 else "not_needed"
+            ),
+            "tts_dominant_word_island": dominant_word_island,
+            "tts_speech_islands": [
+                [round(start, 3), round(end, 3)] for start, end in speech_islands
+            ],
+            "tts_internal_pauses": internal_pauses,
+            "tts_timing_precision": "word_vad_consensus",
+            "tts_timing_confidence": round(
+                (
+                    0.58
+                    if timing_reason == "ambiguous_word_span_ratio_guard"
+                    else 0.90
+                    if timing_reason == "dominant_island_after_long_pause"
+                    else 0.86
+                    if timing_reason == "ocr_vad_word_conflict_consensus"
+                    else 0.88
+                    if timing_reason == "trailing_word_island_consensus"
+                    else (
+                        0.72 if ambiguous
+                        else min(
+                            0.98,
+                            0.82
+                            + (0.12 if acoustic else 0.0)
+                            - (0.06 if leading_slack_used > 0.0 else 0.0),
+                        )
+                    )
+                ), 4
+            ),
+            "tts_timing_reason": timing_reason,
+            "tts_timing_ratio_guard": ratio_guard,
+            "tts_ocr_vad_fusion": ocr_vad_fusion,
+        })
+        audit.append({
+            "segment_id": str(segment.get("id")),
+            "precision": "word_vad_consensus",
+            "placement_start": round(onset, 3),
+            "hard_end": round(hard_end, 3),
+            "target_speech_duration": round(effective, 3),
+            "original_placement_start": round(original_onset, 3),
+            "unbounded_placement_start": round(unbounded_onset, 3),
+            "sentence_anchor_start": round(outer_start, 3),
+            "sentence_start_anchored": sentence_start_anchored,
+            "sentence_start_policy_enabled": preserve_sentence_start,
+            "leading_word_gap": round(leading_word_gap, 3),
+            "trailing_word_gap": round(trailing_word_gap, 3),
+            "trailing_word_island_mode": trailing_word_island_mode,
+            "max_onset_shift_seconds": round(max_onset_shift_seconds, 3),
+            "onset_shift_limited": onset_shift_limited,
+            "leading_slack_used": round(leading_slack_used, 3),
+            "dominant_word_island": dominant_word_island,
+            "speech_islands": segment["tts_speech_islands"],
+            "internal_pauses": internal_pauses,
+            "timing_reason": timing_reason,
+            "ratio_guard": ratio_guard,
+            "ocr_vad_fusion": ocr_vad_fusion,
+        })
+        output.append(segment)
+    return output, audit
+
+
 def attach_coarse_tts_placement(
     segments: Sequence[Mapping[str, Any]],
     speech_ranges: Sequence[TimeRange],
@@ -83,6 +615,8 @@ def attach_coarse_tts_placement(
     post_roll: float = 0.08,
     subtitle_tolerance: float = 0.70,
     min_activity: float = 0.16,
+    hard_silence_seconds: float = 0.75,
+    ocr_max_lead_seconds: float | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Attach acoustic TTS windows only to coarse recovered dialogue.
 
@@ -91,14 +625,21 @@ def attach_coarse_tts_placement(
     activity. Precise ASR segments never receive these internal fields.
     """
     active = merge_ranges(speech_ranges, max_gap=0.10)
+    if ocr_max_lead_seconds is None:
+        ocr_max_lead_seconds = float(os.getenv(
+            "AUTODUB_COARSE_TTS_OCR_MAX_LEAD_SECONDS", "0.35"
+        ))
+    ocr_max_lead_seconds = max(0.0, float(ocr_max_lead_seconds))
     output: List[Dict[str, Any]] = []
     audit: List[Dict[str, Any]] = []
     for source in segments:
         segment = dict(source)
-        if not (
+        precision = str(segment.get("timestamp_precision") or "").lower()
+        recovery_coarse = (
             str(segment.get("asr_recovery_status") or "") == "accepted_coarse"
-            and str(segment.get("timestamp_precision") or "") == "coarse"
-        ):
+            and precision == "coarse"
+        )
+        if precision not in {"coarse", "unusable"}:
             output.append(segment)
             continue
 
@@ -156,7 +697,63 @@ def attach_coarse_tts_placement(
                     ),
                 )
 
-        selected = overlaps[first_index:]
+        if recovery_coarse:
+            # OCR recovery may cover only one dialogue island inside a wider
+            # unresolved interval. Keep the contiguous island group nearest
+            # its subtitle hint and expose the remainder for local recovery.
+            selected = [overlaps[first_index]]
+            for candidate in overlaps[first_index + 1:]:
+                if candidate[0] - selected[-1][1] >= float(hard_silence_seconds):
+                    break
+                selected.append(candidate)
+            excluded = overlaps[first_index + len(selected):]
+        else:
+            # A primary ASR sentence without word timestamps already owns its
+            # full outer interval. Use all acoustic islands for its speech
+            # budget, while retaining long pauses as non-speaking time.
+            selected = overlaps
+            excluded = []
+
+        # A stable subtitle may appear slightly before the spoken line, but a
+        # long activity island that begins much earlier is commonly residual
+        # vocals, a breath, or a neighbouring utterance.  OCR is not allowed to
+        # create a timestamp; it may only trim the unsupported leading part of
+        # an already selected acoustic island.  Apply this guard only to
+        # accepted coarse recovery, require repeated OCR observations, and
+        # require the selected span to be implausibly long for the recovered
+        # text.  Public start/end and speaker metadata remain immutable.
+        ocr_lead_guard = None
+        try:
+            ocr_frame_count = int(segment.get("ocr_recovery_frame_count") or 0)
+        except (TypeError, ValueError):
+            ocr_frame_count = 0
+        duration_centre, duration_ceiling = _spoken_duration_prior(
+            segment.get("text", "")
+        )
+        if recovery_coarse and hint is not None and ocr_frame_count >= 2 and selected:
+            selected_start = float(selected[0][0])
+            selected_end = float(selected[-1][1])
+            supported_lead_start = max(
+                outer_start, float(hint) - ocr_max_lead_seconds
+            )
+            if (
+                selected_start < supported_lead_start
+                and selected_end - selected_start > duration_ceiling
+            ):
+                trimmed = intersect_ranges(
+                    selected, [(supported_lead_start, selected_end)]
+                )
+                trimmed_activity = sum(end - start for start, end in trimmed)
+                if trimmed and trimmed_activity >= float(min_activity):
+                    ocr_lead_guard = {
+                        "original_acoustic_start": round(selected_start, 3),
+                        "guarded_acoustic_start": round(float(trimmed[0][0]), 3),
+                        "subtitle_first_seen": round(float(hint), 3),
+                        "maximum_subtitle_lead": round(ocr_max_lead_seconds, 3),
+                        "spoken_duration_centre": round(duration_centre, 3),
+                        "spoken_duration_ceiling": round(duration_ceiling, 3),
+                    }
+                    selected = trimmed
         active_duration = sum(end - start for start, end in selected)
         if active_duration < float(min_activity):
             record.update(
@@ -189,9 +786,31 @@ def attach_coarse_tts_placement(
                 "speech_anchor_end": round(acoustic_end, 3),
                 "tts_placement_start": round(placement_start, 3),
                 "tts_placement_end": round(placement_end, 3),
+                "tts_hard_end": round(placement_end, 3),
+                "tts_target_duration": round(
+                    min(
+                        placement_end - placement_start,
+                        max(
+                            float(min_activity),
+                            active_duration + float(pre_roll) + float(post_roll),
+                        ),
+                    ), 3
+                ),
                 "tts_available_end": round(outer_end, 3),
+                "tts_speech_islands": [
+                    [round(start, 3), round(end, 3)] for start, end in selected
+                ],
+                "tts_timing_precision": (
+                    "coarse_recovery_vad" if recovery_coarse
+                    else "coarse_primary_vad"
+                ),
                 "recovery_timing_method": "vocal_activity_with_ocr_soft_hint",
                 "recovery_timing_confidence": round(confidence, 4),
+                "coarse_timing_ocr_lead_guard": ocr_lead_guard,
+                "coarse_timing_excluded_islands": [
+                    [round(start, 3), round(end, 3)] for start, end in excluded
+                ],
+                "coarse_timing_requires_local_recovery": bool(excluded),
             }
         )
         record.update(
@@ -204,6 +823,10 @@ def attach_coarse_tts_placement(
             available_end=round(outer_end, 3),
             active_duration=round(active_duration, 3),
             confidence=round(confidence, 4),
+            ocr_lead_guard=ocr_lead_guard,
+            excluded_islands=[
+                [round(start, 3), round(end, 3)] for start, end in excluded
+            ],
         )
         audit.append(record)
         output.append(segment)
