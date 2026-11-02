@@ -305,6 +305,106 @@ class TranslationTests(unittest.TestCase):
             "preferred_if_complete",
         )
 
+    def test_exact_repeated_ocr_is_primary_when_independent_audit_is_unavailable(self):
+        segment = source(text="The scene-dependent line is complete.")
+        segment["_ocr_translation_references"] = [{
+            "source_text": "The scene-dependent line is complete.",
+            "target_text": "这是符合场景的自然说法。",
+            "confidence": "high",
+            "reference_tier": "exact",
+            "reference_policy": "direct",
+            "source_coverage": 1.0,
+            "missing_rate": 0.0,
+            "extra_rate": 0.0,
+            "frame_support": 3,
+            "adaptive_time_match": False,
+            "composed": False,
+        }]
+
+        def request(_items):
+            row = translation(0)
+            row.update({
+                "text": "这是机器生成的一句直译。",
+                "translations_candidates": [
+                    {"text": "这是机器生成的一句直译。"},
+                    {"text": "这是另一句完整的机器译文。"},
+                ],
+            })
+            # Simulate an otherwise valid translation response whose separate
+            # OCR audit call was unavailable. Exact repeated backend evidence
+            # is still strong enough to preserve the human subtitle.
+            return {"translations": [row]}
+
+        rows = translate_segments(
+            [segment], "en", "zh", "test", request, retries=0
+        )
+        self.assertEqual(rows[0]["text"], "这是符合场景的自然说法。")
+        self.assertEqual(rows[0]["translation_selection_source"], "ocr_direct")
+        self.assertEqual(rows[0]["translation_ocr_action"], "backend_direct")
+        self.assertTrue(any(
+            "backend_exact_repeated_source_boundary" in note
+            for note in rows[0]["translation_ocr_admission"]
+        ))
+
+    def test_partial_ocr_without_audit_remains_reference_only(self):
+        segment = source()
+        segment["_ocr_translation_references"] = [{
+            "source_text": segment["text"],
+            "target_text": "这是字幕提供的参考表达。",
+            "confidence": "high",
+            "reference_tier": "trusted",
+            "reference_policy": "repair_or_compress",
+            "source_coverage": 0.90,
+            "missing_rate": 0.08,
+            "extra_rate": 0.02,
+            "frame_support": 3,
+        }]
+
+        rows = translate_segments(
+            [segment], "en", "zh", "test",
+            lambda _items: {"translations": [translation(0)]},
+            retries=0,
+        )
+        self.assertNotEqual(rows[0]["text"], "这是字幕提供的参考表达。")
+        self.assertFalse(str(
+            rows[0].get("translation_selection_source") or ""
+        ).startswith("ocr_"))
+
+    def test_exact_ocr_never_overrides_an_explicit_semantic_conflict(self):
+        segment = source()
+        segment["_ocr_translation_references"] = [{
+            "source_text": segment["text"],
+            "target_text": "这是含有错误否定的字幕。",
+            "confidence": "high",
+            "reference_tier": "exact",
+            "reference_policy": "direct",
+            "source_coverage": 1.0,
+            "missing_rate": 0.0,
+            "extra_rate": 0.0,
+            "frame_support": 3,
+            "adaptive_time_match": False,
+            "composed": False,
+        }]
+
+        def request(_items):
+            row = translation(0)
+            row["_ocr_candidate_audit"] = {
+                "raw": {
+                    "hard_conflicts": ["wrong_negation"],
+                    "semantic_equivalent": False,
+                }
+            }
+            return {"translations": [row]}
+
+        rows = translate_segments(
+            [segment], "en", "zh", "test", request, retries=0
+        )
+        self.assertNotEqual(rows[0]["text"], "这是含有错误否定的字幕。")
+        self.assertIn(
+            "wrong_negation",
+            " ".join(rows[0]["translation_ocr_admission"]),
+        )
+
     def test_language_and_identity_rules(self):
         for text,target in (("Any","zh"),("中文 sentence","en"),("","en"),("Hello","ja")):
             with self.assertRaises(ValueError): validate_target_text(text,target)

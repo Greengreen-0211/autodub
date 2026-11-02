@@ -207,6 +207,60 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertAlmostEqual(ideal, 2.94)
         self.assertAlmostEqual(available, 2.94)
 
+    def test_stable_ocr_trims_implausible_leading_activity_without_mutating_step2(self):
+        segment = {
+            "id": 70,
+            "start": 40.0,
+            "end": 50.0,
+            "text": "Do the magic!",
+            "speaker": "SPEAKER_07",
+            "asr_recovery_status": "accepted_coarse",
+            "timestamp_precision": "coarse",
+            "ocr_subtitle_first_seen": 43.0,
+            "ocr_recovery_frame_count": 3,
+        }
+        refined, audit = attach_coarse_tts_placement(
+            [segment], [(40.2, 46.2)], ocr_max_lead_seconds=0.35
+        )
+        row = refined[0]
+        self.assertEqual(row["start"], 40.0)
+        self.assertEqual(row["end"], 50.0)
+        self.assertEqual(row["speaker"], "SPEAKER_07")
+        self.assertEqual(row["tts_placement_start"], 42.59)
+        self.assertEqual(row["speech_anchor_start"], 42.65)
+        self.assertEqual(
+            row["coarse_timing_ocr_lead_guard"]["original_acoustic_start"],
+            40.2,
+        )
+        self.assertEqual(
+            audit[0]["ocr_lead_guard"]["guarded_acoustic_start"], 42.65
+        )
+
+    def test_ocr_lead_guard_requires_repeated_frames_and_implausible_span(self):
+        base = {
+            "id": 71,
+            "start": 40.0,
+            "end": 50.0,
+            "text": "Do the magic!",
+            "speaker": "SPEAKER_03",
+            "asr_recovery_status": "accepted_coarse",
+            "timestamp_precision": "coarse",
+            "ocr_subtitle_first_seen": 43.0,
+        }
+        one_frame = dict(base, ocr_recovery_frame_count=1)
+        refined, _ = attach_coarse_tts_placement(
+            [one_frame], [(40.2, 46.2)], ocr_max_lead_seconds=0.35
+        )
+        self.assertEqual(refined[0]["tts_placement_start"], 40.14)
+        self.assertIsNone(refined[0]["coarse_timing_ocr_lead_guard"])
+
+        short_span = dict(base, ocr_recovery_frame_count=3)
+        refined, _ = attach_coarse_tts_placement(
+            [short_span], [(42.0, 43.4)], ocr_max_lead_seconds=0.35
+        )
+        self.assertEqual(refined[0]["tts_placement_start"], 41.94)
+        self.assertIsNone(refined[0]["coarse_timing_ocr_lead_guard"])
+
     def test_coarse_window_does_not_span_a_long_internal_silence(self):
         segment = {
             "id": 10,

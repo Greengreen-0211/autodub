@@ -8,9 +8,9 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.14.0-context-ratio"
+RULE_VERSION = "translation-v2.15.0-ocr-exact-native"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "native-dubbing-ocr-v15-dialogue-context-ratio"
+PROMPT_VERSION = "native-dubbing-ocr-v16-exact-native-anchor"
 
 OCR_HARD_CONFLICTS = {
     "wrong_entity",
@@ -215,6 +215,45 @@ def _ocr_audit_acceptance(response_row: dict, variant: str) -> tuple[bool, str]:
     if failed:
         return False, f"{variant}_legacy_audit_failed:{','.join(failed)}"
     return True, "legacy_audit_passed"
+
+
+def _backend_exact_ocr_acceptance(reference: Any) -> tuple[bool, str]:
+    """Admit only a deterministically exact, repeated bilingual subtitle pair.
+
+    The independent model audit remains authoritative whenever it returned a
+    verdict.  This fallback exists for the narrower case where that audit is
+    unavailable: the OCR matcher already proved an exact source boundary over
+    repeated frames, so silently demoting the human target subtitle to a weak
+    hint makes the machine translation unnecessarily literal.  Partial,
+    composed, adaptive-time and repair-only references cannot pass this gate.
+    """
+    if not isinstance(reference, dict):
+        return False, "backend_exact_reference_missing"
+    try:
+        coverage_value = reference.get("source_coverage")
+        missing_value = reference.get("missing_rate")
+        extra_value = reference.get("extra_rate")
+        coverage = float(coverage_value if coverage_value is not None else 0.0)
+        missing = float(missing_value if missing_value is not None else 1.0)
+        extra = float(extra_value if extra_value is not None else 1.0)
+        support = int(reference.get("frame_support") or 0)
+    except (TypeError, ValueError):
+        return False, "backend_exact_reference_metrics_invalid"
+    checks = {
+        "policy": str(reference.get("reference_policy") or "") == "direct",
+        "tier": str(reference.get("reference_tier") or "") == "exact",
+        "confidence": str(reference.get("confidence") or "").lower() == "high",
+        "coverage": coverage >= 0.98,
+        "missing": missing <= 0.02,
+        "extra": extra <= 0.05,
+        "support": support >= 2,
+        "not_adaptive": not bool(reference.get("adaptive_time_match")),
+        "not_composed": not bool(reference.get("composed")),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        return False, "backend_exact_reference_failed:" + ",".join(failed)
+    return True, "backend_exact_repeated_source_boundary"
 
 
 def _ocr_audit_verdict(response_row: dict, variant: str) -> dict:
@@ -778,6 +817,13 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     validated["translation_selection_source"] = str(
                         known["translation_selection_source"]
                     )
+                for audit_key in (
+                    "translation_ocr_action",
+                    "translation_ocr_admission",
+                    "translation_ocr_rejections",
+                ):
+                    if audit_key in known:
+                        validated[audit_key] = known[audit_key]
                 row.update(validated)
             row["translation_attempts"] = known.get("translation_attempts", 0)
             row["translation_cache_hit"] = True
@@ -960,6 +1006,13 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     raw_trusted, raw_audit_reason = _ocr_audit_acceptance(
                         response_row, "raw"
                     )
+                    if (
+                        not raw_trusted
+                        and raw_audit_reason in {"audit_missing", "raw_audit_missing"}
+                    ):
+                        raw_trusted, raw_audit_reason = (
+                            _backend_exact_ocr_acceptance(preferred)
+                        )
                     raw_text, raw_punctuation_ready, raw_punctuation_reason = (
                         _punctuation_ready_text(
                             preferred["target_subtitle_reference"],
@@ -974,7 +1027,8 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         raw_text,
                         "ocr_direct" if trusted_direct else "ocr_reference",
                         (
-                            f"exact_source_boundary:{raw_punctuation_reason}"
+                            f"exact_source_boundary:{raw_audit_reason}:"
+                            f"{raw_punctuation_reason}"
                             if trusted_direct
                             else (
                                 raw_audit_reason
@@ -1212,6 +1266,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     )
                 for reason in rejected_ocr:
                     valid["translation_warnings"].append(f"ocr_candidate_rejected:{reason}")
+                valid["translation_ocr_action"] = ocr_action
+                valid["translation_ocr_admission"] = admission_notes
+                valid["translation_ocr_rejections"] = rejected_ocr
                 rows[i].update(valid)
                 for warning in valid["translation_warnings"]:
                     if warning != "candidate_lengths_similar":

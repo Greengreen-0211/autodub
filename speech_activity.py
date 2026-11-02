@@ -616,6 +616,7 @@ def attach_coarse_tts_placement(
     subtitle_tolerance: float = 0.70,
     min_activity: float = 0.16,
     hard_silence_seconds: float = 0.75,
+    ocr_max_lead_seconds: float | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Attach acoustic TTS windows only to coarse recovered dialogue.
 
@@ -624,6 +625,11 @@ def attach_coarse_tts_placement(
     activity. Precise ASR segments never receive these internal fields.
     """
     active = merge_ranges(speech_ranges, max_gap=0.10)
+    if ocr_max_lead_seconds is None:
+        ocr_max_lead_seconds = float(os.getenv(
+            "AUTODUB_COARSE_TTS_OCR_MAX_LEAD_SECONDS", "0.35"
+        ))
+    ocr_max_lead_seconds = max(0.0, float(ocr_max_lead_seconds))
     output: List[Dict[str, Any]] = []
     audit: List[Dict[str, Any]] = []
     for source in segments:
@@ -707,6 +713,47 @@ def attach_coarse_tts_placement(
             # budget, while retaining long pauses as non-speaking time.
             selected = overlaps
             excluded = []
+
+        # A stable subtitle may appear slightly before the spoken line, but a
+        # long activity island that begins much earlier is commonly residual
+        # vocals, a breath, or a neighbouring utterance.  OCR is not allowed to
+        # create a timestamp; it may only trim the unsupported leading part of
+        # an already selected acoustic island.  Apply this guard only to
+        # accepted coarse recovery, require repeated OCR observations, and
+        # require the selected span to be implausibly long for the recovered
+        # text.  Public start/end and speaker metadata remain immutable.
+        ocr_lead_guard = None
+        try:
+            ocr_frame_count = int(segment.get("ocr_recovery_frame_count") or 0)
+        except (TypeError, ValueError):
+            ocr_frame_count = 0
+        duration_centre, duration_ceiling = _spoken_duration_prior(
+            segment.get("text", "")
+        )
+        if recovery_coarse and hint is not None and ocr_frame_count >= 2 and selected:
+            selected_start = float(selected[0][0])
+            selected_end = float(selected[-1][1])
+            supported_lead_start = max(
+                outer_start, float(hint) - ocr_max_lead_seconds
+            )
+            if (
+                selected_start < supported_lead_start
+                and selected_end - selected_start > duration_ceiling
+            ):
+                trimmed = intersect_ranges(
+                    selected, [(supported_lead_start, selected_end)]
+                )
+                trimmed_activity = sum(end - start for start, end in trimmed)
+                if trimmed and trimmed_activity >= float(min_activity):
+                    ocr_lead_guard = {
+                        "original_acoustic_start": round(selected_start, 3),
+                        "guarded_acoustic_start": round(float(trimmed[0][0]), 3),
+                        "subtitle_first_seen": round(float(hint), 3),
+                        "maximum_subtitle_lead": round(ocr_max_lead_seconds, 3),
+                        "spoken_duration_centre": round(duration_centre, 3),
+                        "spoken_duration_ceiling": round(duration_ceiling, 3),
+                    }
+                    selected = trimmed
         active_duration = sum(end - start for start, end in selected)
         if active_duration < float(min_activity):
             record.update(
@@ -759,6 +806,7 @@ def attach_coarse_tts_placement(
                 ),
                 "recovery_timing_method": "vocal_activity_with_ocr_soft_hint",
                 "recovery_timing_confidence": round(confidence, 4),
+                "coarse_timing_ocr_lead_guard": ocr_lead_guard,
                 "coarse_timing_excluded_islands": [
                     [round(start, 3), round(end, 3)] for start, end in excluded
                 ],
@@ -775,6 +823,7 @@ def attach_coarse_tts_placement(
             available_end=round(outer_end, 3),
             active_duration=round(active_duration, 3),
             confidence=round(confidence, 4),
+            ocr_lead_guard=ocr_lead_guard,
             excluded_islands=[
                 [round(start, 3), round(end, 3)] for start, end in excluded
             ],
