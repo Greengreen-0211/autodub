@@ -335,6 +335,142 @@ def generated_audio_safety(path) -> dict:
     }
 
 
+def prosody_similarity_quality(source_path, synthesized_path) -> dict:
+    """Compare broad source/target prosody without requiring matching words.
+
+    Dubbing languages need not share phonemes or duration, so this deliberately
+    compares normalized pitch and energy *shape* instead of raw values.  The
+    result is a ranking signal only: missing optional audio dependencies or a
+    low score must never stop an autonomous render.
+    """
+    if os.getenv("AUTODUB_TTS_PROSODY_AUDIT", "1").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return {
+            "prosody_quality": "unavailable",
+            "prosody_reason": "disabled",
+            "prosody_similarity": None,
+        }
+    try:
+        import numpy as np
+        import librosa
+
+        def features(path):
+            audio, sample_rate = librosa.load(str(path), sr=16000, mono=True)
+            audio = np.asarray(audio, dtype=np.float32)
+            if audio.size < int(0.18 * sample_rate):
+                raise ValueError("audio_too_short")
+            trimmed, _ = librosa.effects.trim(audio, top_db=35)
+            if trimmed.size < int(0.15 * sample_rate):
+                trimmed = audio
+            hop = 160
+            frame = 640
+            energy = librosa.feature.rms(
+                y=trimmed, frame_length=frame, hop_length=hop,
+            )[0]
+            if energy.size < 3 or float(np.max(energy)) <= 1e-6:
+                raise ValueError("insufficient_energy")
+            pitch = librosa.yin(
+                trimmed,
+                fmin=float(os.getenv("AUTODUB_TTS_PROSODY_F0_MIN", "65")),
+                fmax=float(os.getenv("AUTODUB_TTS_PROSODY_F0_MAX", "500")),
+                sr=sample_rate,
+                frame_length=2048,
+                hop_length=hop,
+            )
+            length = min(len(energy), len(pitch))
+            energy = np.asarray(energy[:length], dtype=float)
+            pitch = np.asarray(pitch[:length], dtype=float)
+            voiced = (
+                np.isfinite(pitch)
+                & (pitch > 0.0)
+                & (energy > max(1e-6, float(np.percentile(energy, 25)) * 0.65))
+            )
+
+            def normalized_curve(values, mask=None):
+                values = np.asarray(values, dtype=float)
+                if mask is not None:
+                    indices = np.flatnonzero(mask)
+                    if indices.size < 3:
+                        return None
+                    values = np.interp(
+                        np.arange(len(values)), indices, values[indices]
+                    )
+                x_old = np.linspace(0.0, 1.0, num=len(values))
+                x_new = np.linspace(0.0, 1.0, num=64)
+                curve = np.interp(x_new, x_old, values)
+                median = float(np.median(curve))
+                spread = float(np.std(curve))
+                return (curve - median) / max(spread, 1e-6)
+
+            energy_curve = normalized_curve(np.log1p(energy * 1000.0))
+            pitch_curve = normalized_curve(np.log2(np.maximum(pitch, 1.0)), voiced)
+            duration = len(trimmed) / float(sample_rate)
+            # Energy changes per second are a language-independent proxy for
+            # delivery activity, not a literal syllable counter.
+            activity = float(np.mean(np.abs(np.diff(energy_curve)))) / max(
+                duration, 0.1
+            )
+            return energy_curve, pitch_curve, duration, activity
+
+        source_energy, source_pitch, source_duration, source_activity = features(
+            source_path
+        )
+        target_energy, target_pitch, target_duration, target_activity = features(
+            synthesized_path
+        )
+
+        def correlation(left, right):
+            value = float(np.corrcoef(left, right)[0, 1])
+            if not math.isfinite(value):
+                return None
+            return max(-1.0, min(1.0, value))
+
+        energy_corr = correlation(source_energy, target_energy)
+        pitch_corr = (
+            correlation(source_pitch, target_pitch)
+            if source_pitch is not None and target_pitch is not None
+            else None
+        )
+        components = [value for value in (energy_corr, pitch_corr) if value is not None]
+        if not components:
+            raise ValueError("no_comparable_contours")
+        contour = (
+            0.55 * energy_corr + 0.45 * pitch_corr
+            if pitch_corr is not None and energy_corr is not None
+            else components[0]
+        )
+        activity_ratio = (
+            target_activity / source_activity if source_activity > 1e-6 else 1.0
+        )
+        activity_score = math.exp(-abs(math.log(max(activity_ratio, 1e-6))))
+        similarity = max(0.0, min(1.0, 0.85 * ((contour + 1.0) / 2.0) + 0.15 * activity_score))
+        minimum = float(os.getenv("AUTODUB_TTS_MIN_PROSODY_SIMILARITY", "0.35"))
+        return {
+            "prosody_quality": "passed" if similarity >= minimum else "degraded",
+            "prosody_reason": "" if similarity >= minimum else (
+                f"prosody_similarity_low:{similarity:.3f}<{minimum:.3f}"
+            ),
+            "prosody_similarity": round(similarity, 6),
+            "prosody_energy_correlation": (
+                round(energy_corr, 6) if energy_corr is not None else None
+            ),
+            "prosody_pitch_correlation": (
+                round(pitch_corr, 6) if pitch_corr is not None else None
+            ),
+            "prosody_activity_ratio": round(activity_ratio, 6),
+            "prosody_source_duration": round(source_duration, 4),
+            "prosody_target_duration": round(target_duration, 4),
+            "prosody_minimum_similarity": minimum,
+        }
+    except Exception as exc:
+        return {
+            "prosody_quality": "unavailable",
+            "prosody_reason": f"{type(exc).__name__}:{exc}",
+            "prosody_similarity": None,
+        }
+
+
 def _wespeaker_embedding(path):
     """Extract a SimAMResNet100 voice vector when the runtime is available."""
     model_path = os.getenv(

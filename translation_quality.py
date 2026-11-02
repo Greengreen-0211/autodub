@@ -8,9 +8,9 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.15.0-ocr-exact-native"
+RULE_VERSION = "translation-v2.16.0-scene-native"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "native-dubbing-ocr-v16-exact-native-anchor"
+PROMPT_VERSION = "native-dubbing-ocr-v17-role-separated"
 
 OCR_HARD_CONFLICTS = {
     "wrong_entity",
@@ -648,6 +648,15 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
     for candidate in raw:
         validate_target_text(candidate.get("text") if isinstance(candidate, dict) else candidate,
                              target, source_text, source, allow_identity=allow_identity)
+    allowed_roles = {"native_standard", "faithful_compact", "ocr_adapted"}
+    role_by_text = {
+        re.sub(r"[\W_]+", "", str(candidate.get("text", "")).casefold()): str(
+            candidate.get("role") or ""
+        )
+        for candidate in raw
+        if isinstance(candidate, dict)
+        and str(candidate.get("role") or "") in allowed_roles
+    }
     candidates = normalize_translation_candidates(raw, "")
     punctuated_candidates = []
     for candidate in candidates:
@@ -679,6 +688,12 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
     # Candidate metadata returned by the model is untrusted. Provenance is
     # assigned only by this module after validation.
     for candidate in candidates:
+        role = role_by_text.get(canonical(candidate.get("text")), "")
+        candidate["_candidate_role"] = (
+            "native_standard"
+            if canonical(candidate.get("text")) == primary_key
+            else (role if role in allowed_roles else "faithful_compact")
+        )
         candidate["_selection_priority"] = (
             "native_standard"
             if canonical(candidate.get("text")) == primary_key
@@ -726,6 +741,18 @@ def _restore_backend_candidate_priorities(validated: dict, cached: dict) -> None
         priority = priorities.get(_canonical(candidate.get("text")))
         if priority in allowed:
             candidate["_selection_priority"] = priority
+    roles = {
+        _canonical(candidate.get("text")): candidate.get("_candidate_role")
+        for candidate in cached.get("translations_candidates", [])
+        if isinstance(candidate, dict)
+        and candidate.get("_candidate_role") in {
+            "native_standard", "faithful_compact", "ocr_adapted"
+        }
+    }
+    for candidate in validated.get("translations_candidates", []):
+        role = roles.get(_canonical(candidate.get("text")))
+        if role:
+            candidate["_candidate_role"] = role
 
 
 def segment_fingerprint(segment: dict, previous: str, following: str, source: str,
@@ -1234,6 +1261,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                             accepted_candidates.append({
                                 "text": ocr_candidate,
                                 "_selection_priority": priority,
+                                "_candidate_role": "ocr_adapted",
                             })
                             admission_notes.append(
                                 f"{priority}={ocr_candidate[:120]!r}:{admission_reason}"

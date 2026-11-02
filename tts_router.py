@@ -33,6 +33,7 @@ from tts_quality import (
     electricity_quality,
     generated_audio_safety,
     natural_duration_fit,
+    prosody_similarity_quality,
     voice_consistency_quality,
 )
 from tts_voice_identity import (
@@ -65,6 +66,8 @@ GENERATION_REQUEST_KEYS = (
     "reference_segment_id", "reference_purity_score", "reference_mode",
     "measure_natural_duration",
     "translation_selection_source",
+    "emotion_audio", "emotion_reliable", "emotion_reliability_source",
+    "emotion_reference_text",
 )
 
 
@@ -381,6 +384,10 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         "minimum_gross_voice_consistency": os.getenv(
             "AUTODUB_TTS_MIN_GROSS_VOICE_CONSISTENCY", "0.25"
         ),
+        "prosody_audit": os.getenv("AUTODUB_TTS_PROSODY_AUDIT", "1"),
+        "minimum_prosody_similarity": os.getenv(
+            "AUTODUB_TTS_MIN_PROSODY_SIMILARITY", "0.35"
+        ),
         "wespeaker_model_path": os.getenv(
             "SIMAM_MODEL_PATH",
             "/data0/goldenseed/models/wespeaker_simamresnet100/speaker-embedding.onnx",
@@ -395,6 +402,11 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         payload["ref_audio_sha256"] = digest.hexdigest()
     else:
         payload["ref_audio_sha256"] = ""
+    emotion_audio = Path(str(item.get("emotion_audio") or ""))
+    if emotion_audio.is_file():
+        payload["emotion_audio_sha256"] = _file_sha256(emotion_audio)
+    else:
+        payload["emotion_audio_sha256"] = ""
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -422,6 +434,9 @@ def _content_audit_fingerprint(item: Dict[str, Any], metadata: Dict[str, Any]) -
         "audio_sha256": audio_sha,
         "expected_text": str(item.get("text") or ""),
         "reference_text": str(item.get("ref_text") or ""),
+        "emotion_reference_text": str(
+            item.get("emotion_reference_text") or ""
+        ),
         "language": str(item.get("target_language") or ""),
         "verifier_sha256": hashlib.sha256(
             Path(__file__).with_name("tts_content_verifier.py").read_bytes()
@@ -1248,6 +1263,11 @@ class TTSRouter:
             "": 2,
             "failed": 3,
         }.get(str(candidate.get("voice_consistency_quality") or ""), 2)
+        try:
+            prosody_similarity = float(candidate.get("prosody_similarity"))
+        except (TypeError, ValueError):
+            prosody_similarity = -1.0
+        prosody_rank = -prosody_similarity
         electricity_rank = int(candidate.get("electricity_quality") == "failed")
         audible_rank = int(candidate.get("audible_speech_quality") != "passed")
         try:
@@ -1275,6 +1295,7 @@ class TTSRouter:
             voice_rank,
             electricity_rank,
             leading_silence_rank,
+            prosody_rank,
             distance,
         )
 
@@ -1447,6 +1468,12 @@ class TTSRouter:
         final_voice = voice_consistency_quality(
             Path(str(item.get("ref_audio") or "")), destination
         )
+        source_prosody = Path(str(item.get("source_prosody_audio") or ""))
+        final_prosody = (
+            prosody_similarity_quality(source_prosody, destination)
+            if source_prosody.is_file()
+            else {}
+        )
         final_electricity = electricity_quality(destination)
         final_hard_audio = generated_audio_safety(destination)
         # Corrupted/empty audio and a waveform whose voiced content is too
@@ -1461,6 +1488,7 @@ class TTSRouter:
             return None
         result.update(final_audible)
         result.update(final_voice)
+        result.update(final_prosody)
         result.update(final_electricity)
         result.update(final_hard_audio)
         result["audible_leading_silence_seconds"] = edge_metrics[
@@ -1545,6 +1573,9 @@ class TTSRouter:
                 "segment_id": item["segment_id"],
                 "text": item["text"],
                 "reference_text": item.get("ref_text", ""),
+                "emotion_reference_text": item.get(
+                    "emotion_reference_text", ""
+                ),
                 "language": item["target_language"],
                 "file": str(path),
                 "request_fingerprint": item["request_fingerprint"],
@@ -1815,6 +1846,66 @@ class TTSRouter:
             ref_path.parent.mkdir(parents=True, exist_ok=True)
             audio.export(ref_path, format="wav")
             txt_path.write_text(source_text, encoding="utf-8")
+            emotion_variants: Dict[str, Dict[str, Any]] = {}
+            minimum_emotion_score = float(os.getenv(
+                "AUTODUB_TTS_EMOTION_REFERENCE_MIN_SCORE", "0.65"
+            ))
+            for candidate in selection_pool:
+                candidate_segment = candidate[2]
+                try:
+                    candidate_emotion_score = float(
+                        candidate_segment.get("emotion_score") or 0.0
+                    )
+                except (TypeError, ValueError):
+                    candidate_emotion_score = 0.0
+                candidate_emotion = normalize_emotion(
+                    candidate_segment.get("emotion")
+                    or candidate_segment.get("raw_emotion")
+                    or candidate_segment.get("emotion_raw")
+                )
+                if (
+                    candidate_emotion == "neutral"
+                    or candidate_segment.get("emotion_reliable") is False
+                    or candidate_emotion_score < minimum_emotion_score
+                    or candidate_emotion in emotion_variants
+                ):
+                    continue
+                variant_audio = candidate[3]
+                variant_segment = candidate[2]
+                variant_text = str(
+                    variant_segment.get("original_text")
+                    or variant_segment.get("qwen3_raw_text")
+                    or variant_segment.get("text")
+                    or ""
+                ).strip()
+                if not variant_text:
+                    continue
+                variant_path = self.root / "references" / (
+                    f"ref_{safe_speaker}_{_safe_id(candidate_emotion)}.wav"
+                )
+                variant_audio.export(variant_path, format="wav")
+                variant_path.with_suffix(".txt").write_text(
+                    variant_text, encoding="utf-8"
+                )
+                emotion_variants[candidate_emotion] = {
+                    "audio": str(variant_path),
+                    "text": variant_text,
+                    "speaker": speaker,
+                    "source_segment_id": str(
+                        variant_segment.get("id", candidate[1])
+                    ),
+                    "purity_score": round(float(candidate[0]), 4),
+                    "duration": round(len(variant_audio) / 1000.0, 3),
+                    "reference_quality": candidate[4],
+                    "assignment_confidence": float(
+                        variant_segment.get(
+                            "speaker_assignment_confidence", 1.0
+                        ) or 0.0
+                    ),
+                    "reference_emotion": candidate_emotion,
+                    "reference_emotion_score": candidate_emotion_score,
+                    "reference_mode": "speaker_emotion_matched",
+                }
             references[speaker] = {
                 "audio": str(ref_path),
                 "text": source_text,
@@ -1829,6 +1920,7 @@ class TTSRouter:
                     source_segment.get("speaker_assignment_confidence", 1.0)
                     or 0.0
                 ),
+                "emotion_variants": emotion_variants,
             }
             manifest["speakers"][speaker] = {
                 "candidate_count": len(candidates),
@@ -1843,6 +1935,13 @@ class TTSRouter:
                 "confidence_degraded": not bool(confident),
                 "boundary_ambiguous": bool(source_segment.get("speaker_boundary_ambiguous")),
                 "concatenated": False,
+                "emotion_variants": {
+                    label: {
+                        key: value for key, value in variant.items()
+                        if key != "audio"
+                    }
+                    for label, variant in emotion_variants.items()
+                },
                 "candidates": [
                     {
                         "segment_id": item[2].get("id", item[1]),
@@ -2329,6 +2428,58 @@ class TTSRouter:
                 retry_ids.add(peer_id)
         return retry
 
+    def _source_prosody_clips(
+        self, segments: List[Dict[str, Any]], vocal_path: str
+    ) -> Dict[str, str]:
+        """Export immutable per-sentence source audio for emotion/prosody use.
+
+        These clips never change Step 2 labels or timing. They are used only
+        as optional emotion prompts and as the source side of final candidate
+        ranking.
+        """
+        source = Path(str(vocal_path))
+        if not source.is_file():
+            return {}
+        try:
+            from pydub import AudioSegment
+
+            full_audio = AudioSegment.from_file(source)
+        except Exception as exc:
+            print(
+                "⚠️ 原句韵律参考准备失败，将继续使用原有 TTS 路由: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return {}
+        destination = self.root / "source_prosody"
+        destination.mkdir(parents=True, exist_ok=True)
+        output: Dict[str, str] = {}
+        for index, segment in enumerate(segments):
+            sid = str(segment.get("id", index))
+            try:
+                outer_start = max(0.0, float(segment["start"]))
+                outer_end = min(
+                    len(full_audio) / 1000.0, float(segment["end"])
+                )
+                start, end = outer_start, outer_end
+                if _is_precise_reference_segment(segment):
+                    speech_start = float(segment.get("speech_start", start))
+                    speech_end = float(segment.get("speech_end", end))
+                    if start <= speech_start < speech_end <= end + 0.001:
+                        start, end = speech_start, speech_end
+                if end - start < 0.18:
+                    continue
+                clip = full_audio[
+                    int(round(start * 1000)):int(round(end * 1000))
+                ]
+                if len(clip) < 180:
+                    continue
+                path = destination / f"segment_{_safe_id(sid)}.wav"
+                clip.export(path, format="wav")
+                output[sid] = str(path)
+            except (KeyError, TypeError, ValueError, OSError):
+                continue
+        return output
+
     def run(self, segments: Iterable[Dict[str, Any]], vocal_path: str, *, force: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         from translation_quality import is_skipped, require_translated
         # Segments without any safe target-language text never reach a TTS
@@ -2338,6 +2489,9 @@ class TTSRouter:
         require_translated(segment_list, self.config.target_lang, getattr(self.config, "source_lang", ""))
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.final_dir.mkdir(parents=True, exist_ok=True)
+        source_prosody_clips = self._source_prosody_clips(
+            segment_list, vocal_path
+        )
         if self.reference_mode == "segment":
             print("--- TTS 参考模式: 每个句子使用对应原句音频（忽略聚类声纹）---")
             references = self._segment_references(segment_list, vocal_path)
@@ -2439,6 +2593,30 @@ class TTSRouter:
                 emotion = normalize_emotion(segment.get("emotion")) if segment["emotion_reliable"] else "neutral"
             else:
                 emotion = normalize_emotion(raw_emotion, score=segment.get("emotion_score"), duration=source_duration)
+            if (
+                self.reference_mode == "speaker"
+                and segment_id not in reference_overrides
+                and bool(segment.get("emotion_reliable", False))
+                and emotion != "neutral"
+            ):
+                emotion_variant = dict(
+                    (reference.get("emotion_variants") or {}).get(emotion) or {}
+                )
+                if emotion_variant:
+                    inherited = {
+                        key: reference.get(key)
+                        for key in (
+                            "requested_speaker", "voice_identity",
+                            "voice_identity_reused", "reference_reliability",
+                        )
+                        if reference.get(key) is not None
+                    }
+                    reference = {
+                        **reference,
+                        **emotion_variant,
+                        **inherited,
+                        "reference_override_reason": "emotion_matched_same_voice_reference",
+                    }
             target = normalize_language(segment.get("target_lang", self.config.target_lang))
             target_raw = str(segment.get("target_lang_raw", self.config.target_lang)).lower()
             hard_duration = max(0.0, hard_end - placement_start)
@@ -2467,6 +2645,17 @@ class TTSRouter:
                 "target_language": target, "target_language_raw": target_raw,
                 "source_language": normalize_language(segment.get("source_lang", getattr(self.config, "source_lang", "unknown"))),
                 "emotion": emotion, "emotion_score": segment.get("emotion_score"),
+                "emotion_reliable": bool(segment.get("emotion_reliable", False)),
+                "emotion_reliability_source": segment.get(
+                    "emotion_reliability_source", "unknown"
+                ),
+                "emotion_audio": source_prosody_clips.get(segment_id, ""),
+                "emotion_reference_text": str(
+                    segment.get("original_text")
+                    or segment.get("source_text")
+                    or ""
+                ),
+                "source_prosody_audio": source_prosody_clips.get(segment_id, ""),
                 "speaker": speaker, "ref_audio": reference["audio"],
                 "ref_text": reference["text"], "target_duration": duration,
                 "source_target_duration": source_duration,
@@ -2517,12 +2706,11 @@ class TTSRouter:
             job["planned_request_fingerprint"] = job["request_fingerprint"]
             items.append(job)
 
-        # A per-sentence emotion route can make one character change timbre
-        # every few seconds even when every individual generation is valid.
-        # Keep the rule decision for audit, but use one dominant engine for all
-        # sentences sharing the same acoustic voice identity. Engine fallback
-        # is still available when that dominant engine cannot generate a
-        # complete utterance.
+        # Use one stable base engine per acoustic identity, but do not erase a
+        # reliable expressive route. IndexTTS2 and CosyVoice3 receive actual
+        # emotion controls in the worker; forcing those lines back to a neutral
+        # dominant engine made the logs look emotion-aware while flattening the
+        # waveform itself.
         if _env_bool("AUTODUB_TTS_SPEAKER_ENGINE_LOCK", True):
             by_identity: Dict[str, List[Dict[str, Any]]] = {}
             for item in items:
@@ -2532,8 +2720,28 @@ class TTSRouter:
             for identity, identity_items in by_identity.items():
                 if len(identity_items) < 2:
                     continue
+                expressive_minimum = float(os.getenv(
+                    "AUTODUB_TTS_EXPRESSIVE_MIN_SCORE", "0.65"
+                ))
+                expressive_engines = {"cosyvoice3", "indextts2"}
+
+                def expressive(item: Dict[str, Any]) -> bool:
+                    try:
+                        score = float(item.get("emotion_score") or 0.0)
+                    except (TypeError, ValueError):
+                        score = 0.0
+                    return bool(
+                        item.get("emotion_reliable")
+                        and str(item.get("emotion") or "neutral") != "neutral"
+                        and score >= expressive_minimum
+                        and str(item.get("planned_engine")) in expressive_engines
+                    )
+
+                base_items = [item for item in identity_items if not expressive(item)]
+                if not base_items:
+                    base_items = list(identity_items)
                 engine_stats: Dict[str, tuple[int, float]] = {}
-                for item in identity_items:
+                for item in base_items:
                     engine = str(item["planned_engine"])
                     count, seconds = engine_stats.get(engine, (0, 0.0))
                     engine_stats[engine] = (
@@ -2550,20 +2758,24 @@ class TTSRouter:
                 )
                 if len(engine_stats) > 1:
                     print(
-                        f"🔒 voice_identity={identity} 固定 TTS 引擎为 "
-                        f"{locked_engine}；原路由={engine_stats}"
+                        f"🔒 voice_identity={identity} 默认 TTS 引擎为 "
+                        f"{locked_engine}；可靠情绪句保留情绪路由；"
+                        f"基础路由={engine_stats}"
                     )
                 for item in identity_items:
                     rule_engine = str(item["planned_engine"])
+                    keep_expressive = expressive(item)
+                    selected_engine = rule_engine if keep_expressive else locked_engine
                     item["rule_planned_engine"] = rule_engine
-                    item["speaker_engine_locked"] = rule_engine != locked_engine
-                    item["model"] = locked_engine
-                    item["tts_engine"] = locked_engine
-                    item["planned_engine"] = locked_engine
-                    item["attempted_engines"] = [locked_engine]
+                    item["speaker_engine_lock_exempt"] = keep_expressive
+                    item["speaker_engine_locked"] = rule_engine != selected_engine
+                    item["model"] = selected_engine
+                    item["tts_engine"] = selected_engine
+                    item["planned_engine"] = selected_engine
+                    item["attempted_engines"] = [selected_engine]
                     item["language"] = (
                         _language_code(item["target_language_raw"])
-                        if locked_engine == "omnivoice"
+                        if selected_engine == "omnivoice"
                         else item["target_language"]
                     )
                     self._job_paths(item)
@@ -2864,6 +3076,9 @@ class TTSRouter:
             metadata.update(segment_id=sid, planned_engine=item["planned_engine"],
                             rule_planned_engine=item.get("rule_planned_engine", item["planned_engine"]),
                             speaker_engine_locked=bool(item.get("speaker_engine_locked", False)),
+                            speaker_engine_lock_exempt=bool(
+                                item.get("speaker_engine_lock_exempt", False)
+                            ),
                             actual_engine=item["model"], tts_engine=item["model"],
                             model_key=item["model"], model=MODEL_DISPLAY[item["model"]],
                             selected_model=MODEL_DISPLAY[item["model"]],
@@ -2890,6 +3105,17 @@ class TTSRouter:
                             placement_end=item["end"],
                             placement_source=item.get("placement_source", "segment_start"),
                             speaker=item["speaker"], emotion=item["emotion"],
+                            emotion_score=item.get("emotion_score"),
+                            emotion_reliable=item.get("emotion_reliable"),
+                            emotion_reliability_source=item.get(
+                                "emotion_reliability_source"
+                            ),
+                            emotion_control_mode=metadata.get(
+                                "emotion_control_mode", "reference_only"
+                            ),
+                            source_prosody_audio=item.get(
+                                "source_prosody_audio", ""
+                            ),
                             reference_manifest_path=str(
                                 self.root / "reference_manifest.json"
                             ),
@@ -2931,14 +3157,79 @@ class TTSRouter:
                   f"status={metadata.get('status','failed')} fallback={item['fallback_count']}")
         _atomic_json(self.result_path, previous)
         _atomic_json(self.plan_path, {"items":items})
+        audit_rows = []
+        for item in items:
+            sid = str(item["segment_id"])
+            metadata = dict(previous.get(sid, {}))
+            source_segment = dict(item.get("source_segment") or {})
+            audit_rows.append({
+                "segment_id": sid,
+                "source_text": source_segment.get("original_text")
+                or source_segment.get("source_text")
+                or source_segment.get("qwen3_raw_text"),
+                "ocr_translation_references": source_segment.get(
+                    "translation_ocr_references", []
+                ),
+                "translation_candidates": source_segment.get(
+                    "translations_candidates", []
+                ),
+                "translation_selection_source": source_segment.get(
+                    "translation_selection_source", "standard"
+                ),
+                "translation_candidate_role": source_segment.get(
+                    "translation_candidate_role", "unknown"
+                ),
+                "planned_translation": item.get("planned_text"),
+                "final_tts_text": metadata.get("tts_text", item.get("text")),
+                "duration_attempt_history": metadata.get(
+                    "duration_attempt_history", []
+                ),
+                "emotion": item.get("emotion"),
+                "emotion_score": item.get("emotion_score"),
+                "emotion_reliable": item.get("emotion_reliable"),
+                "emotion_reliability_source": item.get(
+                    "emotion_reliability_source"
+                ),
+                "emotion_control_mode": metadata.get(
+                    "emotion_control_mode", "reference_only"
+                ),
+                "rule_planned_engine": item.get(
+                    "rule_planned_engine", item.get("planned_engine")
+                ),
+                "speaker_default_engine_applied": bool(
+                    item.get("speaker_engine_locked", False)
+                ),
+                "expressive_engine_override": bool(
+                    item.get("speaker_engine_lock_exempt", False)
+                ),
+                "actual_engine": metadata.get("actual_engine", item.get("model")),
+                "fallback_reason": metadata.get("fallback_reason", ""),
+                "reference_segment_id": item.get("reference_segment_id"),
+                "reference_mode": item.get("reference_mode"),
+                "reference_override_reason": item.get(
+                    "reference_override_reason", ""
+                ),
+                "prosody_quality": metadata.get("prosody_quality"),
+                "prosody_similarity": metadata.get("prosody_similarity"),
+                "prosody_pitch_correlation": metadata.get(
+                    "prosody_pitch_correlation"
+                ),
+                "prosody_energy_correlation": metadata.get(
+                    "prosody_energy_correlation"
+                ),
+                "forced_atempo_factor": metadata.get("forced_atempo_factor"),
+                "duration_ratio": metadata.get("duration_ratio"),
+                "status": metadata.get("status", "failed"),
+            })
+        _atomic_json(self.root / "quality_decision_audit.json", audit_rows)
         output_rows.extend(unreferenced_results)
         print("TTS quality failures:", [{"id":r["segment_id"], "error":r.get("error")} for r in output_rows if r.get("status")!="success"])
         return clips, output_rows
 
     def _run_duration_retranslation(self, items, results):
-        """Measure formal TTS, request at most two rewrites, keep the closest."""
+        """Measure formal TTS, request one guarded rewrite, keep semantics first."""
         maximum_rewrites = max(
-            0, min(2, int(os.getenv("AUTODUB_TTS_DURATION_REWRITES", "2")))
+            0, min(2, int(os.getenv("AUTODUB_TTS_DURATION_REWRITES", "1")))
         )
         updated_results = dict(results)
         for item in items:
@@ -3054,6 +3345,12 @@ class TTSRouter:
                                 "attempt": candidate["attempt"],
                                 "text": candidate["text"],
                                 **candidate["fit"],
+                                "prosody_similarity": candidate["metadata"].get(
+                                    "prosody_similarity"
+                                ),
+                                "prosody_quality": candidate["metadata"].get(
+                                    "prosody_quality"
+                                ),
                                 "rewrite_audit": candidate.get("rewrite") or {},
                             }
                             for candidate in valid
@@ -3238,6 +3535,13 @@ class TTSRouter:
                 final_metadata.update(voice_consistency_quality(
                     Path(item["ref_audio"]), Path(item["final_path"])
                 ))
+                source_prosody = Path(str(
+                    item.get("source_prosody_audio") or ""
+                ))
+                if source_prosody.is_file():
+                    final_metadata.update(prosody_similarity_quality(
+                        source_prosody, Path(item["final_path"])
+                    ))
                 if final_metadata.get("audible_speech_quality") == "failed":
                     final_metadata.update(
                         status="failed",
@@ -3518,6 +3822,13 @@ class TTSRouter:
                         metadata.update(voice_consistency_quality(
                             Path(item["ref_audio"]), Path(item["final_path"])
                         ))
+                        source_prosody = Path(str(
+                            item.get("source_prosody_audio") or ""
+                        ))
+                        if source_prosody.is_file():
+                            metadata.update(prosody_similarity_quality(
+                                source_prosody, Path(item["final_path"])
+                            ))
                         # 电音检测：block policy turns a detected artifact into a
                         # failure so the fallback chain can try another engine.
                         if metadata.get("audible_speech_quality") == "failed":

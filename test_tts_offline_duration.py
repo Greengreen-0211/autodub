@@ -184,7 +184,9 @@ class DurationTests(unittest.TestCase):
             router = tts_router.TTSRouter(
                 SimpleNamespace(temp_dir=tmp), scheme="scheme3"
             )
-            router._reference_score = lambda segment, clip: float(segment["end"])
+            router._reference_quality = lambda segment, clip: (
+                float(segment["end"]), clip, {}, 0, len(clip)
+            )
             segments = [{
                 "id": 9, "start": 0.0, "end": 8.0, "speaker": "A",
                 "text": "joined", "speaker_reference_mixed_raw": True,
@@ -217,12 +219,16 @@ class DurationTests(unittest.TestCase):
         fake_pydub.silence = SimpleNamespace(detect_nonsilent=lambda *_a, **_k: [[0, 1000]])
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             sys.modules, {"pydub": fake_pydub}
-        ), patch("tts_router.voice_reference_similarity", return_value=0.96):
+        ):
             router = tts_router.TTSRouter(SimpleNamespace(temp_dir=tmp), scheme="scheme3")
-            router._reference_score = lambda _segment, clip: len(clip) / 1000.0
+            router._reference_quality = lambda _segment, clip: (
+                len(clip) / 1000.0, clip, {}, 0, len(clip)
+            )
             segments = [
-                {"id": 0, "start": 0.0, "end": 1.0, "speaker": "A", "text": "one"},
-                {"id": 1, "start": 2.0, "end": 5.0, "speaker": "B", "text": "two"},
+                {"id": 0, "start": 0.0, "end": 1.0, "speaker": "A",
+                 "text": "one", "wespeaker_tts_embedding": [1.0, 0.0]},
+                {"id": 1, "start": 2.0, "end": 5.0, "speaker": "B",
+                 "text": "two", "wespeaker_tts_embedding": [0.99, 0.01]},
             ]
             references = router._speaker_references(segments, "unused.wav")
             self.assertEqual([row["speaker"] for row in segments], ["A", "B"])

@@ -253,6 +253,20 @@ class ContentCompletenessTests(unittest.TestCase):
             result["reference_leakage_reason"],
         )
 
+    def test_emotion_prompt_leakage_is_also_a_hard_failure(self):
+        result = synthesized_content_quality(
+            "踩到栏杆上去。",
+            "现在把眼睛闭上，踩到栏杆上去。",
+            "你好，杰克。",
+            "zh",
+            "现在把眼睛闭上。",
+        )
+        self.assertEqual(result["reference_leakage_quality"], "failed")
+        self.assertTrue(result["emotion_reference_leakage_detected"])
+        self.assertIn(
+            "emotion_prompt_", result["reference_leakage_reason"]
+        )
+
     def test_chinese_target_blocks_unexpected_foreign_word_without_ref_match(self):
         result = synthesized_content_quality(
             "踩到栏杆上去。",

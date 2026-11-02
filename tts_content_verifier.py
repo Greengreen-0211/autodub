@@ -295,6 +295,7 @@ def synthesized_content_quality(
     recognized_text: Any,
     reference_text: Any,
     language: Any,
+    emotion_reference_text: Any = "",
 ) -> dict[str, Any]:
     """Combine completeness with the non-negotiable reference-leak gate."""
     audit = content_completeness_quality(
@@ -302,6 +303,30 @@ def synthesized_content_quality(
     )
     leakage = reference_leakage_quality(
         expected_text, recognized_text, reference_text, language
+    )
+    emotion_leakage = reference_leakage_quality(
+        expected_text, recognized_text, emotion_reference_text, language
+    )
+    if emotion_leakage["reference_leakage_detected"]:
+        emotion_leakage["reference_leakage_reason"] = (
+            "emotion_prompt_"
+            + str(emotion_leakage.get("reference_leakage_reason") or "detected")
+        )
+    # Either voice-cloning reference can leak content. Keep the stronger
+    # result, while exposing the emotion-prompt audit for diagnosis.
+    if (
+        emotion_leakage["reference_leakage_detected"]
+        and not leakage["reference_leakage_detected"]
+    ):
+        leakage = emotion_leakage
+    leakage.update(
+        emotion_reference_leakage_detected=bool(
+            emotion_leakage["reference_leakage_detected"]
+        ),
+        emotion_reference_leakage_reason=str(
+            emotion_leakage.get("reference_leakage_reason") or ""
+        ),
+        emotion_reference_text=str(emotion_reference_text or "").strip(),
     )
     audit.update(leakage)
     if leakage["reference_leakage_detected"]:
@@ -381,7 +406,7 @@ def main() -> None:
         recognized = _result_text(result)
         payload[str(item["segment_id"])] = synthesized_content_quality(
             item.get("text"), recognized, item.get("reference_text"),
-            item.get("language"),
+            item.get("language"), item.get("emotion_reference_text"),
         )
     Path(args.output).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"

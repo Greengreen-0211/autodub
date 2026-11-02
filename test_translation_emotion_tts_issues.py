@@ -19,12 +19,14 @@ from translation_quality import (
     prepare_tts_punctuation,
     translate_segments,
     require_translated,
+    validate_translation,
     validate_target_text,
 )
 from light_tts_selector import LightTTSSelector, EspeakBackend
 from emotion_recognizer import apply_emotion_reliability
 from scheme3_policy import build_scheme3_segments, describe_scheme3_decision
 import tts_router
+import tts_worker
 from tts_quality import (
     audible_speech_quality,
     duration_quality,
@@ -56,6 +58,24 @@ def translation(sid, tiny=False):
 
 
 class TranslationTests(unittest.TestCase):
+    def test_translation_candidate_roles_survive_backend_validation(self):
+        validated = validate_translation(
+            {
+                "text": "Hello there.",
+                "translations_candidates": [
+                    {"role": "native_standard", "text": "Hello there."},
+                    {"role": "faithful_compact", "text": "Hello."},
+                ],
+            },
+            {"text": "你好。"},
+            "zh",
+            "en",
+        )
+        self.assertEqual(
+            [row["_candidate_role"] for row in validated["translations_candidates"]],
+            ["native_standard", "faithful_compact"],
+        )
+
     def test_common_words_cannot_become_entity_aliases(self):
         glossary = [{
             "source_forms": ["Olaf", "Where", "you"],
@@ -532,12 +552,12 @@ class RoutingPolicyTests(unittest.TestCase):
     def decision(self,text,emotion):
         return describe_scheme3_decision("en",emotion,text)
 
-    def test_default_precedence_keeps_complexity_first_and_flags_the_override(self):
+    def test_default_precedence_keeps_reliable_strong_emotion(self):
         d=self.decision(LONG_EN,"angry")
-        self.assertEqual(d["planned_engine"],"confucius4")
-        self.assertEqual(d["rule_code"],"long_or_complex_text")
-        self.assertEqual(d["inputs"]["emotion_precedence"],"complexity_first")
-        self.assertTrue(d["inputs"]["emotion_overridden_by_complexity"])
+        self.assertEqual(d["planned_engine"],"indextts2")
+        self.assertEqual(d["rule_code"],"strong_emotion")
+        self.assertEqual(d["inputs"]["emotion_precedence"],"strong_emotion_first")
+        self.assertFalse(d["inputs"]["emotion_overridden_by_complexity"])
 
     def test_strong_emotion_first_is_opt_in_and_strong_only(self):
         with patch.dict(os.environ,{"AUTODUB_SCHEME3_EMOTION_PRECEDENCE":"strong_emotion_first"}):
@@ -552,7 +572,7 @@ class RoutingPolicyTests(unittest.TestCase):
     def test_unknown_precedence_falls_back_to_the_shipped_rule(self):
         with patch.dict(os.environ,{"AUTODUB_SCHEME3_EMOTION_PRECEDENCE":"nonsense"}):
             d=self.decision("short line","angry")
-        self.assertEqual(d["inputs"]["emotion_precedence"],"complexity_first")
+        self.assertEqual(d["inputs"]["emotion_precedence"],"strong_emotion_first")
         self.assertEqual(d["planned_engine"],"indextts2")
 
     def test_neutral_long_text_is_not_an_emotion_override(self):
@@ -569,7 +589,65 @@ class RoutingPolicyTests(unittest.TestCase):
         self.assertFalse(routed[0]["emotion_overridden_by_complexity"])
 
 
+class EmotionBackendTests(unittest.TestCase):
+    def test_indextts_uses_source_emotion_audio_when_runtime_supports_it(self):
+        captured = {}
+
+        class FakeIndex:
+            def infer(
+                self, *, spk_audio_prompt, text, output_path, verbose=False,
+                emo_audio_prompt=None, emo_alpha=1.0,
+            ):
+                captured.update(
+                    spk_audio_prompt=spk_audio_prompt,
+                    text=text,
+                    emo_audio_prompt=emo_audio_prompt,
+                    emo_alpha=emo_alpha,
+                )
+                wav(output_path, 0.5)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "reference.wav"
+            emotion_audio = Path(tmp) / "emotion.wav"
+            output = Path(tmp) / "output.wav"
+            wav(reference, 0.5)
+            wav(emotion_audio, 0.5)
+            backend = tts_worker.IndexTTSBackend.__new__(
+                tts_worker.IndexTTSBackend
+            )
+            backend.model = FakeIndex()
+            item = {
+                "ref_audio": str(reference),
+                "emotion_audio": str(emotion_audio),
+                "emotion": "angry",
+                "language": "en",
+                "text": "Stop now.",
+            }
+            backend.generate(item, output)
+        self.assertEqual(captured["emo_audio_prompt"], str(emotion_audio))
+        self.assertEqual(
+            item["emotion_control_mode"],
+            "indextts2_source_emotion_audio",
+        )
+
+
 class RouterTests(unittest.TestCase):
+    def test_best_candidate_uses_prosody_after_hard_quality_checks(self):
+        base = {
+            "content_completeness_quality": "passed",
+            "duration_selected_attempt": 0,
+            "audible_speech_quality": "passed",
+            "voice_consistency_quality": "passed",
+            "electricity_quality": "passed",
+            "actual_duration": 1.0,
+        }
+        flat = dict(base, prosody_similarity=0.2)
+        expressive = dict(base, prosody_similarity=0.8)
+        self.assertLess(
+            tts_router.TTSRouter._candidate_score(expressive, 1.0),
+            tts_router.TTSRouter._candidate_score(flat, 1.0),
+        )
+
     def setUp(self):
         # These fixtures synthesize tones, not speech. A server-wide ASR model
         # export must not turn them into real content-verification jobs.
@@ -840,6 +918,31 @@ class RouterTests(unittest.TestCase):
         )
         self.assertTrue(results[2]["speaker_engine_locked"])
 
+    def test_reliable_expressive_line_is_not_flattened_by_engine_lock(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ):
+            router = self.setup_router(tmp)
+            rows = [
+                dict(source(0), tts_engine="f5tts"),
+                dict(source(1), tts_engine="f5tts"),
+                dict(
+                    source(2), tts_engine="indextts2", emotion="angry",
+                    raw_emotion="angry", emotion_reliable=True,
+                    emotion_score=0.92,
+                ),
+            ]
+            with patch(
+                "tts_router._run_worker", side_effect=self.worker(calls, set())
+            ):
+                _, results = router.run(rows, "unused")
+        self.assertEqual(calls, ["f5tts", "indextts2"])
+        expressive = results[2]
+        self.assertEqual(expressive["planned_engine"], "indextts2")
+        self.assertTrue(expressive["speaker_engine_lock_exempt"])
+        self.assertFalse(expressive["speaker_engine_locked"])
+
     def test_preflight_precedes_any_worker(self):
         with tempfile.TemporaryDirectory() as tmp, patch("tts_router.preflight_models",side_effect=RuntimeError("missing Vocos")),patch("tts_router._run_worker") as worker:
             clips, rows = self.setup_router(tmp).run([dict(source(),tts_engine="f5tts")],"unused")
@@ -963,7 +1066,9 @@ class RouterTests(unittest.TestCase):
         def rewrite(_segment, _text, _feedback, _history):
             return {"text": next(rewrites), "native_fluency": "pass"}
 
-        with tempfile.TemporaryDirectory() as tmp, patch(
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AUTODUB_TTS_DURATION_REWRITES": "2"}
+        ), patch(
             "tts_router.preflight_models"
         ), patch("tts_router._run_worker", side_effect=worker), patch(
             "tts_router._postprocess", side_effect=postprocess
@@ -1137,7 +1242,7 @@ class RouterTests(unittest.TestCase):
             ], "unused")
         self.assertEqual(results[0]["duration_selected_attempt"], 0)
         self.assertEqual(results[0]["tts_text"], "natural answer")
-        self.assertEqual(len(selected_payloads[0]), 3)
+        self.assertEqual(len(selected_payloads[0]), 2)
 
     def test_generation_attempt_budget_is_global_per_sentence(self):
         calls = []

@@ -445,8 +445,20 @@ class LightTTSSelector:
         ]
         native_standard = [
             row for row in successful
-            if candidates[int(row["candidate_index"])].get("_selection_priority")
-            == "native_standard"
+            if (
+                candidates[int(row["candidate_index"])].get(
+                    "_selection_priority"
+                ) == "native_standard"
+                or candidates[int(row["candidate_index"])].get(
+                    "_candidate_role"
+                ) == "native_standard"
+            )
+        ]
+        compact = [
+            row for row in successful
+            if candidates[int(row["candidate_index"])].get(
+                "_candidate_role"
+            ) == "faithful_compact"
         ]
         standard = [
             row for row in successful
@@ -466,7 +478,7 @@ class LightTTSSelector:
         excluded_indices.update(
             int(row["candidate_index"])
             for row in standard
-            if row["duration_fit"] in {"speed_adjustable", "rejected"}
+            if row["duration_fit"] == "rejected"
         )
         # Deterministic provenance order: exact OCR remains ahead of repaired
         # OCR, including when it needs no more than 10% downstream atempo.
@@ -498,6 +510,29 @@ class LightTTSSelector:
             return min(
                 native_suitable, key=lambda row: float(row["duration_error"])
             ), "native_standard_duration_suitable"
+
+        # A natural standard line remains preferable inside the explicit
+        # ratio tolerance. Duration is a soft tie-breaker here; it must not
+        # silently replace good dialogue with a flatter compact paraphrase.
+        for fit, reason in (
+            ("borderline", "native_standard_duration_borderline"),
+            ("speed_adjustable", "native_standard_bounded_speed"),
+        ):
+            usable_native = [
+                row for row in native_standard if row["duration_fit"] == fit
+            ]
+            if usable_native:
+                return min(
+                    usable_native, key=lambda row: float(row["duration_error"])
+                ), reason
+
+        compact_suitable = [
+            row for row in compact if row["duration_fit"] == "suitable"
+        ]
+        if compact_suitable:
+            return min(
+                compact_suitable, key=lambda row: float(row["duration_error"])
+            ), "faithful_compact_after_native_rejected"
 
         standard_suitable = [row for row in standard if row["duration_fit"] == "suitable"]
         if standard_suitable:
@@ -663,6 +698,9 @@ class LightTTSSelector:
                 "required_speed_factor": selected.get("required_speed_factor"),
                 "duration_fit": selected.get("duration_fit"),
                 "selection_reason": selection_reason,
+                "selected_candidate_role": candidates[selected_index].get(
+                    "_candidate_role", "unknown"
+                ),
                 "preview_audio": selected["audio_file"],
                 "backend": self.backend.name,
                 "status": "fallback" if selected.get("estimated") else "success",
@@ -675,6 +713,9 @@ class LightTTSSelector:
             segment["translation_selection_source"] = str(
                 candidates[selected_index].get("_selection_priority", "standard")
             )
+            segment["translation_candidate_role"] = str(
+                candidates[selected_index].get("_candidate_role", "unknown")
+            )
             segment["translation_duration_ratio"] = selected.get("duration_ratio")
             segment["translation_duration_ratio_bounds"] = [
                 selected.get("duration_lower_ratio"),
@@ -684,6 +725,7 @@ class LightTTSSelector:
             # into the frontend-facing segment schema.
             for candidate in enriched:
                 candidate.pop("_selection_priority", None)
+                candidate.pop("_candidate_role", None)
             segment["translations_candidates"] = enriched
             segment["light_tts_selection"] = selection
             segment["light_tts_status"] = selection["status"]
