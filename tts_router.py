@@ -3145,8 +3145,19 @@ class TTSRouter:
                             source_language=item["source_language"], target_language=item["target_language"],
                             target_language_raw=item["target_language_raw"])
             if metadata.get("status")=="success":
+                source_segment = item.get("source_segment") or {}
+                try:
+                    source_start = float(source_segment.get("start"))
+                except (TypeError, ValueError):
+                    source_start = float(item["start"])
+                try:
+                    source_end = float(source_segment.get("end"))
+                except (TypeError, ValueError):
+                    source_end = float(item["end"])
                 clips.append({"segment_id":sid, "start":item["start"], "end":item["end"], "file":metadata["file"],
                               "tts_engine":item["model"], "request_fingerprint":item["request_fingerprint"],
+                              "source_start":source_start,
+                              "source_end":source_end,
                               "allow_overlap":bool(item.get("allow_overlap", False)),
                               "allowed_overlap_seconds":float(item.get("allowed_overlap_seconds", 0.0)),
                               "source_overlap_evidence":item.get("source_overlap_evidence", "none")})

@@ -1,6 +1,11 @@
 import unittest
 
-from mix_timing import plan_mix_windows, plan_speech_gain, validate_mix_audit
+from mix_timing import (
+    plan_complete_mix_schedule,
+    plan_mix_windows,
+    plan_speech_gain,
+    validate_mix_audit,
+)
 
 
 class MixTimingTests(unittest.TestCase):
@@ -58,6 +63,85 @@ class MixTimingTests(unittest.TestCase):
         self.assertEqual(planned[0]["hard_end"], 10.0)
         self.assertEqual(planned[0]["available_ms"], 1500)
 
+    def test_complete_clip_uses_silent_gap_instead_of_cutting_tail(self):
+        planned = plan_mix_windows([
+            {
+                "segment_id": 1,
+                "start": 1.0,
+                "end": 2.0,
+                "audio_duration_seconds": 2.5,
+            },
+            {
+                "segment_id": 2,
+                "start": 4.0,
+                "end": 5.0,
+                "audio_duration_seconds": 1.0,
+            },
+        ], 10.0)
+        scheduled = plan_complete_mix_schedule(planned, 10.0)
+        self.assertEqual(scheduled[0]["mix_start"], 1.0)
+        self.assertEqual(scheduled[0]["complete_end"], 3.5)
+        self.assertEqual(scheduled[0]["unavoidable_overlap_seconds"], 0.0)
+        self.assertFalse(scheduled[0]["truncated_to_window"])
+
+    def test_complete_clip_reports_collision_instead_of_cutting_tail(self):
+        planned = plan_mix_windows([
+            {
+                "segment_id": 1,
+                "start": 1.0,
+                "source_start": 0.5,
+                "end": 2.0,
+                "audio_duration_seconds": 3.0,
+            },
+            {
+                "segment_id": 2,
+                "start": 3.0,
+                "end": 4.0,
+                "audio_duration_seconds": 1.0,
+            },
+        ], 10.0)
+        scheduled = plan_complete_mix_schedule(
+            planned, 10.0, maximum_early_shift_seconds=0.3
+        )
+        self.assertAlmostEqual(scheduled[0]["mix_start"], 0.7)
+        self.assertAlmostEqual(
+            scheduled[0]["unavoidable_overlap_seconds"], 0.7
+        )
+        self.assertFalse(scheduled[0]["truncated_to_window"])
+
+    def test_complete_clip_never_moves_before_source_sentence(self):
+        planned = plan_mix_windows([
+            {
+                "segment_id": 1,
+                "start": 1.2,
+                "source_start": 1.0,
+                "end": 2.0,
+                "audio_duration_seconds": 3.0,
+            },
+            {
+                "segment_id": 2,
+                "start": 3.0,
+                "end": 4.0,
+                "audio_duration_seconds": 1.0,
+            },
+        ], 10.0)
+        scheduled = plan_complete_mix_schedule(
+            planned, 10.0, maximum_early_shift_seconds=0.35
+        )
+        self.assertAlmostEqual(scheduled[0]["mix_start"], 1.0)
+
+    def test_final_complete_clip_moves_earlier_instead_of_being_cut(self):
+        planned = plan_mix_windows([{
+            "segment_id": 1,
+            "start": 8.5,
+            "end": 9.0,
+            "audio_duration_seconds": 2.0,
+        }], 10.0)
+        scheduled = plan_complete_mix_schedule(planned, 10.0)
+        self.assertEqual(scheduled[0]["mix_start"], 8.0)
+        self.assertEqual(scheduled[0]["complete_end"], 10.0)
+        self.assertFalse(scheduled[0]["truncated_to_window"])
+
     def test_mix_audit_requires_every_verified_clip(self):
         with self.assertRaisesRegex(RuntimeError, "missing=.*2"):
             validate_mix_audit(["1", "2"], [{
@@ -80,6 +164,15 @@ class MixTimingTests(unittest.TestCase):
             "original_wav_duration": 1.0, "clip_rms": 100,
             "mix_verified": True,
         }])
+
+    def test_agent_mode_records_complete_clip_collision(self):
+        issues = validate_mix_audit(["1"], [{
+            "segment_id": "1", "audible_duration": 1.0,
+            "original_wav_duration": 1.0, "clip_rms": 100,
+            "mix_verified": True,
+            "unavoidable_overlap_seconds": 0.25,
+        }], allow_degraded=True)
+        self.assertTrue(any("collision boundary" in issue for issue in issues))
 
     def test_agent_mode_records_tail_trim_without_blocking_delivery(self):
         issues = validate_mix_audit(["1"], [{
