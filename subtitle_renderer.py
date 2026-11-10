@@ -22,6 +22,12 @@ _OCR_LINE_RE = re.compile(
     r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_OCR_PLAIN_COORD_RE = re.compile(
+    r"(.*?)"
+    r"(\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\)\s*,\s*"
+    r"\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\))",
+    flags=re.DOTALL,
+)
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -82,6 +88,28 @@ def _looks_like_subtitle(text: str, box: Sequence[float]) -> bool:
     )
 
 
+def _ocr_records(raw: str) -> list[tuple[str, str]]:
+    """Return text/coordinate pairs from both supported OCR wire formats.
+
+    HunyuanOCR deployments in this project have returned both tagged spotting
+    output (``<ref>...<quad>...``) and compact output such as
+    ``dialogue(312,888),(685,947)``.  Compact responses may concatenate
+    several detections without newlines, so ``finditer`` must consume every
+    coordinate pair independently.
+    """
+    tagged = [
+        (match.group(1), match.group(2) or "")
+        for match in _OCR_LINE_RE.finditer(raw or "")
+        if match.group(2)
+    ]
+    if tagged:
+        return tagged
+    return [
+        (match.group(1), match.group(2))
+        for match in _OCR_PLAIN_COORD_RE.finditer(raw or "")
+    ]
+
+
 def read_ocr_subtitle_observations(
     cache_path: str | Path,
     width: int,
@@ -104,9 +132,9 @@ def read_ocr_subtitle_observations(
         if timestamp < 0:
             continue
         raw = str(row.get("text") or "")
-        for match in _OCR_LINE_RE.finditer(raw):
-            text = re.sub(r"\s+", " ", match.group(1)).strip()
-            box = _normalized_box(match.group(2) or "", width, height)
+        for raw_text, raw_box in _ocr_records(raw):
+            text = re.sub(r"\s+", " ", raw_text).strip(" \t|-:")
+            box = _normalized_box(raw_box, width, height)
             if box and _looks_like_subtitle(text, box):
                 frames.setdefault(timestamp, []).append({"text": text, "bbox": box})
 

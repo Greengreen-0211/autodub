@@ -30,6 +30,32 @@ class SubtitleRendererTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["bbox"], [0.25, 0.76, 0.75, 0.875])
 
+    def test_plain_compact_ocr_keeps_bottom_dialogue_and_filters_watermarks(self):
+        payload = {
+            "a": {
+                "status": "ok",
+                "timestamp": 30.897,
+                "text": (
+                    "没有毛绒绒(18,47),(118,86)"
+                    "bilibili(124,31),(200,92)"
+                    "臣妾以瓜尔佳氏一族起誓(312,888),(685,947)"
+                ),
+            },
+            "b": {
+                "status": "ok",
+                "timestamp": 31.815,
+                "text": "没有毛绒绒 bilibili(17,30),(200,93)",
+            },
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ocr_frames.json"
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            rows = read_ocr_subtitle_observations(path, 1920, 1080)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["timestamp"], 30.897)
+        self.assertEqual(rows[0]["texts"], ["臣妾以瓜尔佳氏一族起誓"])
+        self.assertEqual(rows[0]["bbox"], [0.312, 0.888, 0.685, 0.947])
+
     def test_events_use_final_tts_text_and_actual_mix_timing(self):
         rows = build_subtitle_events(
             [{"id": 3, "start": 1.0, "end": 2.0, "text": "旧译文"}],
