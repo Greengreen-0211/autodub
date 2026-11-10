@@ -94,6 +94,95 @@ def plan_mix_windows(
     return ordered
 
 
+def plan_complete_mix_schedule(
+    clips: Iterable[Mapping[str, Any]],
+    video_duration: float,
+    *,
+    maximum_early_shift_seconds: float = 0.35,
+) -> List[Dict[str, Any]]:
+    """Place complete generated clips without cutting their sentence tails.
+
+    ``plan_mix_windows`` keeps the synthesis target window strict.  That is
+    useful while selecting a TTS candidate, but it must not become a slicing
+    instruction in Step 5: a slightly overlong fallback may still fit in the
+    silence before the next dubbed sentence.  This scheduler therefore uses
+    the next *actual* onset (plus measured source overlap) as the collision
+    boundary and keeps the complete WAV.
+
+    When a clip still collides, it may reclaim only the leading slack between
+    its source sentence start and chosen placement, capped by
+    ``maximum_early_shift_seconds``.  Any remaining collision is reported for
+    the delivery audit instead of being hidden by deleting the last word.  The
+    final clip may move farther when necessary so that its complete audio
+    remains inside the video.
+    """
+    ordered = sorted(
+        (dict(item) for item in clips),
+        key=lambda item: float(item.get("start", 0.0)),
+    )
+    duration = max(0.0, float(video_duration))
+    maximum_shift = max(0.0, float(maximum_early_shift_seconds))
+    for index in range(len(ordered) - 1, -1, -1):
+        item = ordered[index]
+        desired_start = max(0.0, float(item.get("start", 0.0)))
+        audio_duration = max(
+            0.0, float(item.get("audio_duration_seconds", 0.0))
+        )
+        try:
+            allowed_overlap = max(
+                0.0, float(item.get("allowed_overlap_seconds", 0.0))
+            )
+        except (TypeError, ValueError):
+            allowed_overlap = 0.0
+
+        if index + 1 < len(ordered):
+            collision_boundary = (
+                float(ordered[index + 1]["mix_start"])
+                + allowed_overlap
+            )
+            required_shift = max(
+                0.0,
+                desired_start + audio_duration - collision_boundary,
+            )
+            try:
+                source_start = max(
+                    0.0, float(item.get("source_start", desired_start))
+                )
+            except (TypeError, ValueError):
+                source_start = desired_start
+            source_leading_slack = max(0.0, desired_start - source_start)
+            applied_shift = min(
+                required_shift, maximum_shift, source_leading_slack
+            )
+        else:
+            collision_boundary = duration
+            required_shift = max(
+                0.0,
+                desired_start + audio_duration - collision_boundary,
+            )
+            # A tail cut at the video boundary is still a tail cut.  Prefer a
+            # larger, explicitly audited shift for the final sentence.
+            applied_shift = required_shift
+
+        mix_start = max(0.0, desired_start - applied_shift)
+        complete_end = mix_start + audio_duration
+        unavoidable_overlap = max(
+            0.0, complete_end - collision_boundary
+        )
+        item["desired_start"] = desired_start
+        item["mix_start"] = mix_start
+        item["complete_end"] = complete_end
+        item["collision_boundary"] = collision_boundary
+        item["timing_shift_seconds"] = mix_start - desired_start
+        item["unavoidable_overlap_seconds"] = unavoidable_overlap
+        item["extends_past_planned_end_seconds"] = max(
+            0.0,
+            complete_end - float(item.get("hard_end", complete_end)),
+        )
+        item["truncated_to_window"] = False
+    return ordered
+
+
 def validate_mix_audit(
     expected_segment_ids: Iterable[Any],
     audit_rows: Iterable[Mapping[str, Any]],
@@ -136,6 +225,14 @@ def validate_mix_audit(
         if trimmed > float(maximum_trim_seconds) + 1e-6:
             failures.append(
                 f"{sid}:would trim {trimmed:.3f}s at the sentence tail"
+            )
+        collision = max(
+            0.0, float(row.get("unavoidable_overlap_seconds") or 0.0)
+        )
+        if collision > 0.03:
+            failures.append(
+                f"{sid}:complete clip exceeds its collision boundary by "
+                f"{collision:.3f}s"
             )
     if failures:
         if allow_degraded:

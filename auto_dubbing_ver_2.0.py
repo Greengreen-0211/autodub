@@ -3601,36 +3601,49 @@ class Mixer:
         print("--- [Step 5] 混音 ---")
         final_audio = AudioSegment.silent(duration=int(duration * 1000))
         from mix_timing import (
+            plan_complete_mix_schedule,
             plan_mix_windows,
             plan_speech_gain,
             validate_mix_audit,
         )
 
-        ordered_clips = plan_mix_windows(audio_clips_info, duration)
+        measured_clips = []
+        loaded_audio = {}
+        for item in audio_clips_info:
+            measured = dict(item)
+            path = str(measured.get("file") or "")
+            if os.path.exists(path):
+                clip = AudioSegment.from_wav(path)
+                loaded_audio[path] = clip
+                measured["audio_duration_seconds"] = len(clip) / 1000.0
+            measured_clips.append(measured)
+        planned_clips = plan_mix_windows(measured_clips, duration)
+        ordered_clips = plan_complete_mix_schedule(
+            planned_clips,
+            duration,
+            maximum_early_shift_seconds=float(os.getenv(
+                "AUTODUB_TTS_MAX_COMPLETE_CLIP_EARLY_SHIFT_SECONDS", "0.35"
+            )),
+        )
         bg_mix = None
         if os.path.exists(accomp_path):
             bg_mix = AudioSegment.from_wav(accomp_path) - 6
-        bounded_count = 0
         mix_audit = []
         for index, item in enumerate(ordered_clips):
             if os.path.exists(item["file"]):
-                clip = AudioSegment.from_wav(item["file"])
+                clip = loaded_audio.get(str(item["file"]))
+                if clip is None:
+                    clip = AudioSegment.from_wav(item["file"])
                 original_duration = len(clip) / 1000.0
-                start = float(item["start"])
+                start = float(item["mix_start"])
+                desired_start = float(item["desired_start"])
                 hard_end = float(item["hard_end"])
-                available_ms = int(item["available_ms"])
-                if available_ms <= 0:
+                if len(clip) <= 0:
                     print(
-                        f"⚠️ 跳过无可用混音窗口的 TTS 片段: "
-                        f"segment={item.get('segment_id')} start={start:.3f} end={hard_end:.3f}"
+                        f"⚠️ 跳过空 TTS 片段: "
+                        f"segment={item.get('segment_id')}"
                     )
                     continue
-                if len(clip) > available_ms:
-                    clip = clip[:available_ms]
-                    fade_ms = min(25, max(0, len(clip) // 4))
-                    if fade_ms:
-                        clip = clip.fade_out(fade_ms)
-                    bounded_count += 1
                 start_ms = int(round(start * 1000))
                 background_window = (
                     bg_mix[start_ms:start_ms + len(clip)]
@@ -3677,9 +3690,13 @@ class Mixer:
                     }
                 if gain_plan["speech_gain_db"] > 0.01:
                     clip = clip.apply_gain(gain_plan["speech_gain_db"])
-                audible_duration = len(clip) / 1000.0
+                complete_wav_duration = len(clip) / 1000.0
+                audible_duration = min(
+                    complete_wav_duration,
+                    max(0.0, float(duration) - start),
+                )
                 next_start = (
-                    float(ordered_clips[index + 1]["start"])
+                    float(ordered_clips[index + 1]["mix_start"])
                     if index + 1 < len(ordered_clips) else None
                 )
                 audible_end = start + audible_duration
@@ -3690,7 +3707,14 @@ class Mixer:
                 mix_audit.append({
                     "segment_id": str(item.get("segment_id", index)),
                     "start": round(start, 6),
+                    "desired_start": round(desired_start, 6),
+                    "timing_shift_seconds": round(
+                        float(item.get("timing_shift_seconds", 0.0)), 6
+                    ),
                     "planned_hard_end": round(hard_end, 6),
+                    "collision_boundary": round(
+                        float(item.get("collision_boundary", hard_end)), 6
+                    ),
                     "original_wav_duration": round(original_duration, 6),
                     "audible_duration": round(audible_duration, 6),
                     "audible_end": round(audible_end, 6),
@@ -3704,7 +3728,17 @@ class Mixer:
                     "source_overlap_evidence": item.get(
                         "source_overlap_evidence", "none"
                     ),
-                    "truncated_to_window": original_duration > audible_duration + 0.001,
+                    "extends_past_planned_end_seconds": round(
+                        float(item.get(
+                            "extends_past_planned_end_seconds", 0.0
+                        )), 6
+                    ),
+                    "unavoidable_overlap_seconds": round(
+                        float(item.get("unavoidable_overlap_seconds", 0.0)), 6
+                    ),
+                    "truncated_to_window": (
+                        complete_wav_duration > audible_duration + 0.001
+                    ),
                     "clip_rms": int(clip.rms),
                     **gain_plan,
                 })
@@ -3729,9 +3763,14 @@ class Mixer:
                 "⚠️ Step 5 混音质量降级但继续成片: "
                 + "; ".join(mix_quality_issues)
             )
-        if bounded_count:
+        extended_count = sum(
+            float(row.get("extends_past_planned_end_seconds") or 0.0) > 0.001
+            for row in mix_audit
+        )
+        if extended_count:
             print(
-                f"ℹ️ {bounded_count} 个 TTS 片段仅进行了不超过允许阈值的尾部取整。"
+                f"ℹ️ {extended_count} 个偏长 TTS 片段保留了完整句尾，"
+                "并优先使用下一句前的空白时间。"
             )
         if bg_mix is not None:
             final_audio = final_audio.overlay(bg_mix)
@@ -4779,6 +4818,7 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
         if (
             row.get("mix_audibility_quality") == "degraded"
             or bool(row.get("truncated_to_window"))
+            or float(row.get("unavoidable_overlap_seconds") or 0.0) > 0.03
         )
     })
     failed_ids = sorted({
