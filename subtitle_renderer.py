@@ -215,13 +215,127 @@ def _median(values: Sequence[float], default: float) -> float:
     return float(statistics.median(values)) if values else float(default)
 
 
+def _uses_cjk(text: str, target_language: str) -> bool:
+    return target_language.lower().startswith(("zh", "ja", "ko")) or bool(
+        re.search(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", text)
+    )
+
+
+def _text_weight(text: str) -> int:
+    return max(1, len(re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)))
+
+
+def _natural_subtitle_chunks(text: str, target_language: str) -> list[str]:
+    """Split a long line at linguistic boundaries before timing is assigned."""
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return []
+    chunks: list[str] = []
+    if _uses_cjk(clean, target_language):
+        compact = clean.replace(" ", "")
+        buffer = ""
+        for char in compact:
+            buffer += char
+            natural_break = char in "，。！？；：、,.!?;:" and len(buffer) >= 8
+            if natural_break or len(buffer) >= 18:
+                chunks.append(buffer)
+                buffer = ""
+        if buffer:
+            if chunks and len(buffer) < 5:
+                chunks[-1] += buffer
+            else:
+                chunks.append(buffer)
+    else:
+        # Prefer complete clauses.  Only split inside a clause when it cannot
+        # fit comfortably as one card; this avoids breaks such as
+        # "the sky was still | bright" immediately before a comma.
+        clauses = [
+            match.group(0).strip()
+            for match in re.finditer(
+                r".+?(?:[,;:.!?]+[\"'’”)]*(?=\s|$)|$)", clean
+            )
+            if match.group(0).strip()
+        ]
+        for clause in clauses or [clean]:
+            words = clause.split()
+            if len(words) <= 10 and len(clause) <= 58:
+                chunks.append(clause)
+                continue
+            cursor = 0
+            while cursor < len(words):
+                remaining = len(words) - cursor
+                take = remaining if remaining <= 10 else min(9, math.ceil(remaining / 2))
+                chunks.append(" ".join(words[cursor:cursor + take]))
+                cursor += take
+        if len(chunks) > 1 and len(chunks[-1].split()) < 3:
+            chunks[-2] += " " + chunks[-1]
+            chunks.pop()
+    return chunks or [clean]
+
+
+def _merge_chunks_to_limit(chunks: Sequence[str], limit: int) -> list[str]:
+    merged = [str(chunk).strip() for chunk in chunks if str(chunk).strip()]
+    limit = max(1, int(limit))
+    while len(merged) > limit:
+        index = min(
+            range(len(merged) - 1),
+            key=lambda item: _text_weight(merged[item]) + _text_weight(merged[item + 1]),
+        )
+        separator = "" if _uses_cjk(merged[index] + merged[index + 1], "") else " "
+        merged[index:index + 2] = [merged[index] + separator + merged[index + 1]]
+    return merged
+
+
+def split_long_subtitle_events(
+    events: Sequence[Mapping[str, Any]],
+    target_language: str,
+    *,
+    minimum_card_seconds: float = 0.85,
+) -> list[dict[str, Any]]:
+    """Turn long utterances into readable, consecutive subtitle cards."""
+    output: list[dict[str, Any]] = []
+    minimum = max(0.5, float(minimum_card_seconds))
+    for event in events:
+        start, end = float(event["start"]), float(event["end"])
+        total = max(0.0, end - start)
+        chunks = _natural_subtitle_chunks(str(event.get("text") or ""), target_language)
+        maximum_cards = max(1, int(total / minimum + 1e-9))
+        chunks = _merge_chunks_to_limit(chunks, maximum_cards)
+        if len(chunks) <= 1:
+            output.append({
+                **dict(event),
+                "subtitle_chunk_index": 1,
+                "subtitle_chunk_count": 1,
+            })
+            continue
+        floor = min(minimum, total / len(chunks))
+        remaining = max(0.0, total - floor * len(chunks))
+        weights = [_text_weight(chunk) for chunk in chunks]
+        weight_total = sum(weights)
+        cursor = start
+        for index, (chunk, weight) in enumerate(zip(chunks, weights), start=1):
+            chunk_end = (
+                end if index == len(chunks)
+                else cursor + floor + remaining * weight / weight_total
+            )
+            output.append({
+                **dict(event),
+                "start": round(cursor, 3),
+                "end": round(chunk_end, 3),
+                "text": chunk,
+                "source_full_text": str(event.get("text") or ""),
+                "subtitle_chunk_index": index,
+                "subtitle_chunk_count": len(chunks),
+            })
+            cursor = chunk_end
+    return output
+
+
 def _wrap_two_lines(text: str, target_language: str) -> str:
     clean = re.sub(r"\s+", " ", text).strip()
     if not clean:
         return ""
-    is_cjk = target_language.lower().startswith(("zh", "ja", "ko")) or bool(
-        re.search(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", clean)
-    )
+    is_cjk = _uses_cjk(clean, target_language)
     if is_cjk:
         compact = clean.replace(" ", "")
         if len(compact) <= 24:
@@ -256,8 +370,8 @@ def plan_subtitle_layout(
 ) -> dict[str, Any]:
     """Plan a stable lower-screen placement above the existing subtitle."""
     width, height = max(1, int(width)), max(1, int(height))
-    default_font = max(24, int(round(height * 0.045)))
-    minimum_font = max(20, int(round(height * 0.034)))
+    default_font = max(26, int(round(height * 0.052)))
+    minimum_font = max(22, int(round(height * 0.040)))
     default_gap = max(8, int(round(height * 0.018)))
     minimum_gap = max(5, int(round(height * 0.008)))
     safe_top = max(12, int(round(height * 0.035)))
@@ -265,8 +379,9 @@ def plan_subtitle_layout(
         [float(row["bbox"][1]) for row in observations if row.get("bbox")],
         0.80,
     )
+    display_events = split_long_subtitle_events(events, target_language)
     candidates: list[dict[str, Any]] = []
-    for event in events:
+    for event in display_events:
         start, end = float(event["start"]), float(event["end"])
         nearby = [
             row for row in observations
@@ -359,6 +474,8 @@ def plan_subtitle_layout(
         "bottom_canvas_extension": band_height,
         "font_size": font_size,
         "events": planned,
+        "source_event_count": len(events),
+        "display_event_count": len(planned),
         "ocr_observation_count": len(observations),
         "no_overlap_guaranteed": bool(observations) or expanded,
     }
@@ -509,6 +626,7 @@ def render_target_subtitles(
         "subtitle_ass_path": str(ass_path),
         "subtitle_layout_audit_path": str(audit_path),
         "subtitle_layout_mode": layout["mode"],
-        "subtitle_event_count": len(events),
+        "subtitle_event_count": len(layout.get("events") or []),
+        "subtitle_source_event_count": len(events),
         "ocr_observation_count": len(observations),
     }

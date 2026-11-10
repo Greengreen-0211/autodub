@@ -7,6 +7,7 @@ from subtitle_renderer import (
     build_subtitle_events,
     plan_subtitle_layout,
     read_ocr_subtitle_observations,
+    split_long_subtitle_events,
     write_ass,
 )
 
@@ -86,6 +87,55 @@ class SubtitleRendererTests(unittest.TestCase):
         self.assertEqual(layout["mode"], "above_existing_subtitle")
         self.assertLessEqual(event["y"], 0.78 * 1080 - event["gap_pixels"])
         self.assertFalse(event["overlaps_existing_subtitle"])
+
+    def test_1080p_default_font_is_slightly_larger(self):
+        events = [{"segment_id": "0", "start": 1, "end": 2, "text": "Readable text"}]
+        observations = [{"timestamp": 1.5, "bbox": [0.2, 0.82, 0.8, 0.9]}]
+        layout = plan_subtitle_layout(events, observations, 1920, 1080, target_language="en")
+        self.assertGreaterEqual(layout["font_size"], 56)
+
+    def test_long_english_line_becomes_timed_consecutive_cards(self):
+        events = [{
+            "segment_id": "7",
+            "start": 10.0,
+            "end": 15.0,
+            "text": (
+                "I stayed awake because the sky was still bright, "
+                "and I wanted to wait until you came home safely."
+            ),
+        }]
+        chunks = split_long_subtitle_events(events, "en")
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(chunks[0]["start"], 10.0)
+        self.assertEqual(chunks[-1]["end"], 15.0)
+        self.assertTrue(chunks[0]["text"].endswith(","))
+        self.assertTrue(all(
+            chunks[index]["end"] == chunks[index + 1]["start"]
+            for index in range(len(chunks) - 1)
+        ))
+        self.assertTrue(all(chunk["end"] - chunk["start"] >= 0.84 for chunk in chunks))
+        self.assertEqual(
+            " ".join(chunk["text"] for chunk in chunks).replace("  ", " "),
+            events[0]["text"],
+        )
+
+    def test_short_window_does_not_flash_multiple_cards(self):
+        events = [{
+            "segment_id": "8", "start": 1.0, "end": 1.7,
+            "text": "This text may be long but its spoken window is short.",
+        }]
+        chunks = split_long_subtitle_events(events, "en")
+        self.assertEqual(len(chunks), 1)
+
+    def test_long_chinese_line_prefers_punctuation_boundary(self):
+        events = [{
+            "segment_id": "9", "start": 3.0, "end": 7.0,
+            "text": "天还醒着，所以我也醒着，我想等你平安回来。",
+        }]
+        chunks = split_long_subtitle_events(events, "zh")
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(chunks[0]["text"].endswith("，"))
+        self.assertEqual("".join(chunk["text"] for chunk in chunks), events[0]["text"])
 
     def test_missing_ocr_uses_safe_expanded_canvas_not_top(self):
         events = [{"segment_id": "0", "start": 1, "end": 2, "text": "新的字幕"}]
