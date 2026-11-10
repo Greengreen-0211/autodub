@@ -203,6 +203,9 @@ class DubbingConfig:
         self.subtitle_font = os.getenv(
             "AUTODUB_SUBTITLE_FONT", "Noto Sans CJK SC"
         ).strip() or "Noto Sans CJK SC"
+        self.subtitle_font_size = _env_int(
+            "AUTODUB_SUBTITLE_FONT_SIZE", 0
+        )
         self.emotion_model_dir = os.getenv(
             "EMOTION2VEC_MODEL_DIR",
             "/data0/goldenseed/qgd/models/emotion2vec_plus_base",
@@ -4837,6 +4840,9 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
                 video_duration=float(state["duration"]),
                 font_name=getattr(
                     config, "subtitle_font", "Noto Sans CJK SC"
+                ),
+                preferred_font_size=getattr(
+                    config, "subtitle_font_size", 0
                 ),
             )
             print(

@@ -367,11 +367,16 @@ def plan_subtitle_layout(
     height: int,
     *,
     target_language: str = "zh",
+    preferred_font_size: int = 0,
 ) -> dict[str, Any]:
     """Plan a stable lower-screen placement above the existing subtitle."""
     width, height = max(1, int(width)), max(1, int(height))
-    default_font = max(26, int(round(height * 0.052)))
-    minimum_font = max(22, int(round(height * 0.040)))
+    requested_font = int(preferred_font_size or 0)
+    default_font = (
+        requested_font if requested_font > 0
+        else max(30, int(round(height * 0.063)))
+    )
+    minimum_font = max(24, int(round(default_font * 0.78)))
     default_gap = max(8, int(round(height * 0.018)))
     minimum_gap = max(5, int(round(height * 0.008)))
     safe_top = max(12, int(round(height * 0.035)))
@@ -504,6 +509,8 @@ def write_ass(
     width = int(layout["output_width"])
     height = int(layout["output_height"])
     font_size = int(layout["font_size"])
+    outline = round(max(2.8, font_size * 0.052), 1)
+    shadow = round(max(0.8, font_size * 0.015), 1)
     lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -518,7 +525,7 @@ def write_ass(
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Target,{font_name},{font_size},&H00FFFFFF,&H000000FF,"
-        "&H00000000,&H70000000,0,0,0,0,100,100,0,0,1,2.4,0.8,2,24,24,12,1",
+        f"&H00000000,&H70000000,0,0,0,0,100,100,0,0,1,{outline},{shadow},2,24,24,12,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -567,6 +574,7 @@ def render_target_subtitles(
     mix_audit: Sequence[Mapping[str, Any]],
     video_duration: float,
     font_name: str = "Noto Sans CJK SC",
+    preferred_font_size: int = 0,
 ) -> dict[str, Any]:
     """Create a second, subtitled delivery and a machine-readable audit."""
     base = Path(base_video)
@@ -581,7 +589,12 @@ def render_target_subtitles(
     if not events:
         raise RuntimeError("no actually mixed target-language lines to subtitle")
     layout = plan_subtitle_layout(
-        events, observations, width, height, target_language=target_language
+        events,
+        observations,
+        width,
+        height,
+        target_language=target_language,
+        preferred_font_size=preferred_font_size,
     )
     digest = hashlib.sha1(project_name.encode("utf-8")).hexdigest()[:8]
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", project_name).strip("_") or "project"

@@ -88,11 +88,24 @@ class SubtitleRendererTests(unittest.TestCase):
         self.assertLessEqual(event["y"], 0.78 * 1080 - event["gap_pixels"])
         self.assertFalse(event["overlaps_existing_subtitle"])
 
-    def test_1080p_default_font_is_slightly_larger(self):
+    def test_1080p_default_font_is_readably_large(self):
         events = [{"segment_id": "0", "start": 1, "end": 2, "text": "Readable text"}]
         observations = [{"timestamp": 1.5, "bbox": [0.2, 0.82, 0.8, 0.9]}]
         layout = plan_subtitle_layout(events, observations, 1920, 1080, target_language="en")
-        self.assertGreaterEqual(layout["font_size"], 56)
+        self.assertGreaterEqual(layout["font_size"], 68)
+
+    def test_explicit_font_size_can_be_selected_without_code_changes(self):
+        events = [{"segment_id": "0", "start": 1, "end": 2, "text": "Readable text"}]
+        observations = [{"timestamp": 1.5, "bbox": [0.2, 0.82, 0.8, 0.9]}]
+        layout = plan_subtitle_layout(
+            events,
+            observations,
+            1920,
+            1080,
+            target_language="en",
+            preferred_font_size=76,
+        )
+        self.assertEqual(layout["font_size"], 76)
 
     def test_long_english_line_becomes_timed_consecutive_cards(self):
         events = [{
