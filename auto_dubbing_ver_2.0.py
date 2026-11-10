@@ -194,6 +194,15 @@ class DubbingConfig:
         self.tts_backend = os.getenv("AUTODUB_TTS_BACKEND", "scheme3").strip().lower()
         self.light_tts_enabled = _env_bool("AUTODUB_LIGHT_TTS_ENABLED", True)
         self.light_tts_backend = os.getenv("AUTODUB_LIGHT_TTS_BACKEND", "auto").strip().lower()
+        # Subtitle rendering is a post-Step-5 delivery enhancement.  It never
+        # changes speech recognition, speaker clustering, translation, TTS,
+        # or the timing/mixing decisions that produced the base video.
+        self.subtitle_mode = os.getenv(
+            "AUTODUB_SUBTITLE_MODE", "auto"
+        ).strip().lower()
+        self.subtitle_font = os.getenv(
+            "AUTODUB_SUBTITLE_FONT", "Noto Sans CJK SC"
+        ).strip() or "Noto Sans CJK SC"
         self.emotion_model_dir = os.getenv(
             "EMOTION2VEC_MODEL_DIR",
             "/data0/goldenseed/qgd/models/emotion2vec_plus_base",
@@ -4806,6 +4815,48 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
         input_file,
         state["duration"],
     ) or {}
+    subtitle_result = {
+        "status": "disabled",
+        "base_output_video": mix_result.get("output_video"),
+        "output_video": mix_result.get("output_video"),
+    }
+    # Lightweight test/integration configs created before this feature do not
+    # carry subtitle settings; preserve their historical no-subtitle behavior.
+    if getattr(config, "subtitle_mode", "off") != "off":
+        try:
+            from subtitle_renderer import render_target_subtitles
+            subtitle_result = render_target_subtitles(
+                base_video=mix_result["output_video"],
+                output_dir=config.output_dir,
+                project_name=config.project_name,
+                temp_dir=config.temp_dir,
+                target_language=config.target_lang,
+                segments=state.get("segments_step3") or [],
+                tts_results=state.get("tts_router_results") or [],
+                mix_audit=mix_result.get("mix_audit") or [],
+                video_duration=float(state["duration"]),
+                font_name=getattr(
+                    config, "subtitle_font", "Noto Sans CJK SC"
+                ),
+            )
+            print(
+                "✅ 目标语言字幕版: "
+                f"{subtitle_result.get('output_video')} "
+                f"({subtitle_result.get('subtitle_layout_mode')})"
+            )
+        except Exception as exc:
+            # Subtitle layout/rendering is deliberately fail-open: the Agent
+            # must still deliver the complete base video autonomously.
+            subtitle_result = {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "base_output_video": mix_result.get("output_video"),
+                "output_video": mix_result.get("output_video"),
+            }
+            print(
+                "⚠️ 字幕后处理失败，保留无字幕成品并继续交付: "
+                f"{subtitle_result['error']}"
+            )
     tts_rows = list(state.get("tts_router_results") or [])
     degraded_tts_ids = sorted({
         str(row.get("segment_id"))
@@ -4832,12 +4883,32 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
         or mix_degraded_ids
         or mix_result.get("mix_quality_issues")
     )
+    delivered_video = (
+        subtitle_result.get("output_video")
+        if subtitle_result.get("status") == "success"
+        else mix_result.get("output_video")
+    )
     state_mgr.save({
+        "subtitle_delivery": subtitle_result,
         "agent_delivery_report": {
             "status": (
                 "completed_with_degradation" if degraded else "completed"
             ),
-            "output_video": mix_result.get("output_video"),
+            "output_video": delivered_video,
+            "base_output_video": mix_result.get("output_video"),
+            "subtitle_output_video": (
+                subtitle_result.get("output_video")
+                if subtitle_result.get("status") == "success" else None
+            ),
+            "subtitle_status": subtitle_result.get("status"),
+            "subtitle_layout_mode": subtitle_result.get(
+                "subtitle_layout_mode"
+            ),
+            "subtitle_ass_path": subtitle_result.get("subtitle_ass_path"),
+            "subtitle_layout_audit_path": subtitle_result.get(
+                "subtitle_layout_audit_path"
+            ),
+            "subtitle_error": subtitle_result.get("error"),
             "failed_tts_segment_ids": failed_ids,
             "degraded_tts_segment_ids": degraded_tts_ids,
             "mix_degraded_segment_ids": mix_degraded_ids,
@@ -4889,6 +4960,15 @@ def main() -> None:
     parser.add_argument("--disable-tts-fallback", action="store_true", help="关闭 TTS 模型 fallback")
     parser.add_argument("--allow-missing-tts", action="store_true", help="显式允许不完整 TTS 混音")
     parser.add_argument(
+        "--subtitle-mode",
+        choices=["off", "auto", "burn"],
+        default=os.getenv("AUTODUB_SUBTITLE_MODE", "auto").strip().lower(),
+        help=(
+            "Step 5 字幕后处理：auto/burn=生成不遮挡原字幕的目标字幕版(默认)，"
+            "off=只保留无字幕成品"
+        ),
+    )
+    parser.add_argument(
         "--translation-failure-policy",
         choices=["best_available", "fail_fast", "skip_failed"],
         default=None,
@@ -4916,6 +4996,7 @@ def main() -> None:
     config.retranslate_ids = {s.strip() for s in args.retranslate_ids.split(",") if s.strip()}
     config.disable_tts_fallback = args.disable_tts_fallback
     config.allow_missing_tts = args.allow_missing_tts
+    config.subtitle_mode = args.subtitle_mode
     if args.ocr_url:
         config.ocr_url = args.ocr_url
     if args.ocr_frame_index is not None:

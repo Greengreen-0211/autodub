@@ -1,0 +1,101 @@
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+from subtitle_renderer import (
+    build_subtitle_events,
+    plan_subtitle_layout,
+    read_ocr_subtitle_observations,
+    write_ass,
+)
+
+
+class SubtitleRendererTests(unittest.TestCase):
+    def test_ocr_quad_is_normalized_and_bilingual_card_is_unioned(self):
+        payload = {
+            "a": {
+                "status": "ok",
+                "timestamp": 2.0,
+                "text": (
+                    "<ref>Source line</ref><quad>[(250,760),(750,760),(750,810),(250,810)]</quad>"
+                    "<ref>原字幕</ref><quad>[(300,825),(700,825),(700,875),(300,875)]</quad>"
+                ),
+            }
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ocr_frames.json"
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            rows = read_ocr_subtitle_observations(path, 1920, 1080)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["bbox"], [0.25, 0.76, 0.75, 0.875])
+
+    def test_events_use_final_tts_text_and_actual_mix_timing(self):
+        rows = build_subtitle_events(
+            [{"id": 3, "start": 1.0, "end": 2.0, "text": "旧译文"}],
+            [{"segment_id": 3, "status": "success", "tts_text": "最终配音文本"}],
+            [{"segment_id": 3, "start": 1.2, "audible_end": 2.3}],
+            10.0,
+        )
+        self.assertEqual(rows[0]["text"], "最终配音文本")
+        self.assertEqual((rows[0]["start"], rows[0]["end"]), (1.2, 2.3))
+
+    def test_unmixed_or_failed_lines_do_not_get_subtitles(self):
+        rows = build_subtitle_events(
+            [
+                {"id": 1, "text": "未混音"},
+                {"id": 2, "text": "失败"},
+            ],
+            [{"segment_id": 2, "status": "failed", "tts_text": "失败"}],
+            [{"segment_id": 2, "start": 1, "audible_end": 2}],
+            3,
+        )
+        self.assertEqual(rows, [])
+
+    def test_target_is_always_above_existing_subtitle(self):
+        events = [{"segment_id": "0", "start": 1, "end": 2, "text": "新的字幕"}]
+        observations = [{"timestamp": 1.5, "bbox": [0.2, 0.78, 0.8, 0.86]}]
+        layout = plan_subtitle_layout(events, observations, 1920, 1080, target_language="zh")
+        event = layout["events"][0]
+        self.assertEqual(layout["mode"], "above_existing_subtitle")
+        self.assertLessEqual(event["y"], 0.78 * 1080 - event["gap_pixels"])
+        self.assertFalse(event["overlaps_existing_subtitle"])
+
+    def test_missing_ocr_uses_safe_expanded_canvas_not_top(self):
+        events = [{"segment_id": "0", "start": 1, "end": 2, "text": "新的字幕"}]
+        layout = plan_subtitle_layout(events, [], 1280, 720, target_language="zh")
+        event = layout["events"][0]
+        self.assertEqual(layout["mode"], "expanded_bottom_canvas")
+        self.assertGreater(event["y"], 720)
+        self.assertEqual(event["placement_source"], "expanded_bottom_canvas")
+        self.assertTrue(layout["no_overlap_guaranteed"])
+
+    def test_insufficient_space_uses_expanded_canvas(self):
+        events = [{
+            "segment_id": "0",
+            "start": 1,
+            "end": 2,
+            "text": "这是一条足够长并且需要显示为两行的目标语言字幕文本",
+        }]
+        observations = [{"timestamp": 1.5, "bbox": [0.2, 0.08, 0.8, 0.14]}]
+        layout = plan_subtitle_layout(events, observations, 1920, 1080, target_language="zh")
+        self.assertEqual(layout["mode"], "expanded_bottom_canvas")
+        self.assertGreater(layout["output_height"], 1080)
+        self.assertGreater(layout["events"][0]["y"], 1080)
+
+    def test_ass_has_two_line_wrap_and_position_override(self):
+        events = [{
+            "segment_id": "0", "start": 1, "end": 2,
+            "text": "这是一条足够长并且应当自动换成两行显示的目标语言字幕",
+        }]
+        layout = plan_subtitle_layout(events, [], 1920, 1080, target_language="zh")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "target.ass"
+            write_ass(path, layout)
+            content = path.read_text(encoding="utf-8-sig")
+        self.assertIn("\\pos(", content)
+        self.assertIn("\\N", content)
+
+
+if __name__ == "__main__":
+    unittest.main()
