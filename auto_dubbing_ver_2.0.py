@@ -3911,6 +3911,12 @@ def run_step_1(config: DubbingConfig, input_file: str, disable_ocr: bool = False
 
 
 def run_step_2(config: DubbingConfig) -> None:
+    from diarization_router import run_routed
+
+    return run_routed(config, StateManager(config), lambda: _run_step_2_legacy(config))
+
+
+def _run_step_2_legacy(config: DubbingConfig) -> None:
     state_mgr = StateManager(config)
     state = state_mgr.load()
     if not state or "segments_step1" not in state:
@@ -3929,7 +3935,7 @@ def run_step_2(config: DubbingConfig) -> None:
     if backend == "wespeaker":
         work_dir = os.path.join(config.temp_dir, "wespeaker_diar")
         rttm_path = os.path.join(work_dir, "result.rttm")
-        if os.path.exists(rttm_path):
+        if os.path.exists(rttm_path) and not _env_bool("AUTODUB_DIAR_FORCE_REBUILD", False):
             print("--- [Step 2-W] 检测到已有 WeSpeaker RTTM，直接解析回填 ---")
             diar = SpeakerDiarization(config)
             from run_step2_wespeaker import (
