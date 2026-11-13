@@ -68,24 +68,31 @@ def _normalized_box(raw: str, width: int, height: int) -> list[float] | None:
     return box
 
 
-def _looks_like_subtitle(text: str, box: Sequence[float]) -> bool:
+def _subtitle_candidate_reason(text: str, box: Sequence[float]) -> str:
     compact = re.sub(r"\s+", "", text or "")
     if not compact or len(compact) > 180:
-        return False
+        return "empty_or_too_long"
     if re.search(r"(?:https?://|www\.)", compact, flags=re.IGNORECASE):
-        return False
+        return "url"
     if re.fullmatch(r"[\W_]+", compact, flags=re.UNICODE):
-        return False
+        return "symbols_only"
     left, top, right, bottom = (float(value) for value in box)
     center_x = (left + right) / 2.0
     center_y = (top + bottom) / 2.0
     box_width, box_height = right - left, bottom - top
-    return (
-        center_y >= 0.45
-        and 0.18 <= center_x <= 0.82
-        and 0.035 <= box_width <= 0.98
-        and 0.008 <= box_height <= 0.18
-    )
+    if center_y < 0.70 or bottom < 0.74:
+        return "outside_bottom_subtitle_band"
+    if not 0.22 <= center_x <= 0.78:
+        return "not_horizontally_centered"
+    if not 0.025 <= box_width <= 0.98:
+        return "implausible_width"
+    if not 0.008 <= box_height <= 0.18:
+        return "implausible_height"
+    return ""
+
+
+def _looks_like_subtitle(text: str, box: Sequence[float]) -> bool:
+    return not _subtitle_candidate_reason(text, box)
 
 
 def _ocr_records(raw: str) -> list[tuple[str, str]]:
@@ -114,6 +121,7 @@ def read_ocr_subtitle_observations(
     cache_path: str | Path,
     width: int,
     height: int,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Extract likely on-screen subtitle regions from the existing OCR cache."""
     path = Path(cache_path)
@@ -124,6 +132,13 @@ def read_ocr_subtitle_observations(
     except (OSError, json.JSONDecodeError):
         return []
     rows = payload.values() if isinstance(payload, dict) else payload
+    filter_audit = diagnostics if diagnostics is not None else {}
+    filter_audit.update({
+        "raw_coordinate_record_count": 0,
+        "accepted_line_count": 0,
+        "rejected_line_count": 0,
+        "rejected_lines": [],
+    })
     frames: dict[float, list[dict[str, Any]]] = {}
     for row in rows or []:
         if not isinstance(row, Mapping) or row.get("status") != "ok":
@@ -135,13 +150,31 @@ def read_ocr_subtitle_observations(
         for raw_text, raw_box in _ocr_records(raw):
             text = re.sub(r"\s+", " ", raw_text).strip(" \t|-:")
             box = _normalized_box(raw_box, width, height)
-            if box and _looks_like_subtitle(text, box):
+            filter_audit["raw_coordinate_record_count"] += 1
+            reason = "invalid_coordinates" if not box else _subtitle_candidate_reason(text, box)
+            if box and not reason:
+                filter_audit["accepted_line_count"] += 1
                 frames.setdefault(timestamp, []).append({"text": text, "bbox": box})
+            else:
+                filter_audit["rejected_line_count"] += 1
+                if len(filter_audit["rejected_lines"]) < 100:
+                    filter_audit["rejected_lines"].append({
+                        "timestamp": timestamp,
+                        "text": text,
+                        "bbox": box,
+                        "reason": reason,
+                    })
 
     observations: list[dict[str, Any]] = []
     for timestamp, lines in sorted(frames.items()):
-        # A bilingual subtitle may occupy two adjacent rows.  Avoid the whole
-        # card, not merely one line, by taking their union.
+        # Keep only the bottom-most vertically adjacent group.  This preserves
+        # two-line/bilingual subtitles without letting an unrelated price tag
+        # higher in the frame pull the union toward a person's face.
+        bottom_anchor = max(line["bbox"][3] for line in lines)
+        lines = [
+            line for line in lines
+            if bottom_anchor - float(line["bbox"][3]) <= 0.10
+        ]
         left = min(line["bbox"][0] for line in lines)
         top = min(line["bbox"][1] for line in lines)
         right = max(line["bbox"][2] for line in lines)
@@ -151,7 +184,87 @@ def read_ocr_subtitle_observations(
             "bbox": [left, top, right, bottom],
             "texts": [line["text"] for line in lines],
         })
+    filter_audit["accepted_frame_count"] = len(observations)
     return observations
+
+
+def _percentile(values: Sequence[float], fraction: float, default: float) -> float:
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return float(default)
+    position = max(0.0, min(1.0, float(fraction))) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def select_stable_subtitle_track(
+    observations: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Choose one persistent bottom subtitle track and reject spatial outliers."""
+    candidates = [dict(row) for row in observations if row.get("bbox")]
+    if not candidates:
+        return [], {
+            "status": "missing",
+            "input_observation_count": len(observations),
+            "selected_observation_count": 0,
+            "rejected_observation_count": len(observations),
+            "confidence": 0.0,
+        }
+    bottoms = [float(row["bbox"][3]) for row in candidates]
+    best_anchor = max(
+        bottoms,
+        key=lambda anchor: (
+            sum(abs(value - anchor) <= 0.055 for value in bottoms),
+            anchor,
+        ),
+    )
+    initial = [
+        row for row in candidates
+        if abs(float(row["bbox"][3]) - best_anchor) <= 0.055
+    ]
+    median_bottom = _median(
+        [float(row["bbox"][3]) for row in initial], best_anchor
+    )
+    deviations = [
+        abs(float(row["bbox"][3]) - median_bottom) for row in initial
+    ]
+    mad = _median(deviations, 0.0)
+    tolerance = max(0.025, min(0.06, 3.5 * mad if mad > 0 else 0.035))
+    selected = [
+        row for row in candidates
+        if abs(float(row["bbox"][3]) - median_bottom) <= tolerance
+    ]
+    tops = [float(row["bbox"][1]) for row in selected]
+    selected_bottoms = [float(row["bbox"][3]) for row in selected]
+    stable_top = _percentile(tops, 0.15, 0.80)
+    stable_bottom = _median(selected_bottoms, median_bottom)
+    top_spread = (
+        _percentile(tops, 0.90, stable_top)
+        - _percentile(tops, 0.10, stable_top)
+    )
+    support = len(selected) / max(1, len(candidates))
+    stability = max(0.0, 1.0 - top_spread / 0.18)
+    confidence = max(0.0, min(1.0, support * 0.7 + stability * 0.3))
+    rejected = [
+        row for row in candidates
+        if abs(float(row["bbox"][3]) - median_bottom) > tolerance
+    ]
+    return selected, {
+        "status": "selected",
+        "input_observation_count": len(observations),
+        "selected_observation_count": len(selected),
+        "rejected_observation_count": len(rejected),
+        "stable_top": round(stable_top, 6),
+        "stable_bottom": round(stable_bottom, 6),
+        "bottom_tolerance": round(tolerance, 6),
+        "top_spread": round(top_spread, 6),
+        "confidence": round(confidence, 6),
+        "rejected_observations": rejected[:100],
+    }
 
 
 def _result_map(results: Any) -> dict[str, Mapping[str, Any]]:
@@ -207,6 +320,18 @@ def build_subtitle_events(
             "text": text,
             "text_source": "tts_result" if result.get("tts_text") else "step3",
             "timing_source": "step5_mix_audit",
+            # These fields describe overlap in the source/mix.  The subtitle
+            # timeline uses them to distinguish a real two-person overlap
+            # from an accidental overlap caused by subtitle display windows.
+            "source_overlap_evidence": timing.get(
+                "source_overlap_evidence", "none"
+            ),
+            "allowed_overlap_seconds": round(
+                max(0.0, _number(timing.get("allowed_overlap_seconds"))), 3
+            ),
+            "mixed_overlap_seconds": round(
+                max(0.0, _number(timing.get("mixed_overlap_seconds"))), 3
+            ),
         })
     return sorted(events, key=lambda row: (row["start"], row["end"]))
 
@@ -331,6 +456,128 @@ def split_long_subtitle_events(
     return output
 
 
+def _has_source_overlap(event: Mapping[str, Any]) -> bool:
+    if _number(event.get("allowed_overlap_seconds")) > 0.03:
+        return True
+    evidence = str(event.get("source_overlap_evidence") or "").strip().lower()
+    return evidence not in {"", "none", "false", "0", "unknown", "not_applicable"}
+
+
+def resolve_subtitle_timeline(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    minimum_display_seconds: float = 0.35,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Create a non-overlapping display timeline without changing audio.
+
+    Accidental overlaps hand off at one shared boundary.  Overlaps backed by
+    source/mix evidence are represented as one multi-line card during the
+    shared interval, so two independent ASS events can never cover each other.
+    """
+    rows = sorted(
+        (dict(row) for row in events if float(row["end"]) > float(row["start"])),
+        key=lambda row: (float(row["start"]), float(row["end"])),
+    )
+    minimum = max(0.1, float(minimum_display_seconds))
+    adjustments: list[dict[str, Any]] = []
+    artificial_count = 0
+    for index in range(1, len(rows)):
+        previous, current = rows[index - 1], rows[index]
+        if float(previous["end"]) <= float(current["start"]):
+            continue
+        # The mix audit stores the overlap budget on the earlier clip, where
+        # it describes that clip's relationship with its following clip.
+        # The current clip's value belongs to the next pair and must not make
+        # this boundary look like a genuine source overlap.
+        if _has_source_overlap(previous):
+            continue
+        old_previous_end = float(previous["end"])
+        old_current_start = float(current["start"])
+        boundary = (old_previous_end + old_current_start) / 2.0
+        lower = float(previous["start"]) + minimum
+        upper = float(current["end"]) - minimum
+        if lower <= upper:
+            boundary = max(lower, min(upper, boundary))
+        else:
+            boundary = max(float(previous["start"]), min(float(current["end"]), boundary))
+        previous["end"] = round(boundary, 3)
+        current["start"] = round(boundary, 3)
+        previous["timeline_resolution"] = "artificial_overlap_handoff"
+        current["timeline_resolution"] = "artificial_overlap_handoff"
+        artificial_count += 1
+        adjustments.append({
+            "kind": "artificial_overlap_handoff",
+            "previous_segment_id": previous.get("segment_id"),
+            "current_segment_id": current.get("segment_id"),
+            "previous_end_before": round(old_previous_end, 3),
+            "current_start_before": round(old_current_start, 3),
+            "handoff": round(boundary, 3),
+        })
+
+    boundaries = sorted({
+        round(float(row[key]), 6)
+        for row in rows for key in ("start", "end")
+    })
+    resolved: list[dict[str, Any]] = []
+    genuine_intervals = 0
+    for start, end in zip(boundaries, boundaries[1:]):
+        if end <= start:
+            continue
+        midpoint = (start + end) / 2.0
+        active = [
+            row for row in rows
+            if float(row["start"]) <= midpoint < float(row["end"])
+        ]
+        if not active:
+            continue
+        if len(active) == 1:
+            card = dict(active[0])
+            signature = (str(card.get("segment_id")), str(card.get("text") or ""))
+        else:
+            texts: list[str] = []
+            segment_ids: list[str] = []
+            for row in active:
+                text = str(row.get("text") or "").strip()
+                sid = str(row.get("segment_id") or "")
+                if text and text not in texts:
+                    texts.append(text)
+                if sid and sid not in segment_ids:
+                    segment_ids.append(sid)
+            card = dict(active[0])
+            card.update({
+                "segment_id": "+".join(segment_ids),
+                "combined_segment_ids": segment_ids,
+                "text": "\n".join(texts),
+                "timeline_resolution": "combined_source_overlap",
+            })
+            signature = (tuple(segment_ids), tuple(texts))
+            genuine_intervals += 1
+        card["start"] = round(start, 3)
+        card["end"] = round(end, 3)
+        card["_timeline_signature"] = signature
+        if (
+            resolved
+            and resolved[-1].get("_timeline_signature") == signature
+            and abs(float(resolved[-1]["end"]) - start) < 0.002
+        ):
+            resolved[-1]["end"] = round(end, 3)
+        else:
+            resolved.append(card)
+    for row in resolved:
+        row.pop("_timeline_signature", None)
+    return resolved, {
+        "input_event_count": len(events),
+        "output_event_count": len(resolved),
+        "artificial_overlap_handoff_count": artificial_count,
+        "source_overlap_combined_interval_count": genuine_intervals,
+        "adjustments": adjustments,
+        "events_are_disjoint": all(
+            float(resolved[index - 1]["end"]) <= float(resolved[index]["start"]) + 0.001
+            for index in range(1, len(resolved))
+        ),
+    }
+
+
 def _wrap_two_lines(text: str, target_language: str) -> str:
     clean = re.sub(r"\s+", " ", text).strip()
     if not clean:
@@ -380,53 +627,31 @@ def plan_subtitle_layout(
     default_gap = max(8, int(round(height * 0.018)))
     minimum_gap = max(5, int(round(height * 0.008)))
     safe_top = max(12, int(round(height * 0.035)))
-    global_top = _median(
-        [float(row["bbox"][1]) for row in observations if row.get("bbox")],
-        0.80,
-    )
-    display_events = split_long_subtitle_events(events, target_language)
+    stable_track, track_audit = select_stable_subtitle_track(observations)
+    stable_top = float(track_audit.get("stable_top", 0.76))
+    paginated_events = split_long_subtitle_events(events, target_language)
+    display_events, timeline_audit = resolve_subtitle_timeline(paginated_events)
     candidates: list[dict[str, Any]] = []
     for event in display_events:
-        start, end = float(event["start"]), float(event["end"])
-        nearby = [
-            row for row in observations
-            if start - 0.45 <= _number(row.get("timestamp")) <= end + 0.45
-            and row.get("bbox")
-        ]
-        source = "overlapping_ocr"
-        if not nearby and observations:
-            midpoint = (start + end) / 2.0
-            nearest = min(
-                observations,
-                key=lambda row: abs(_number(row.get("timestamp")) - midpoint),
-            )
-            if abs(_number(nearest.get("timestamp")) - midpoint) <= 4.0:
-                nearby = [nearest]
-                source = "nearby_ocr"
-        if nearby:
-            original_top = _median([float(row["bbox"][1]) for row in nearby], global_top)
-        elif observations:
-            original_top = global_top
-            source = "global_ocr_median"
+        source = "stable_global_ocr_track" if stable_track else "missing_ocr_geometry"
+        if event.get("timeline_resolution") == "combined_source_overlap":
+            # Each source utterance gets its own line in the single shared
+            # card; do not collapse the explicit line break during wrapping.
+            render_text = str(event.get("text") or "").strip()
         else:
-            # This is only a provisional boundary.  With no OCR geometry at
-            # all, the final planner uses a separate bottom canvas rather than
-            # pretending it can prove a collision-free in-frame placement.
-            original_top = 0.76
-            source = "missing_ocr_geometry"
-        render_text = _wrap_two_lines(
-            str(event.get("text") or ""), target_language
-        )
+            render_text = _wrap_two_lines(
+                str(event.get("text") or ""), target_language
+            )
         candidates.append({
             **dict(event),
-            "original_subtitle_top": round(original_top, 6),
+            "original_subtitle_top": round(stable_top, 6),
             "placement_source": source,
             "render_text": render_text,
-            "line_count": 2 if "\n" in render_text else 1,
+            "line_count": max(1, render_text.count("\n") + 1),
         })
 
-    # Smooth OCR jitter, but never move a subtitle down across the current
-    # frame's own collision boundary.
+    # Use one global baseline.  Per-event OCR placement made subtitles jump
+    # when OCR briefly detected a sign, price label, or face-adjacent text.
     font_size, gap = default_font, default_gap
     def fits(candidate: Mapping[str, Any], font: int, spacing: int) -> bool:
         bottom = float(candidate["original_subtitle_top"]) * height - spacing
@@ -436,7 +661,7 @@ def plan_subtitle_layout(
     if any(not fits(row, font_size, gap) for row in candidates):
         font_size, gap = minimum_font, minimum_gap
     expanded = (
-        bool(candidates) and not observations
+        bool(candidates) and not stable_track
     ) or any(not fits(row, font_size, gap) for row in candidates)
     band_height = 0
     output_height = height
@@ -445,17 +670,15 @@ def plan_subtitle_layout(
         output_height = height + band_height
 
     planned: list[dict[str, Any]] = []
-    raw_boundaries = [row["original_subtitle_top"] * height - gap for row in candidates]
-    for index, candidate in enumerate(candidates):
+    fixed_boundary = stable_top * height - gap
+    for candidate in candidates:
         if expanded:
             baseline = height + int(round(band_height * 0.78))
             placement = "expanded_bottom_canvas"
             collision_boundary = None
         else:
-            neighborhood = raw_boundaries[max(0, index - 1):index + 2]
-            smoothed = _median(neighborhood, raw_boundaries[index])
-            collision_boundary = raw_boundaries[index]
-            baseline = min(smoothed, collision_boundary)
+            collision_boundary = fixed_boundary
+            baseline = fixed_boundary
             placement = candidate["placement_source"]
         row = dict(candidate)
         row.update({
@@ -482,7 +705,21 @@ def plan_subtitle_layout(
         "source_event_count": len(events),
         "display_event_count": len(planned),
         "ocr_observation_count": len(observations),
-        "no_overlap_guaranteed": bool(observations) or expanded,
+        "selected_track_observation_count": len(stable_track),
+        "stable_target_baseline_y": (
+            round(planned[0]["y"], 2) if planned else None
+        ),
+        "position_is_globally_fixed": True,
+        "subtitle_track": track_audit,
+        "timeline_audit": timeline_audit,
+        "spatial_no_overlap_guaranteed": bool(stable_track) or expanded,
+        "timeline_no_overlap_guaranteed": bool(
+            timeline_audit.get("events_are_disjoint")
+        ),
+        "no_overlap_guaranteed": (
+            (bool(stable_track) or expanded)
+            and bool(timeline_audit.get("events_are_disjoint"))
+        ),
     }
 
 
@@ -584,7 +821,13 @@ def render_target_subtitles(
     output.mkdir(parents=True, exist_ok=True)
     width, height = probe_video_size(base)
     cache_path = Path(temp_dir) / "ocr_optimized" / "ocr_frames.json"
-    observations = read_ocr_subtitle_observations(cache_path, width, height)
+    ocr_filter_diagnostics: dict[str, Any] = {}
+    observations = read_ocr_subtitle_observations(
+        cache_path,
+        width,
+        height,
+        diagnostics=ocr_filter_diagnostics,
+    )
     events = build_subtitle_events(segments, tts_results, mix_audit, video_duration)
     if not events:
         raise RuntimeError("no actually mixed target-language lines to subtitle")
@@ -596,6 +839,7 @@ def render_target_subtitles(
         target_language=target_language,
         preferred_font_size=preferred_font_size,
     )
+    layout["ocr_filter_diagnostics"] = ocr_filter_diagnostics
     digest = hashlib.sha1(project_name.encode("utf-8")).hexdigest()[:8]
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", project_name).strip("_") or "project"
     stem = f"{safe_name}_{digest}_target_subtitles"

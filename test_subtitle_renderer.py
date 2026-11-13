@@ -7,6 +7,8 @@ from subtitle_renderer import (
     build_subtitle_events,
     plan_subtitle_layout,
     read_ocr_subtitle_observations,
+    resolve_subtitle_timeline,
+    select_stable_subtitle_track,
     split_long_subtitle_events,
     write_ass,
 )
@@ -57,6 +59,40 @@ class SubtitleRendererTests(unittest.TestCase):
         self.assertEqual(rows[0]["texts"], ["臣妾以瓜尔佳氏一族起誓"])
         self.assertEqual(rows[0]["bbox"], [0.312, 0.888, 0.685, 0.947])
 
+    def test_mid_frame_scene_text_is_rejected_with_diagnostics(self):
+        payload = {"a": {
+            "status": "ok",
+            "timestamp": 4.0,
+            "text": "价格(350,450),(650,520)对白(310,888),(685,947)",
+        }}
+        audit = {}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ocr_frames.json"
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            rows = read_ocr_subtitle_observations(
+                path, 1920, 1080, diagnostics=audit
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["texts"], ["对白"])
+        self.assertEqual(audit["accepted_line_count"], 1)
+        self.assertEqual(audit["rejected_line_count"], 1)
+        self.assertEqual(
+            audit["rejected_lines"][0]["reason"],
+            "outside_bottom_subtitle_band",
+        )
+
+    def test_stable_track_rejects_spatial_outlier(self):
+        observations = [
+            {"timestamp": 1, "bbox": [0.2, 0.82, 0.8, 0.90]},
+            {"timestamp": 2, "bbox": [0.2, 0.83, 0.8, 0.91]},
+            {"timestamp": 3, "bbox": [0.2, 0.81, 0.8, 0.89]},
+            {"timestamp": 4, "bbox": [0.2, 0.70, 0.8, 0.77]},
+        ]
+        selected, audit = select_stable_subtitle_track(observations)
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(audit["rejected_observation_count"], 1)
+        self.assertGreater(audit["confidence"], 0.7)
+
     def test_events_use_final_tts_text_and_actual_mix_timing(self):
         rows = build_subtitle_events(
             [{"id": 3, "start": 1.0, "end": 2.0, "text": "旧译文"}],
@@ -66,6 +102,22 @@ class SubtitleRendererTests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["text"], "最终配音文本")
         self.assertEqual((rows[0]["start"], rows[0]["end"]), (1.2, 2.3))
+
+    def test_mix_overlap_evidence_is_preserved_for_subtitle_timeline(self):
+        rows = build_subtitle_events(
+            [{"id": 3, "text": "台词"}],
+            [{"segment_id": 3, "status": "success", "tts_text": "台词"}],
+            [{
+                "segment_id": 3,
+                "start": 1.0,
+                "audible_end": 2.0,
+                "allowed_overlap_seconds": 0.4,
+                "source_overlap_evidence": "source_speech_overlap",
+            }],
+            10.0,
+        )
+        self.assertEqual(rows[0]["allowed_overlap_seconds"], 0.4)
+        self.assertEqual(rows[0]["source_overlap_evidence"], "source_speech_overlap")
 
     def test_unmixed_or_failed_lines_do_not_get_subtitles(self):
         rows = build_subtitle_events(
@@ -87,6 +139,70 @@ class SubtitleRendererTests(unittest.TestCase):
         self.assertEqual(layout["mode"], "above_existing_subtitle")
         self.assertLessEqual(event["y"], 0.78 * 1080 - event["gap_pixels"])
         self.assertFalse(event["overlaps_existing_subtitle"])
+
+    def test_all_target_cards_use_one_fixed_vertical_position(self):
+        events = [
+            {"segment_id": "0", "start": 1, "end": 2, "text": "第一句"},
+            {"segment_id": "1", "start": 3, "end": 4, "text": "第二句"},
+        ]
+        observations = [
+            {"timestamp": 1.5, "bbox": [0.2, 0.80, 0.8, 0.89]},
+            {"timestamp": 3.5, "bbox": [0.2, 0.84, 0.8, 0.91]},
+            {"timestamp": 7.0, "bbox": [0.2, 0.70, 0.8, 0.76]},
+        ]
+        layout = plan_subtitle_layout(events, observations, 1920, 1080)
+        self.assertEqual(len({event["y"] for event in layout["events"]}), 1)
+        self.assertTrue(layout["position_is_globally_fixed"])
+        self.assertEqual(
+            layout["events"][0]["placement_source"],
+            "stable_global_ocr_track",
+        )
+
+    def test_artificial_timeline_overlap_gets_one_handoff_boundary(self):
+        events = [
+            {"segment_id": "0", "start": 0.0, "end": 2.0, "text": "A"},
+            {"segment_id": "1", "start": 1.7, "end": 3.0, "text": "B"},
+        ]
+        resolved, audit = resolve_subtitle_timeline(events)
+        self.assertEqual(audit["artificial_overlap_handoff_count"], 1)
+        self.assertTrue(audit["events_are_disjoint"])
+        self.assertEqual(resolved[0]["end"], resolved[1]["start"])
+
+    def test_current_lines_next_overlap_budget_does_not_apply_backwards(self):
+        events = [
+            {"segment_id": "0", "start": 0.0, "end": 2.0, "text": "A"},
+            {
+                "segment_id": "1", "start": 1.7, "end": 3.0, "text": "B",
+                "allowed_overlap_seconds": 0.5,
+                "source_overlap_evidence": "source_speech_overlap",
+            },
+        ]
+        resolved, audit = resolve_subtitle_timeline(events)
+        self.assertEqual(audit["artificial_overlap_handoff_count"], 1)
+        self.assertFalse(any(
+            row.get("timeline_resolution") == "combined_source_overlap"
+            for row in resolved
+        ))
+
+    def test_real_source_overlap_becomes_one_combined_card(self):
+        events = [
+            {
+                "segment_id": "0", "start": 0.0, "end": 2.0, "text": "A",
+                "allowed_overlap_seconds": 0.5,
+                "source_overlap_evidence": "source_speech_overlap",
+            },
+            {"segment_id": "1", "start": 1.5, "end": 3.0, "text": "B"},
+        ]
+        resolved, audit = resolve_subtitle_timeline(events)
+        self.assertTrue(audit["events_are_disjoint"])
+        combined = [
+            row for row in resolved
+            if row.get("timeline_resolution") == "combined_source_overlap"
+        ]
+        self.assertEqual(len(combined), 1)
+        self.assertEqual(combined[0]["text"], "A\nB")
+        self.assertEqual(combined[0]["start"], 1.5)
+        self.assertEqual(combined[0]["end"], 2.0)
 
     def test_1080p_default_font_is_readably_large(self):
         events = [{"segment_id": "0", "start": 1, "end": 2, "text": "Readable text"}]
