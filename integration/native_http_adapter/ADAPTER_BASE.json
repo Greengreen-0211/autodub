@@ -1,0 +1,16 @@
+{
+  "files": [
+    {
+      "path": "task_service/native_audio.py",
+      "sha256": "c20a6e2150762d0bca19cc702016750b1ed6c775b91da515bcfcdf36810dfd81"
+    },
+    {
+      "path": "task_service/native_trials.py",
+      "sha256": "b047fbcdf0bfa8ff8d57e113c7e1b63f447ce09630d9692ea08fe8d9f4a9a4d3"
+    },
+    {
+      "path": "tools/start_video_workflow.py",
+      "sha256": "a1658778decaf85809d188f6f605c5f2a7cb03fe8c35d5a3d440d260d80c9abd"
+    }
+  ]
+}

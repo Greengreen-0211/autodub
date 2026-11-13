@@ -1,0 +1,253 @@
+{
+  "repository": "Greengreen-0211/autodub",
+  "commit": "f0577d9c7252bb22ae24494d5c9791d517aaba4e",
+  "checked_date": "2026-11-12",
+  "files": [
+    {
+      "path": "asr_recovery.py",
+      "git_blob": "85c8d2d00ce90879110c5aed73e247607ea2e8ca",
+      "bytes": 28106,
+      "sha256": "a1fbf9a8d8c4db67ed885efcc1e531ee92f8629e4d31249b7fb8e924cdac414f"
+    },
+    {
+      "path": "auto_dubbing_ver_2.0.py",
+      "git_blob": "888b859d13ee6c4ea746eaefa21a146a403bcd5c",
+      "bytes": 244342,
+      "sha256": "469e7cf09c886674b1fbb5187927b585e8ba4cc2fa3c63791b1e41d2539d130e"
+    },
+    {
+      "path": "autodub_ocr_runtime/FROZEN_SOURCES.json",
+      "git_blob": "df8382297387677d402f67655a3ad63f954750ff",
+      "bytes": 4321,
+      "sha256": "fc69c47dd6f8eacc1aa1cf38793bd83be2e3efa8a40aa64eae56cce5aa25f3ba"
+    },
+    {
+      "path": "autodub_ocr_runtime/__init__.py",
+      "git_blob": "1ec0d3c03d4300010f7f4ecdc26e69c2c0197583",
+      "bytes": 114,
+      "sha256": "c5363010f24db0143d697cdaba20ee3bb94b6fa3e7b5c1e7a13aaecc108aa57f"
+    },
+    {
+      "path": "autodub_ocr_runtime/engine.py",
+      "git_blob": "5a78a4d34c039c67a44d6483425aaf4582bc2402",
+      "bytes": 12607,
+      "sha256": "72bf4e3fb12ed3c365f96b4e92a5dbf90b479b5e569077f9d00d673b5e8c2086"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/replay_p3_guard_candidates_v1.py",
+      "git_blob": "d6b630fc878c8de717ac547360d61727ec0321fc",
+      "bytes": 14911,
+      "sha256": "7958c26bc312f94d2952cdc21aca6801375366979c987e470d9d230bcc087514"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/replay_v11_p4_task_boundary_v1.py",
+      "git_blob": "00589f42f3a1fe94d57b4f6066fafcaf5573f58f",
+      "bytes": 17274,
+      "sha256": "2b282239bea14f22c79c9a7c9de872625d59d59da9f49f0d8f540aa6b7278596"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/run_ocr_asr_correction_ablation.py",
+      "git_blob": "c3953e21b5e23797e82bbf57dd948349336554f9",
+      "bytes": 50805,
+      "sha256": "946f75d9c9a0c255ddc2c8e400b47f721937803425fe0662d200dfcb1ebaae04"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_a1_local_deletion.py",
+      "git_blob": "6e20a3f359e29e3cefe28df67e0e37a09aaf81fb",
+      "bytes": 6019,
+      "sha256": "56cc74fab06c187c093ae7c6adec87a07650830d8d75f1b7eab4fee5499a038b"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c1r_checked_adapter.py",
+      "git_blob": "4292a5c287a645e15482d4e39a90b9f49b392109",
+      "bytes": 6454,
+      "sha256": "f61bcf9d71dad657159a5b43a2382dfb6feaafda55b96de6797707d96535de9a"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c3_structured_adapter.py",
+      "git_blob": "27d65050b74cbe666444a872e3ff3d955340fbcc",
+      "bytes": 12888,
+      "sha256": "ed2b67f1da6118accf7acc2a2022095c6a1f3cd15d579fc1253eaca58bccb901"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c3_structured_adapter_r2.py",
+      "git_blob": "6fcccf0be688f63ceda8e654bb42ad4964b56d25",
+      "bytes": 1359,
+      "sha256": "fdf8522fa3650bdadffc9f74de63981ab3d9f6d70259353f4f63b6dde5c45715"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c4_candidate_adapter.py",
+      "git_blob": "f539188c0bfe267f20667b196eaa4d5109bb3d80",
+      "bytes": 4960,
+      "sha256": "626c813fec286e8e03eba70bba5d04745f3bf54ae08b39e4525e9ce5257dbf83"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c4_candidate_adapter_r4.py",
+      "git_blob": "ce12b6dc666040b3f2af45e20642765978f4022d",
+      "bytes": 1520,
+      "sha256": "1100a0ac960a95acc87b23db804fee5c801947270e7d52ff1f47843b402bfc5c"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c4_candidate_inventory.py",
+      "git_blob": "4920d1e44b1f5979f288f45b9acfc95b5ba372c9",
+      "bytes": 22620,
+      "sha256": "82b68864e92313ef6358aecc748686c9e04a2bfa18f55347447cdf7cf2979c63"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c4_candidate_inventory_r2.py",
+      "git_blob": "e1dc6bf8975790fb1f77865954f655be56999a28",
+      "bytes": 4690,
+      "sha256": "1f8aa3ef5e927b4d75f30e27d62b69e47eeb3508ddbe0b5c6a65dc3ffba49782"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c4_candidate_inventory_r4.py",
+      "git_blob": "6493e66b2bced7bf556c1625674f560b67614ba9",
+      "bytes": 27410,
+      "sha256": "ffe4d384c3ec24f69af09826738dbc261bd84da5b506406f5e337b4d0426c524"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c7_ocr_structure_sanitizer_r1.py",
+      "git_blob": "72c151316cc0dce754d9a0b0425d50c26a94b99e",
+      "bytes": 4175,
+      "sha256": "c537999785526c728b8a7b92a7cfb52d880322ebdf5f84b368d7fab2d22e27ed"
+    },
+    {
+      "path": "autodub_ocr_runtime/frozen/v12_c8_exact_context.py",
+      "git_blob": "ddf96131d6facead97154faf0ef65adf1714d09f",
+      "bytes": 5627,
+      "sha256": "d8f0386c6648f785683b4f5f89a92759686c6fa71fa96b106eca50bfd7dea3ee"
+    },
+    {
+      "path": "backend_contract.py",
+      "git_blob": "8aa6feb26cc5e824cf36d2df27e0c74bac41454b",
+      "bytes": 28018,
+      "sha256": "29dcf8c37fa26f937725d1ba7504685ac16a880524490f6e8744780ea0a8a123"
+    },
+    {
+      "path": "check_ocr_service.py",
+      "git_blob": "77091d9b434c6af2b2fc9cfc8b41a8a2891a5cc1",
+      "bytes": 2964,
+      "sha256": "53f196dcde4c55abebbf9ac9423447c65507f775a5ce8034930319041a5bcaf4"
+    },
+    {
+      "path": "emotion_recognizer.py",
+      "git_blob": "e34d96f7d94b63b45c813fe6d568ea64b3d12097",
+      "bytes": 13934,
+      "sha256": "158477c24591b97e243ca4f582c0d8d9d42ece431e4e58f1b2a8dac4648b9be9"
+    },
+    {
+      "path": "emotion_worker.py",
+      "git_blob": "4829fbd349b67b2f9519f0e237d996c802e08aa7",
+      "bytes": 6008,
+      "sha256": "ab8d341f2f2e689af8a95e995309a72295fa3c54d38337cf37955754980db4a9"
+    },
+    {
+      "path": "light_tts_selector.py",
+      "git_blob": "bd275ef6709719b8292555acb957381807639a26",
+      "bytes": 32407,
+      "sha256": "821458774e9833facaf0bfa30e907caef548487f58c307244a2426853f0aad39"
+    },
+    {
+      "path": "make_fbank_direct.py",
+      "git_blob": "c59074b155a33058776c36d5ca8910eaedac33f1",
+      "bytes": 2431,
+      "sha256": "72db818ab48e214af99ef764a0aa23fdda1be06e4ddc5cfb05167d2ca759b8f2"
+    },
+    {
+      "path": "mix_timing.py",
+      "git_blob": "10250fe2ed94c36fbb1d931196ce08fe845941ce",
+      "bytes": 9602,
+      "sha256": "8119b2bf4dd69649b6272ab68cc0ae6b3993133f59f4fdb5099e9a38152cff68"
+    },
+    {
+      "path": "ocr_server_v2.py",
+      "git_blob": "b46ebfee5baa6d3240fc3c37dd7f53bec4f597b7",
+      "bytes": 11555,
+      "sha256": "41a90b0a52166b2f2c03d305befdde3f5b79eccb4958a911a4d462727179d41f"
+    },
+    {
+      "path": "ocr_translation_reference.py",
+      "git_blob": "c8b22bbbf1c3fa74d5a81fa8222f8872ad124439",
+      "bytes": 38995,
+      "sha256": "77725b7feecfeb08394b9afc7b57d6b0e722cff292a13dd613b7e1ec991667b6"
+    },
+    {
+      "path": "ocr_v211_integration.py",
+      "git_blob": "78cff00ddb504d344ff31e217a55286daa7ecb1a",
+      "bytes": 69260,
+      "sha256": "87621baa38e695daa7087216fd4e44ca4b0a259dd835c3fdd92c8564ce874674"
+    },
+    {
+      "path": "run_step2_wespeaker.py",
+      "git_blob": "968090733086432d265619ad556e76877596794e",
+      "bytes": 174063,
+      "sha256": "68500c83dbbff37a6c67435f497efd317fc7d76d4953d6f2e4446adfce16572e"
+    },
+    {
+      "path": "scheme3_policy.py",
+      "git_blob": "c113842ae8e33aeda55c47a977684388d144778e",
+      "bytes": 13958,
+      "sha256": "cf99a70248a39f557f32a9c864f190555d808527f27e8900f020735d9625707d"
+    },
+    {
+      "path": "speaker_alignment.py",
+      "git_blob": "54c93805305ca6f96a4ecad4ef40310ec7abe5e5",
+      "bytes": 45212,
+      "sha256": "27accfe4de92b04b4dfff7823e67fb354636b88c4f27e8e38e0b49e22c180051"
+    },
+    {
+      "path": "speech_activity.py",
+      "git_blob": "61efac75b6899cdf01bdb241ddedbfcf8ef8d170",
+      "bytes": 41983,
+      "sha256": "78b51749c22035ce895d32f633e99277af401f391cfcc5451accd332f6603a79"
+    },
+    {
+      "path": "subtitle_renderer.py",
+      "git_blob": "2d3c4ce636251eef78897916f68c9150d316476f",
+      "bytes": 24288,
+      "sha256": "f68027ea13cc4dc6a14c2326690db24ad0664c2c4bbdf6cc356ccdb62a814f07"
+    },
+    {
+      "path": "translation_quality.py",
+      "git_blob": "04fb6ea785efa7d40bb5ac150e48a2954608a240",
+      "bytes": 69666,
+      "sha256": "db4c6bf6a74e0c8b986423dfa4078968b6c212be6f6647781ff1a909d65423b9"
+    },
+    {
+      "path": "tts_content_verifier.py",
+      "git_blob": "0b338ee5e0559b7e19875196d898bbfa9e511655",
+      "bytes": 16438,
+      "sha256": "5ee4955f296aa063df08c387e6991d90aebf4dd4449a0d945e09ea93fe9dc419"
+    },
+    {
+      "path": "tts_preflight.py",
+      "git_blob": "e2289ed9d7dae1e50b7d8626393d1011157356d8",
+      "bytes": 9065,
+      "sha256": "5e9a847389dc7e8ee92e6f496316d691a374b6035385f9df9e48179a86086bcf"
+    },
+    {
+      "path": "tts_quality.py",
+      "git_blob": "66e39db19cd594ab3a9fbdc208c976eca15c5dd0",
+      "bytes": 44094,
+      "sha256": "146a84c8bd1c9dfa23fd9679a90a3ea2c4ac1de8383c9483afdd682f0b62646f"
+    },
+    {
+      "path": "tts_router.py",
+      "git_blob": "916bb4c0d89964ebeb889c9be1f9a4aa7f598a5a",
+      "bytes": 179235,
+      "sha256": "7d374cd8ef9274db9c4f3d4e8934065fd0091284b4d839131e08ac257b6b97fe"
+    },
+    {
+      "path": "tts_voice_identity.py",
+      "git_blob": "a09064ac42957e04e1631e14e059e417cbf1f86f",
+      "bytes": 24649,
+      "sha256": "b5f0c729060d31f535c2b6d54ca13c3c803da036695898f749ba23b42a0d9dd8"
+    },
+    {
+      "path": "tts_worker.py",
+      "git_blob": "1414475d752c3d8dcb2d1f0ef5c9c3144741c568",
+      "bytes": 20348,
+      "sha256": "3b7b692e837ea02657db450300eeeb57fb3af13bb76ae03952a4416f6f831fcf"
+    }
+  ]
+}
