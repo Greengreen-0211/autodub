@@ -4206,6 +4206,12 @@ def build_clustering_comparison(repaired, pairwise):
 
 
 def main():
+    from diarization_router import run_bridge
+
+    return run_bridge(TEMP_DIR, _run_wespeaker_legacy)
+
+
+def _run_wespeaker_legacy():
     print("=== [Step 2] WeSpeaker + 时序约束聚类 说话人分离 ===")
     print(f"当前 Python: {sys.executable}")
     state = load_state()
