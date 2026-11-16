@@ -1,1 +1,4 @@
 edge-tts
+# Pocket TTS（主用时长预览后端：英文/法/德/葡/意/西/荷；需 torch，CPU 即可；
+# 未安装时自动回退 edge-tts/espeak，也可用 AUTODUB_LIGHT_TTS_BACKEND 强制指定）
+pocket-tts

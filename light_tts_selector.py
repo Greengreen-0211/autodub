@@ -27,6 +27,9 @@ VOICE_BY_LANGUAGE = {
     "ru": "ru-RU-SvetlanaNeural",
 }
 
+# Kyutai Pocket TTS 内置语言（无中文），其余语言走 edge-tts/espeak。
+POCKET_LANGUAGES = {"en", "fr", "de", "pt", "it", "es", "nl"}
+
 
 class LightTTSBackend(Protocol):
     name: str
@@ -102,6 +105,10 @@ def _language_code(value: Any) -> str:
     aliases = {"chinese": "zh", "mandarin": "zh", "english": "en"}
     language = aliases.get(language, language)
     return language.split("-", 1)[0] or "en"
+
+
+def _routes_to_pocket(language: Any) -> bool:
+    return _language_code(language) in POCKET_LANGUAGES
 
 
 def _safe_id(value: Any) -> str:
@@ -205,8 +212,91 @@ class EspeakBackend:
         self._generate(text, self.voice_for(language), output_path)
 
 
+class PocketTTSBackend:
+    """Kyutai Pocket TTS (CPU, ~100M) as a light-TTS duration preview backend.
+
+    按语言惰性加载模型并缓存，``generate_audio`` 返回 24kHz 的 PCM 张量。
+    只对 ``POCKET_LANGUAGES`` 里的内置语言路由到这里；中文等其余语言仍走
+    edge-tts/espeak（见 ``LightTTSSelector._backend_for``）。
+    """
+
+    name = "pocket-tts"
+    extension = ".wav"
+
+    def __init__(self, voice: Optional[str] = None) -> None:
+        self.voice = voice or os.getenv("AUTODUB_POCKET_TTS_VOICE", "alba")
+        self.signature = f"{self.name}:{self.voice}"
+        self._models: Dict[str, Any] = {}
+        self._voices: Dict[str, Any] = {}
+        self._checked: set = set()
+
+    @staticmethod
+    def _pocket_language(language: str) -> str:
+        lang = _language_code(language)
+        if lang not in POCKET_LANGUAGES:
+            raise RuntimeError(
+                f"Pocket TTS 不支持语言 {lang!r}（可用: {sorted(POCKET_LANGUAGES)}）"
+            )
+        return lang
+
+    def _model(self, lang: str) -> Any:
+        if lang not in self._models:
+            try:
+                from pocket_tts import TTSModel
+            except ImportError as exc:
+                raise RuntimeError(
+                    "pocket-tts 未安装；请 pip install pocket-tts（需 torch），"
+                    "或设置 AUTODUB_LIGHT_TTS_BACKEND=edge-tts/espeak 跳过。"
+                ) from exc
+            self._models[lang] = TTSModel.load_model(language=lang)
+        return self._models[lang]
+
+    def _voice(self, lang: str) -> Any:
+        if lang not in self._voices:
+            self._voices[lang] = self._model(lang).get_state_for_audio_prompt(self.voice)
+        return self._voices[lang]
+
+    def preflight(self, language: str) -> None:
+        lang = self._pocket_language(language)
+        if lang in self._checked:
+            return
+        model = self._model(lang)
+        voice = self._voice(lang)
+        audio = model.generate_audio(voice, "test")
+        if audio is None or (hasattr(audio, "numel") and audio.numel() == 0):
+            raise RuntimeError(f"Pocket TTS {lang} 最小合成自检失败")
+        self._checked.add(lang)
+        print(f"Pocket TTS preflight: lang={lang} voice={self.voice} PASS")
+
+    def synthesize(self, text: str, language: str, output_path: Path) -> None:
+        lang = self._pocket_language(language)
+        model = self._model(lang)
+        voice = self._voice(lang)
+        audio = model.generate_audio(voice, text)
+        self._write_wav(audio, int(getattr(model, "sample_rate", 24000)), output_path)
+
+    @staticmethod
+    def _write_wav(audio: Any, sample_rate: int, output_path: Path) -> None:
+        import numpy as np
+
+        if hasattr(audio, "detach"):
+            samples = np.asarray(audio.detach().cpu().numpy())
+        else:
+            samples = np.asarray(audio)
+        pcm = np.clip(samples.reshape(-1).astype(np.float32), -1.0, 1.0)
+        pcm = (pcm * 32767.0).astype(np.int16)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(output_path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(sample_rate)
+            handle.writeframes(pcm.tobytes())
+
+
 def create_light_tts_backend(name: str = "auto") -> LightTTSBackend:
     selected = str(name or "auto").strip().lower()
+    if selected in {"pocket-tts", "pocket"}:
+        return PocketTTSBackend()
     if selected == "edge-tts":
         return EdgeTTSBackend()
     if selected in {"espeak", "espeak-ng"}:
@@ -220,7 +310,7 @@ def create_light_tts_backend(name: str = "auto") -> LightTTSBackend:
             return EspeakBackend()
         except RuntimeError as exc:
             raise RuntimeError(
-                "没有可用的轻量 TTS：请安装 edge-tts 或 espeak-ng，"
+                "没有可用的轻量 TTS：请安装 edge-tts、espeak-ng 或 pocket-tts，"
                 "也可设置 AUTODUB_LIGHT_TTS_BACKEND。"
             ) from exc
 
@@ -238,8 +328,44 @@ class LightTTSSelector:
         self.root = Path(work_dir) / "light_tts_selector"
         self.audio_dir = self.root / "audio"
         self.results_path = self.root / "selection_results.json"
-        self.backend = backend or create_light_tts_backend(backend_name)
+        self.backend = backend  # 显式传入时绕过按语言路由（测试/回退兼容）
+        self.backend_name = str(backend_name or "auto").strip().lower()
+        self._routed_pocket: Optional[LightTTSBackend] = None
+        self._routed_fallback: Optional[LightTTSBackend] = None
+        self._pocket_disabled = False
         self.audio_dir.mkdir(parents=True, exist_ok=True)
+
+    def _single_backend(self) -> LightTTSBackend:
+        if self._routed_fallback is None:
+            self._routed_fallback = create_light_tts_backend(self.backend_name)
+        return self._routed_fallback
+
+    def _pocket_backend(self) -> LightTTSBackend:
+        if self._routed_pocket is None:
+            self._routed_pocket = PocketTTSBackend()
+        return self._routed_pocket
+
+    def _backend_for(self, language: str) -> LightTTSBackend:
+        """按语言选择轻量后端：Pocket TTS 覆盖内置语言，其余走 edge/espeak。"""
+        if self.backend is not None:
+            backend = self.backend
+        elif self.backend_name not in {"", "auto"}:
+            backend = self._single_backend()
+        elif _routes_to_pocket(language) and not self._pocket_disabled:
+            try:
+                backend = self._pocket_backend()
+                if hasattr(backend, "preflight"):
+                    backend.preflight(str(language))
+                return backend
+            except Exception as exc:
+                print(f"⚠️ Pocket TTS 不可用，回退 edge/espeak: {exc}")
+                self._pocket_disabled = True
+                backend = self._single_backend()
+        else:
+            backend = self._single_backend()
+        if hasattr(backend, "preflight"):
+            backend.preflight(str(language))
+        return backend
 
     def _load(self) -> Dict[str, Any]:
         if not self.results_path.exists():
@@ -261,6 +387,7 @@ class LightTTSSelector:
         language: str,
         target_duration: float,
         available_duration: float,
+        backend: LightTTSBackend,
     ) -> str:
         data = {
             "segment_id": segment_id,
@@ -269,7 +396,7 @@ class LightTTSSelector:
             "language": language,
             "target_duration": round(target_duration, 6),
             "available_duration": round(available_duration, 6),
-            "backend": self.backend.signature,
+            "backend": backend.signature,
         }
         encoded = json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
@@ -573,8 +700,6 @@ class LightTTSSelector:
         segments = [segment for segment in segments if not is_skipped(segment)]
         if not segments:
             return [], []
-        if hasattr(self.backend, "preflight"):
-            self.backend.preflight(str(target_language))
         state = self._load()
         output: List[Dict[str, Any]] = []
         selection_rows: List[Dict[str, Any]] = []
@@ -583,6 +708,7 @@ class LightTTSSelector:
             segment_id = str(segment.get("id", sequence))
             duration, available_duration = self._speech_window(segment)
             language = str(segment.get("target_lang_raw", target_language) or target_language)
+            backend = self._backend_for(language)
             candidates = normalize_translation_candidates(
                 segment.get("translations_candidates"), segment.get("text", "")
             )
@@ -594,10 +720,10 @@ class LightTTSSelector:
                 text = candidate["text"]
                 cache_key = f"{segment_id}:{index}"
                 fingerprint = self._fingerprint(
-                    segment_id, index, text, language, duration, available_duration
+                    segment_id, index, text, language, duration, available_duration, backend
                 )
                 output_path = self.audio_dir / (
-                    f"segment_{_safe_id(segment_id)}_candidate_{index}{self.backend.extension}"
+                    f"segment_{_safe_id(segment_id)}_candidate_{index}{backend.extension}"
                 )
                 known = state["candidates"].get(cache_key, {})
                 reusable = (
@@ -615,7 +741,7 @@ class LightTTSSelector:
                     record = dict(known)
                 else:
                     try:
-                        self.backend.synthesize(text, language, output_path)
+                        backend.synthesize(text, language, output_path)
                         actual = audio_duration(output_path)
                         if actual <= 0:
                             raise ValueError("empty TTS audio")
@@ -628,7 +754,7 @@ class LightTTSSelector:
                             "actual_duration": actual,
                             "duration_error": abs(actual - duration),
                             "audio_file": str(output_path.resolve()),
-                            "backend": self.backend.name,
+                            "backend": backend.name,
                             "request_fingerprint": fingerprint,
                             "status": "success",
                             "error": "",
@@ -640,7 +766,7 @@ class LightTTSSelector:
                             "text": text,
                             "target_duration": duration,
                             "audio_file": str(output_path.resolve()),
-                            "backend": self.backend.name,
+                            "backend": backend.name,
                             "request_fingerprint": fingerprint,
                             "status": "failed",
                             "error": str(exc),
@@ -702,7 +828,7 @@ class LightTTSSelector:
                     "_candidate_role", "unknown"
                 ),
                 "preview_audio": selected["audio_file"],
-                "backend": self.backend.name,
+                "backend": backend.name,
                 "status": "fallback" if selected.get("estimated") else "success",
                 "duration_source": "text_estimate" if selected.get("estimated") else "measured_audio",
                 "fallback_reason": "; ".join(r.get("light_tts_error", "") for r in enriched) if selected.get("estimated") else "",
