@@ -275,6 +275,46 @@ class SubtitleRendererTests(unittest.TestCase):
         self.assertEqual(event["placement_source"], "expanded_bottom_canvas")
         self.assertTrue(layout["no_overlap_guaranteed"])
 
+    def test_single_line_is_visually_centered_in_expanded_canvas(self):
+        events = [{
+            "segment_id": "0", "start": 1, "end": 2,
+            "text": "Single line subtitle",
+        }]
+        layout = plan_subtitle_layout(events, [], 1280, 720, target_language="en")
+        event = layout["events"][0]
+        expected_center = 720 + layout["bottom_canvas_extension"] / 2.0
+        rendered_center = (
+            event["y"] - event["subtitle_block_height_pixels"] / 2.0
+        )
+        self.assertAlmostEqual(rendered_center, expected_center, places=1)
+        self.assertAlmostEqual(
+            event["subtitle_visual_center_y"], expected_center, places=1
+        )
+
+    def test_one_and_two_line_cards_share_expanded_canvas_visual_center(self):
+        events = [
+            {
+                "segment_id": "0", "start": 1, "end": 2,
+                "text": "Short subtitle",
+            },
+            {
+                "segment_id": "1", "start": 3, "end": 4,
+                "text": (
+                    "This target subtitle is deliberately long enough "
+                    "to wrap across two readable lines"
+                ),
+            },
+        ]
+        layout = plan_subtitle_layout(events, [], 1280, 720, target_language="en")
+        centers = {
+            event["subtitle_visual_center_y"] for event in layout["events"]
+        }
+        self.assertEqual(len(centers), 1)
+        self.assertGreater(
+            max(event["y"] for event in layout["events"]),
+            min(event["y"] for event in layout["events"]),
+        )
+
     def test_insufficient_space_uses_expanded_canvas(self):
         events = [{
             "segment_id": "0",

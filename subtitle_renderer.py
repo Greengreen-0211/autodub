@@ -672,19 +672,29 @@ def plan_subtitle_layout(
     planned: list[dict[str, Any]] = []
     fixed_boundary = stable_top * height - gap
     for candidate in candidates:
+        block_height = float(candidate["line_count"]) * font_size * 1.28
         if expanded:
-            baseline = height + int(round(band_height * 0.78))
+            # ASS ``an2`` positions the bottom-center of the rendered text
+            # block at ``y``.  A fixed fraction of the band therefore makes a
+            # one-line card sit too low.  Offset the anchor by half of the
+            # measured block height so every card's *visual* center, whether
+            # one or two lines, remains at the center of the added canvas.
+            visual_center = height + band_height / 2.0
+            baseline = visual_center + block_height / 2.0
             placement = "expanded_bottom_canvas"
             collision_boundary = None
         else:
             collision_boundary = fixed_boundary
             baseline = fixed_boundary
+            visual_center = baseline - block_height / 2.0
             placement = candidate["placement_source"]
         row = dict(candidate)
         row.update({
             "x": round(width / 2.0, 2),
             "y": round(baseline, 2),
             "font_size": font_size,
+            "subtitle_block_height_pixels": round(block_height, 2),
+            "subtitle_visual_center_y": round(visual_center, 2),
             "gap_pixels": 0 if expanded else gap,
             "placement_source": placement,
             "collision_boundary_y": (
@@ -708,6 +718,10 @@ def plan_subtitle_layout(
         "selected_track_observation_count": len(stable_track),
         "stable_target_baseline_y": (
             round(planned[0]["y"], 2) if planned else None
+        ),
+        "stable_target_visual_center_y": (
+            round(height + band_height / 2.0, 2)
+            if expanded and planned else None
         ),
         "position_is_globally_fixed": True,
         "subtitle_track": track_audit,
