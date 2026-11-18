@@ -28,7 +28,17 @@ VOICE_BY_LANGUAGE = {
 }
 
 # Kyutai Pocket TTS 内置语言（无中文），其余语言走 edge-tts/espeak。
+# 路由判定用短码；pocket-tts 的 load_model 需要下列全名。
 POCKET_LANGUAGES = {"en", "fr", "de", "pt", "it", "es", "nl"}
+POCKET_LANGUAGE_NAMES = {
+    "en": "english",
+    "fr": "french",
+    "de": "german",
+    "pt": "portuguese",
+    "it": "italian",
+    "es": "spanish",
+    "nl": "dutch",
+}
 
 
 class LightTTSBackend(Protocol):
@@ -241,6 +251,11 @@ class PocketTTSBackend:
 
     def _model(self, lang: str) -> Any:
         if lang not in self._models:
+            # huggingface_hub 在 import 时读取 HF_ENDPOINT；内网机器可设置
+            # AUTODUB_POCKET_HF_ENDPOINT（例如 https://hf-mirror.com）走镜像。
+            mirror = os.getenv("AUTODUB_POCKET_HF_ENDPOINT", "").strip()
+            if mirror and not os.getenv("HF_ENDPOINT"):
+                os.environ["HF_ENDPOINT"] = mirror
             try:
                 from pocket_tts import TTSModel
             except ImportError as exc:
@@ -248,7 +263,9 @@ class PocketTTSBackend:
                     "pocket-tts 未安装；请 pip install pocket-tts（需 torch），"
                     "或设置 AUTODUB_LIGHT_TTS_BACKEND=edge-tts/espeak 跳过。"
                 ) from exc
-            self._models[lang] = TTSModel.load_model(language=lang)
+            self._models[lang] = TTSModel.load_model(
+                language=POCKET_LANGUAGE_NAMES[lang]
+            )
         return self._models[lang]
 
     def _voice(self, lang: str) -> Any:
