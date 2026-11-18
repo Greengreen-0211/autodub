@@ -1,0 +1,101 @@
+# 改动说明 —— OCR 冻结 B 句子级纠错
+
+分支：`fix/backend-ocr-sentence-split`（基于 `origin/backend`，已合并至 `f6072fa` 即 PR#15 之后）
+
+> 说明：本分支最初的基点是 `86ba282`（PR#10 之后）。为便于合并进 `backend`，已 `merge origin/backend`（合并提交 `9750724`）解决冲突；`ocr_v211_integration.py` 相对最新 `origin/backend` 只保留本次句子级改动，backend 新增的 `preserve_speaker_timing_skeleton` 逻辑在 legacy / 异常 / 正常三条路径上均保留。
+
+## 背景
+
+组长反馈 OCR 相关问题，经排查冻结 B 纠错链路存在一个结构性缺陷：
+
+冻结 B 纠错跑在 Step 1b，**早于 Step 2 的句子切分**，作用在粗粒度 ASR 片段上。
+而 HunyuanOCR 抽到的字幕卡（subtitle card）是细粒度的、逐句对应的。当一个粗片段
+包含多个句子（实测有 18s / 7 句的片段）时，整段文本被塞进**一次**请求里，OCR 字幕
+帧无法与多句 ASR 对齐，候选被判定为 `no_classifiable_candidates`，纠错实际 0 采纳。
+
+## 根因
+
+`OCRV211Corrector.correct()` 原来「一个粗片段 = 一条请求」，`qwen_asr` 是整段文本，
+`ocr_candidates` 是整段的所有 OCR 帧文本。多句片段里句子与字幕帧之间没有时间关联，
+冻结 B 的本地对齐拿不到可分类候选，只能保守保留原 ASR。
+
+## 修复思路
+
+把「一个粗片段 = 一条请求」改成「**一个句子 = 一条请求**」：
+
+1. 用粗片段自带的 `qwen3_sentence_candidates`（强制对齐器在 Step 1a 就已写入
+   `segments_qwen3_raw`，字段含 `char_start`/`char_end`/`start`/`end`）把整段切成句子片段。
+2. 每个句子单独构造一条请求，并把该句子时间窗 `[start-0.5, end+0.5]` 内的 OCR 帧
+   作为它的候选。
+3. 冻结 B 逐句返回纠错结果后，按 `char_start`/`char_end` 字符偏移把纠错后的句子
+   **原样拼回**整段文本（句间空白/标点分隔符不动）。
+
+## 涉及文件
+
+| 文件 | 改动 |
+|---|---|
+| `ocr_v211_integration.py` | 新增 `_split_segment_sentences` / `_split_text_sentences` / `_merge_sentence_decisions` / `_ocr_frames_by_segment`；`OCRV211Corrector.correct()` 增加 `frame_records` 参数并改为句子级请求+合并；`run_step_1b_optimized()` 把 `client.frame_records_by_segment` 传入 |
+
+## 改动详情
+
+### 1. `_split_segment_sentences(segment)`
+
+- 优先读 `qwen3_sentence_candidates`，用相邻候选的 `char_start` 作为上一句的结束边界，
+  每个片段 `text == text[char_start:char_end]`（`.rstrip()` 去尾随空白，`char_end` 相应回缩），
+  保证「纠错句 = 原句片段」可精确替换。
+- 没有时间戳（字段缺失/非法）时退化为按 `[.!?。！？]+空白` 标点切分（`_split_text_sentences`）。
+- 空文本片段保留一个空句子，行为与原来一致。
+
+### 2. `correct(segments, ocr_texts, frame_records=None)`
+
+- `frame_records` 由 `run_step_1b_optimized` 传入（内存版 `client.frame_records_by_segment`），
+  避免读缓存时混入历史视频的残留帧；仅在未传入时回退到 `_ocr_frames_by_segment()` 读
+  `ocr_frames.json` 兜底。
+- 每条请求 `id = f"{segment_id}::{index}"`，`qwen_asr` = 该句文本，`ocr_candidates` =
+  时间窗内的 OCR 帧（过滤空文本与「图片中没有文字。」标记）。
+- 引擎异常时整段 `_ocr_keep(..., "runtime_fallback:...")` 保留原 ASR，并同样调用
+  `preserve_speaker_timing_skeleton`。
+
+### 3. `_merge_sentence_decisions(text, sentences, decisions, segment_id)`
+
+- 按 `char_start`/`char_end` 逐句拼回；仅当决策 `accepted` 且 `corrected_text != 原句` 时才替换。
+- 全部不采纳时返回 `reason="no_sentence_correction_accepted"`，采纳任一则
+  `reason="sentence_level_correction"`。
+
+### 4. `run_step_1b_optimized()`
+
+- 新增 `frame_records_by_segment` 变量，在 OCR 抽帧成功后赋值为
+  `client.frame_records_by_segment`，并传入 `correct()`。
+
+## 兼容性
+
+- `off` / `legacy` 两条路径完全不变。
+- `ocr_texts`（`Dict[str, str]`）结构与下游 `backend_contract.py` 的 `ocr_texts_by_segment`
+  消费方式不变，前端片段契约不变。
+- `correct()` 新增的 `frame_records` 是可选参数，默认 `None` 时回退到缓存读取，
+  不破坏任何既有调用。
+- backend 的 `preserve_speaker_timing_skeleton` 在三条路径上均保留。
+
+## 测试（合并最新 backend 后重跑）
+
+- `python3 -m autodub_ocr_runtime.selftest`：**Ran 18 tests — OK**（API_CALLS=0）
+- `python3 test_ocr_host_integration.py`：**Ran 4 tests — OK**
+- `python3 test_backend_contract.py`：**Ran 3 tests — OK**
+- 针对真实 7 句粗片段（`test_video_4` 的 `segments_qwen3_raw[6]`）验证：
+  - 切分成 7 句，`char` 偏移正确；
+  - 无采纳决策拼接后与原文本**逐字节一致**；
+  - 单句替换在正确偏移处拼接成功。
+
+## 备份
+
+改前原文件备份于：
+
+```
+/data0/goldenseed/cjx/backups/ocr_v211_integration.py.20261025_205616.bak
+```
+
+## 提交
+
+`ocr_v211_integration.py`、`改动说明.md` 提交并推送至 `fix/backend-ocr-sentence-split`。
+
+> 仓库根目录下另有未跟踪文件 `run_phase_a.sh`（非本次改动、非我创建），**未纳入提交**。
