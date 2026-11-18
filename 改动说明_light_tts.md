@@ -66,6 +66,7 @@ pip install pocket-tts   # Linux CPU 可加 --extra-index-url https://download.p
 - `pip install --dry-run` 确认**只新增 pocket-tts-4.0.1，不升级/降级任何现有包**；随后实际安装成功。
 - 安装前 pip 快照：`/data0/goldenseed/cjx/backups/pip_freeze_autodub_server_20261118_164739.txt`
 - 首次加载模型需联网下载权重；本机直连 huggingface.co 不通，用 `AUTODUB_POCKET_HF_ENDPOINT=https://hf-mirror.com` 成功下载并缓存（英文模型）。
+- 同日补装 `edge-tts 7.3.1`（`pip install --dry-run` 确认只新增 `edge-tts` + `tabulate`），装前快照：`/data0/goldenseed/cjx/backups/pip_freeze_before_edge_20261118_171552.txt`。
 
 ## 测试
 
@@ -77,9 +78,27 @@ pip install pocket-tts   # Linux CPU 可加 --extra-index-url https://download.p
   - `synthesize(...)` 英文 → 2.48s WAV，24kHz，正常
   - 中文 → 被语言门正确拒绝（`Pocket TTS 不支持语言 'zh'`）
   - `LightTTSSelector(auto).select()` 真实英文片段 → `backend=pocket-tts`、2.96s/3.0s、`fit=suitable`，二次运行命中缓存
-  - 中文片段 → 走 espeak（本机 `edge-tts` 未安装，属既有状态），合成 2.72s 正常
+  - 中文片段 → 本机原先未装 `edge-tts`，走 espeak；**2026-11-18 已补装 `edge-tts 7.3.1`**（纯增量，另加 `tabulate`），现中文走 edge-tts
 
-> 注：本机 `autodub_server` 环境里 `edge-tts` 未安装，中文实际由 espeak 承担（`create_light_tts_backend("auto")` 自动降级）。这是改动前就存在的状态，本次未改动。
+### 后端实测性能对比（同 5 句英文，CPU，均预热）
+
+| 文本长度 | espeak | Pocket TTS | 输出时长 espeak / Pocket |
+|---|---|---|---|
+| 4 字符 | 10.0 ms | 549.0 ms | 0.63s / 1.04s |
+| 39 字符 | 11.5 ms | 850.5 ms | 2.14s / 1.68s |
+| 45 字符 | 12.7 ms | 1106.4 ms | 2.54s / 2.40s |
+| 66 字符 | 13.7 ms | 1383.8 ms | 3.68s / 3.28s |
+| 117 字符 | 15.9 ms | 2374.6 ms | 6.30s / 5.60s |
+| 合计 | 0.07s | 6.27s | — |
+
+- Pocket TTS 比 espeak 慢约 **55–150 倍**；另有一次性模型加载 ~4.9s。该版本无 device 参数，只能跑 CPU。
+- edge-tts 实测单句约 1.5–1.7s（含网络往返）。
+- **换 Pocket TTS 的收益是"时长估计与预览音质更贴近真实语音"，不是速度**；Step 3 会因此变慢（18 段 × 最多 5 候选 ≈ 1.5–2 分钟，已有指纹缓存，重跑不重复合成）。
+- 若需压缩耗时，可选：只对最终选中候选合成、`quantize=True`/降低 `sampler_decode_steps`、或长句继续用 espeak。
+
+### 关于"不合成直接估时长"
+
+Pocket TTS **没有**时长预测接口；时长需生成到 EOS 才确定。代码里已有的零成本兜底是纯文本估算（中文 字符数/4、英文 单词数/2.5），仅在合成失败时启用。
 
 ## 备份
 
