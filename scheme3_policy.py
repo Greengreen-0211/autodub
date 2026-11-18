@@ -25,18 +25,17 @@ POSITIVE_EMOTIONS = frozenset({"happy", "surprised"})
 SCHEME3_ENGINES = frozenset(
     {"f5tts", "indextts2", "cosyvoice3", "confucius4", "omnivoice"}
 )
-SCHEME3_RULE_VERSION = "scheme3-v1"
+SCHEME3_RULE_VERSION = "scheme3-v2-expressive"
 REQUIRED_SEGMENT_FIELDS = frozenset(
     {"text", "start", "end", "source_lang", "target_lang", "emotion", "speaker", "tts_engine"}
 )
 
-# Routing precedence.  ``complexity_first`` is the shipped scheme-three rule:
-# long or clause-heavy text always takes the long-text model.  The opt-in
-# ``strong_emotion_first`` lets a reliable strong emotion outrank complexity,
-# because indextts2 is the emotion-specialised engine.  The default is
-# unchanged, so existing routing decisions and fingerprints stay valid.
+# Reliable strong emotion now outranks text complexity by default. The runtime
+# actually passes source emotion evidence into IndexTTS2, so routing a long
+# angry/sad/fearful line to a neutral long-text path would discard usable
+# performance information. ``complexity_first`` remains an explicit rollback.
 EMOTION_PRECEDENCES = ("complexity_first", "strong_emotion_first")
-DEFAULT_EMOTION_PRECEDENCE = "complexity_first"
+DEFAULT_EMOTION_PRECEDENCE = "strong_emotion_first"
 
 LANGUAGE_ALIASES = {
     "chinese": "zh",

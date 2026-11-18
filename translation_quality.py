@@ -8,9 +8,9 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.12.1"
+RULE_VERSION = "translation-v2.16.0-scene-native"
 LANGUAGE_VERSION = "target-script-v2"
-PROMPT_VERSION = "neutral-dubbing-ocr-v12"
+PROMPT_VERSION = "native-dubbing-ocr-v17-role-separated"
 
 OCR_HARD_CONFLICTS = {
     "wrong_entity",
@@ -110,21 +110,49 @@ def _source_contains_form(text: Any, form: Any) -> bool:
     return _canonical(form) in _canonical(text)
 
 
+_LATIN_ENTITY_STOPWORDS = {
+    "a", "an", "and", "any", "are", "as", "at", "be", "but", "by",
+    "can", "did", "do", "does", "for", "from", "go", "had", "has",
+    "have", "he", "hello", "her", "here", "him", "his", "how", "i",
+    "if", "in", "is", "it", "its", "me", "my", "no", "not", "of",
+    "oh", "on", "or", "our", "she", "so", "that", "the", "their",
+    "them", "there", "they", "this", "to", "up", "us", "wait", "we",
+    "what", "when", "where", "which", "who", "why", "with", "you",
+    "your", "yes",
+}
+
+
+def plausible_source_entity_form(value: Any) -> bool:
+    """Reject ordinary dialogue words before they can become entity aliases."""
+    form = str(value or "").strip()
+    if not form:
+        return False
+    if re.search(r"[A-Za-z]", form):
+        words = re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", form)
+        if not words:
+            return False
+        if len(words) == 1 and words[0].casefold() in _LATIN_ENTITY_STOPWORDS:
+            return False
+    return True
+
+
 def applicable_glossary_entries(segment: dict, glossary: list[dict] | None) -> list[dict]:
     """Return validated video-level entities that occur in this source turn."""
-    source_parts = [str(segment.get("text", ""))]
-    source_parts.extend(
-        str(reference.get("source_text", ""))
-        for reference in segment.get("_ocr_translation_references", [])
-        if isinstance(reference, dict)
-    )
-    source_text = " ".join(source_parts)
+    # Only the authoritative ASR sentence may create a mandatory glossary
+    # constraint. OCR references can span adjacent subtitle cards and are
+    # useful as spelling/translation hints, but must never import a neighbour's
+    # entity into the current sentence (for example Olaf -> "Where are you?").
+    source_text = str(segment.get("text", ""))
     output = []
     for entry in glossary or []:
         if not isinstance(entry, dict):
             continue
         target_form = str(entry.get("target_form", "")).strip()
-        source_forms = [str(value).strip() for value in entry.get("source_forms", []) if str(value).strip()]
+        source_forms = [
+            str(value).strip()
+            for value in entry.get("source_forms", [])
+            if plausible_source_entity_form(value)
+        ]
         if target_form and source_forms and any(
             _source_contains_form(source_text, form) for form in source_forms
         ):
@@ -187,6 +215,45 @@ def _ocr_audit_acceptance(response_row: dict, variant: str) -> tuple[bool, str]:
     if failed:
         return False, f"{variant}_legacy_audit_failed:{','.join(failed)}"
     return True, "legacy_audit_passed"
+
+
+def _backend_exact_ocr_acceptance(reference: Any) -> tuple[bool, str]:
+    """Admit only a deterministically exact, repeated bilingual subtitle pair.
+
+    The independent model audit remains authoritative whenever it returned a
+    verdict.  This fallback exists for the narrower case where that audit is
+    unavailable: the OCR matcher already proved an exact source boundary over
+    repeated frames, so silently demoting the human target subtitle to a weak
+    hint makes the machine translation unnecessarily literal.  Partial,
+    composed, adaptive-time and repair-only references cannot pass this gate.
+    """
+    if not isinstance(reference, dict):
+        return False, "backend_exact_reference_missing"
+    try:
+        coverage_value = reference.get("source_coverage")
+        missing_value = reference.get("missing_rate")
+        extra_value = reference.get("extra_rate")
+        coverage = float(coverage_value if coverage_value is not None else 0.0)
+        missing = float(missing_value if missing_value is not None else 1.0)
+        extra = float(extra_value if extra_value is not None else 1.0)
+        support = int(reference.get("frame_support") or 0)
+    except (TypeError, ValueError):
+        return False, "backend_exact_reference_metrics_invalid"
+    checks = {
+        "policy": str(reference.get("reference_policy") or "") == "direct",
+        "tier": str(reference.get("reference_tier") or "") == "exact",
+        "confidence": str(reference.get("confidence") or "").lower() == "high",
+        "coverage": coverage >= 0.98,
+        "missing": missing <= 0.02,
+        "extra": extra <= 0.05,
+        "support": support >= 2,
+        "not_adaptive": not bool(reference.get("adaptive_time_match")),
+        "not_composed": not bool(reference.get("composed")),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        return False, "backend_exact_reference_failed:" + ",".join(failed)
+    return True, "backend_exact_repeated_source_boundary"
 
 
 def _ocr_audit_verdict(response_row: dict, variant: str) -> dict:
@@ -581,6 +648,15 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
     for candidate in raw:
         validate_target_text(candidate.get("text") if isinstance(candidate, dict) else candidate,
                              target, source_text, source, allow_identity=allow_identity)
+    allowed_roles = {"native_standard", "faithful_compact", "ocr_adapted"}
+    role_by_text = {
+        re.sub(r"[\W_]+", "", str(candidate.get("text", "")).casefold()): str(
+            candidate.get("role") or ""
+        )
+        for candidate in raw
+        if isinstance(candidate, dict)
+        and str(candidate.get("role") or "") in allowed_roles
+    }
     candidates = normalize_translation_candidates(raw, "")
     punctuated_candidates = []
     for candidate in candidates:
@@ -612,7 +688,17 @@ def validate_translation(row: dict, original: dict, source: str, target: str) ->
     # Candidate metadata returned by the model is untrusted. Provenance is
     # assigned only by this module after validation.
     for candidate in candidates:
-        candidate["_selection_priority"] = "standard"
+        role = role_by_text.get(canonical(candidate.get("text")), "")
+        candidate["_candidate_role"] = (
+            "native_standard"
+            if canonical(candidate.get("text")) == primary_key
+            else (role if role in allowed_roles else "faithful_compact")
+        )
+        candidate["_selection_priority"] = (
+            "native_standard"
+            if canonical(candidate.get("text")) == primary_key
+            else "faithful_variant"
+        )
     trusted_ocr = any(
         isinstance(reference, dict)
         and str(reference.get("confidence", "")).lower() == "high"
@@ -641,7 +727,10 @@ def _restore_backend_candidate_priorities(validated: dict, cached: dict) -> None
     A resumable checkpoint, however, already contains backend-validated OCR
     candidates and must retain their selection priority on a cache hit.
     """
-    allowed = {"ocr_direct", "ocr_repaired", "ocr_hybrid", "ocr_reference", "standard"}
+    allowed = {
+        "ocr_direct", "ocr_repaired", "ocr_hybrid", "ocr_reference",
+        "native_standard", "faithful_variant", "standard",
+    }
     priorities = {
         _canonical(candidate.get("text")): candidate.get("_selection_priority")
         for candidate in cached.get("translations_candidates", [])
@@ -652,20 +741,60 @@ def _restore_backend_candidate_priorities(validated: dict, cached: dict) -> None
         priority = priorities.get(_canonical(candidate.get("text")))
         if priority in allowed:
             candidate["_selection_priority"] = priority
+    roles = {
+        _canonical(candidate.get("text")): candidate.get("_candidate_role")
+        for candidate in cached.get("translations_candidates", [])
+        if isinstance(candidate, dict)
+        and candidate.get("_candidate_role") in {
+            "native_standard", "faithful_compact", "ocr_adapted"
+        }
+    }
+    for candidate in validated.get("translations_candidates", []):
+        role = roles.get(_canonical(candidate.get("text")))
+        if role:
+            candidate["_candidate_role"] = role
 
 
 def segment_fingerprint(segment: dict, previous: str, following: str, source: str,
                         target: str, model: str,
-                        entity_glossary: list[dict] | None = None) -> str:
+                        entity_glossary: list[dict] | None = None,
+                        dialogue_context: list[dict] | None = None) -> str:
     payload = {"rules": RULE_VERSION, "language_check": LANGUAGE_VERSION, "prompt": PROMPT_VERSION,
                "source": language_code(source), "target": language_code(target), "model": model,
                "segment": {k: segment.get(k) for k in
-                           ("id", "text", "start", "end", "speaker", "translation_allow_identity")},
+                           ("id", "text", "start", "end", "speaker",
+                            "translation_allow_identity", "tts_placement_start",
+                            "tts_hard_end", "tts_target_duration",
+                            "tts_timing_precision")},
                "previous_text": previous, "next_text": following,
+               "dialogue_context": dialogue_context or [],
                "entity_glossary": entity_glossary or [],
                "ocr_translation_references": segment.get("_ocr_translation_references", []),
                "ocr_source_spelling_hints": segment.get("_ocr_source_spelling_hints", [])}
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def _dialogue_context(
+    segments: list[dict], index: int, radius: int = 3
+) -> list[dict]:
+    """Return a compact, speaker-aware scene window around one source line."""
+    current_speaker = str(segments[index].get("speaker", "Unknown"))
+    context = []
+    left = max(0, index - max(1, int(radius)))
+    right = min(len(segments), index + max(1, int(radius)) + 1)
+    for other_index in range(left, right):
+        if other_index == index:
+            continue
+        item = segments[other_index]
+        context.append({
+            "relative_index": other_index - index,
+            "speaker": str(item.get("speaker", "Unknown")),
+            "same_speaker": str(item.get("speaker", "Unknown")) == current_speaker,
+            "text": str(item.get("text", "")),
+            "start": item.get("start"),
+            "end": item.get("end"),
+        })
+    return context
 
 
 def translate_segments(segments: list[dict], source: str, target: str, model: str,
@@ -682,9 +811,11 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         sid = ids[i]
         before = str(segments[i-1].get("text", "")) if i else ""
         after = str(segments[i+1].get("text", "")) if i+1 < len(segments) else ""
+        dialogue_context = _dialogue_context(segments, i)
         required_entities = applicable_glossary_entries(segment, entity_glossary)
         fp = segment_fingerprint(
-            segment, before, after, source, target, model, required_entities
+            segment, before, after, source, target, model, required_entities,
+            dialogue_context,
         )
         # Prompt-only keys are intentionally not copied into persisted/public rows.
         public_segment = {
@@ -709,12 +840,24 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
             else:
                 validated = validate_translation(known, segment, source, target)
                 _restore_backend_candidate_priorities(validated, known)
+                if known.get("translation_selection_source"):
+                    validated["translation_selection_source"] = str(
+                        known["translation_selection_source"]
+                    )
+                for audit_key in (
+                    "translation_ocr_action",
+                    "translation_ocr_admission",
+                    "translation_ocr_rejections",
+                ):
+                    if audit_key in known:
+                        validated[audit_key] = known[audit_key]
                 row.update(validated)
             row["translation_attempts"] = known.get("translation_attempts", 0)
             row["translation_cache_hit"] = True
         except ValueError:
             pending.append(i)
         rows.append(row)
+        rows[i]["translation_dialogue_context"] = dialogue_context
         references = []
         for reference in segment.get("_ocr_translation_references", [])[:3]:
             if not isinstance(reference, dict):
@@ -731,6 +874,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     "source_coverage": reference.get("source_coverage"),
                     "missing_rate": reference.get("missing_rate"),
                     "extra_rate": reference.get("extra_rate"),
+                    "frame_support": reference.get("frame_support"),
+                    "adaptive_time_match": bool(reference.get("adaptive_time_match", False)),
+                    "temporal_outside_seconds": reference.get("temporal_outside_seconds"),
                     "composed": bool(reference.get("composed", False)),
                     "subtitle_cards": reference.get("subtitle_cards", [])[:8],
                     "source_clauses": reference.get("source_clauses", [])[:12],
@@ -739,7 +885,16 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     "usage_policy": (
                         "preferred_if_complete"
                         if (
-                            str(reference.get("confidence", "")).lower() == "high"
+                            (
+                                str(reference.get("confidence", "")).lower() == "high"
+                                or (
+                                    str(reference.get("confidence", "")).lower() == "medium"
+                                    and float(reference.get("source_coverage") or 0.0) >= 0.90
+                                    and float(reference.get("missing_rate") or 1.0) <= 0.10
+                                    and float(reference.get("extra_rate") or 1.0) <= 0.08
+                                    and int(reference.get("frame_support") or 0) >= 2
+                                )
+                            )
                             and str(reference.get("reference_policy", "hint")) != "hint"
                         )
                         else "terminology_hint"
@@ -761,16 +916,65 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
             reference.get("usage_policy") == "preferred_if_complete"
             for reference in references
         )
+        public_duration = max(
+            0.1, float(segment["end"]) - float(segment["start"])
+        )
+        explicit_speech_duration = segment.get("tts_target_duration")
+        try:
+            mix_start = float(
+                segment.get("mix_start", segment.get("speech_start"))
+            )
+            mix_end = float(
+                segment.get("mix_end", segment.get("speech_end"))
+            )
+            speech_duration = (
+                mix_end - mix_start
+                if float(segment["start"]) <= mix_start < mix_end
+                <= float(segment["end"]) + 0.001
+                else public_duration
+            )
+        except (TypeError, ValueError):
+            speech_duration = public_duration
+        try:
+            if explicit_speech_duration is not None:
+                speech_duration = float(explicit_speech_duration)
+        except (TypeError, ValueError):
+            pass
+        speech_duration = max(0.1, speech_duration)
+        target_code = language_code(target)
+        if target_code == "en":
+            compact_budget = {
+                "unit": "spoken_words",
+                "maximum": max(1, int(speech_duration * 2.8)),
+            }
+        elif target_code == "zh":
+            compact_budget = {
+                "unit": "cjk_characters",
+                "maximum": max(2, int(speech_duration * 4.5)),
+            }
+        else:
+            compact_budget = {
+                "unit": "seconds",
+                "maximum": round(speech_duration, 3),
+            }
         inputs[i] = {"id": sid, "speaker": segment.get("speaker", "Unknown"),
                      "text_asr_corrected": segment.get("text", ""),
                      "previous_text": before, "next_text": after,
-                     "duration": float(segment["end"])-float(segment["start"]),
+                     "dialogue_context": dialogue_context,
+                     "duration": public_duration,
+                     "speech_duration_seconds": round(speech_duration, 3),
+                     "compact_spoken_budget": compact_budget,
+                     "candidate_roles": [
+                         "native_standard", "faithful_compact", "ocr_adapted"
+                     ],
                      "minimum_candidates": (
                          1 if is_tiny(str(segment.get("text", ""))) or trusted_ocr else 2
                      ),
                      "entity_glossary": required_entities,
                      "ocr_translation_references": references,
                      "ocr_source_spelling_hints": source_spelling_hints}
+        rows[i]["translation_entity_glossary"] = required_entities
+        rows[i]["translation_ocr_references"] = references
 
     def save():
         if checkpoint:
@@ -829,6 +1033,13 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     raw_trusted, raw_audit_reason = _ocr_audit_acceptance(
                         response_row, "raw"
                     )
+                    if (
+                        not raw_trusted
+                        and raw_audit_reason in {"audit_missing", "raw_audit_missing"}
+                    ):
+                        raw_trusted, raw_audit_reason = (
+                            _backend_exact_ocr_acceptance(preferred)
+                        )
                     raw_text, raw_punctuation_ready, raw_punctuation_reason = (
                         _punctuation_ready_text(
                             preferred["target_subtitle_reference"],
@@ -843,7 +1054,8 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                         raw_text,
                         "ocr_direct" if trusted_direct else "ocr_reference",
                         (
-                            f"exact_source_boundary:{raw_punctuation_reason}"
+                            f"exact_source_boundary:{raw_audit_reason}:"
+                            f"{raw_punctuation_reason}"
                             if trusted_direct
                             else (
                                 raw_audit_reason
@@ -1049,6 +1261,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                             accepted_candidates.append({
                                 "text": ocr_candidate,
                                 "_selection_priority": priority,
+                                "_candidate_role": "ocr_adapted",
                             })
                             admission_notes.append(
                                 f"{priority}={ocr_candidate[:120]!r}:{admission_reason}"
@@ -1071,6 +1284,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     )
                     if trusted_primary:
                         valid["text"] = trusted_primary["text"]
+                        valid["translation_selection_source"] = str(
+                            trusted_primary.get("_selection_priority", "standard")
+                        )
                     valid["translations_candidates"] = candidates[:5]
                 elif preferred and response_row.get("ocr_reference_complete") is True:
                     valid["translation_warnings"].append(
@@ -1078,6 +1294,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     )
                 for reason in rejected_ocr:
                     valid["translation_warnings"].append(f"ocr_candidate_rejected:{reason}")
+                valid["translation_ocr_action"] = ocr_action
+                valid["translation_ocr_admission"] = admission_notes
+                valid["translation_ocr_rejections"] = rejected_ocr
                 rows[i].update(valid)
                 for warning in valid["translation_warnings"]:
                     if warning != "candidate_lengths_similar":
@@ -1122,7 +1341,11 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                     )
                 else:
                     rows[i]["translation_error"] = reason
-                    rows[i]["translation_retryable"] = _translation_request_error(reason)
+                    # A structurally valid response can still contain a bad
+                    # language, an empty tiny line, or an invalid candidate.
+                    # Retry that one segment in isolation instead of silently
+                    # turning it into an undubbed hole after the batch call.
+                    rows[i]["translation_retryable"] = True
                     print(f"⚠️ translation segment={ids[i]} attempt={rows[i]['translation_attempts']} failed: {exc}")
         save()
 
@@ -1143,8 +1366,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         attempt(pending[offset:offset+max(1, batch_size)])
     if request is not None:
         for i in pending:
-            # Initial batch request plus at most two request-level retries =
-            # three total calls. Content-quality failures are not retried.
+            # Initial batch request plus at most two isolated retries = three
+            # total calls. This includes content-validation failures so a
+            # single malformed tiny line cannot silently disappear.
             for _ in range(max(0, min(2, retries))):
                 if rows[i]["translation_status"] in USABLE_TRANSLATION_STATUSES:
                     break

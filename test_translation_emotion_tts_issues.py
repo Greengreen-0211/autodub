@@ -15,16 +15,25 @@ from unittest.mock import patch
 import wave
 
 from translation_quality import (
+    applicable_glossary_entries,
     prepare_tts_punctuation,
     translate_segments,
     require_translated,
+    validate_translation,
     validate_target_text,
 )
 from light_tts_selector import LightTTSSelector, EspeakBackend
 from emotion_recognizer import apply_emotion_reliability
 from scheme3_policy import build_scheme3_segments, describe_scheme3_decision
 import tts_router
-from tts_quality import duration_quality, stage_fingerprint, validate_mix_state
+import tts_worker
+from tts_quality import (
+    audible_speech_quality,
+    duration_quality,
+    natural_duration_fit,
+    stage_fingerprint,
+    validate_mix_state,
+)
 from tts_preflight import cache_environment, check_model, cached_file, requirements
 
 ROOT=Path(__file__).resolve().parent
@@ -34,7 +43,9 @@ def wav(path, duration=1.0):
     Path(path).parent.mkdir(parents=True,exist_ok=True)
     with wave.open(str(path),"wb") as h:
         h.setnchannels(1); h.setsampwidth(2); h.setframerate(1000)
-        h.writeframes(b"\x00\x00"*int(duration*1000))
+        # Audible deterministic fixture. Tests that need silence create it
+        # explicitly so the formal audible-speech gate remains meaningful.
+        h.writeframes(b"\x10\x27"*int(duration*1000))
 
 
 def source(sid=0,text="This is a full sentence."):
@@ -47,6 +58,43 @@ def translation(sid, tiny=False):
 
 
 class TranslationTests(unittest.TestCase):
+    def test_translation_candidate_roles_survive_backend_validation(self):
+        validated = validate_translation(
+            {
+                "text": "Hello there.",
+                "translations_candidates": [
+                    {"role": "native_standard", "text": "Hello there."},
+                    {"role": "faithful_compact", "text": "Hello."},
+                ],
+            },
+            {"text": "你好。"},
+            "zh",
+            "en",
+        )
+        self.assertEqual(
+            [row["_candidate_role"] for row in validated["translations_candidates"]],
+            ["native_standard", "faithful_compact"],
+        )
+
+    def test_common_words_cannot_become_entity_aliases(self):
+        glossary = [{
+            "source_forms": ["Olaf", "Where", "you"],
+            "target_form": "雪宝",
+        }]
+        self.assertEqual(
+            applicable_glossary_entries({
+                "text": "Where are you?",
+                "_ocr_translation_references": [{
+                    "source_text": "Olaf. Where are you?",
+                }],
+            }, glossary),
+            [],
+        )
+        self.assertEqual(
+            applicable_glossary_entries({"text": "Olaf, where are you?"}, glossary),
+            [{"source_forms": ["Olaf"], "target_form": "雪宝"}],
+        )
+
     def test_multi_sentence_comma_chain_restores_strong_boundaries(self):
         source_text = (
             "I just can't. The sky's awake, so I'm awake. "
@@ -183,6 +231,23 @@ class TranslationTests(unittest.TestCase):
         self.assertTrue(all(r["translation_status"]=="success" for r in rows))
         self.assertEqual(checkpoints[0][0]["translation_status"],"success")
 
+    def test_content_validation_failure_is_retried_in_isolation(self):
+        calls = []
+        def request(items):
+            calls.append([row["id"] for row in items])
+            if len(calls) == 1:
+                return {"translations": [{
+                    "id": "0", "text": "Any",
+                    "translations_candidates": [{"text": "Any"}],
+                }]}
+            return {"translations": [translation(0, tiny=True)]}
+        rows = translate_segments(
+            [source(text="Wait.")], "en", "zh", "test", request, retries=2
+        )
+        self.assertEqual(calls, [["0"], ["0"]])
+        self.assertEqual(rows[0]["translation_status"], "success")
+        self.assertEqual(rows[0]["text"], "等等。")
+
     def test_invalid_sibling_candidate_uses_best_valid_without_retry(self):
         def request(items):
             t=translation(0); t["translations_candidates"][1]["text"]="Any"
@@ -223,12 +288,142 @@ class TranslationTests(unittest.TestCase):
         cached=translate_segments(segments,"en","zh","test",request,batch_size=1)
         self.assertEqual(calls[0]["next_text"],segments[1]["text"])
         self.assertEqual(calls[1]["previous_text"],segments[0]["text"])
+        self.assertEqual(calls[0]["dialogue_context"][0]["relative_index"], 1)
+        self.assertTrue(calls[0]["dialogue_context"][0]["same_speaker"])
+        self.assertEqual(
+            cached[0]["translation_dialogue_context"],
+            calls[0]["dialogue_context"],
+        )
         calls.clear()
         translate_segments(segments,"en","zh","test",request,cached=cached,force_ids={"1"})
         self.assertEqual([c["id"] for c in calls],["1"])
         calls.clear()
         translate_segments(segments,"en","zh","new-model",request,cached=cached)
         self.assertEqual(len(calls),2)
+
+    def test_repeated_high_coverage_medium_ocr_reaches_semantic_audit(self):
+        captured = []
+        segment = source()
+        segment["_ocr_translation_references"] = [{
+            "source_text": segment["text"],
+            "target_text": "这是完整的一句话。",
+            "confidence": "medium",
+            "reference_policy": "repair_or_compress",
+            "source_coverage": 0.95,
+            "missing_rate": 0.04,
+            "extra_rate": 0.02,
+            "frame_support": 3,
+        }]
+
+        def request(items):
+            captured.extend(items)
+            return {"translations": [translation(0)]}
+
+        translate_segments([segment], "en", "zh", "test", request, retries=0)
+        self.assertEqual(
+            captured[0]["ocr_translation_references"][0]["usage_policy"],
+            "preferred_if_complete",
+        )
+
+    def test_exact_repeated_ocr_is_primary_when_independent_audit_is_unavailable(self):
+        segment = source(text="The scene-dependent line is complete.")
+        segment["_ocr_translation_references"] = [{
+            "source_text": "The scene-dependent line is complete.",
+            "target_text": "这是符合场景的自然说法。",
+            "confidence": "high",
+            "reference_tier": "exact",
+            "reference_policy": "direct",
+            "source_coverage": 1.0,
+            "missing_rate": 0.0,
+            "extra_rate": 0.0,
+            "frame_support": 3,
+            "adaptive_time_match": False,
+            "composed": False,
+        }]
+
+        def request(_items):
+            row = translation(0)
+            row.update({
+                "text": "这是机器生成的一句直译。",
+                "translations_candidates": [
+                    {"text": "这是机器生成的一句直译。"},
+                    {"text": "这是另一句完整的机器译文。"},
+                ],
+            })
+            # Simulate an otherwise valid translation response whose separate
+            # OCR audit call was unavailable. Exact repeated backend evidence
+            # is still strong enough to preserve the human subtitle.
+            return {"translations": [row]}
+
+        rows = translate_segments(
+            [segment], "en", "zh", "test", request, retries=0
+        )
+        self.assertEqual(rows[0]["text"], "这是符合场景的自然说法。")
+        self.assertEqual(rows[0]["translation_selection_source"], "ocr_direct")
+        self.assertEqual(rows[0]["translation_ocr_action"], "backend_direct")
+        self.assertTrue(any(
+            "backend_exact_repeated_source_boundary" in note
+            for note in rows[0]["translation_ocr_admission"]
+        ))
+
+    def test_partial_ocr_without_audit_remains_reference_only(self):
+        segment = source()
+        segment["_ocr_translation_references"] = [{
+            "source_text": segment["text"],
+            "target_text": "这是字幕提供的参考表达。",
+            "confidence": "high",
+            "reference_tier": "trusted",
+            "reference_policy": "repair_or_compress",
+            "source_coverage": 0.90,
+            "missing_rate": 0.08,
+            "extra_rate": 0.02,
+            "frame_support": 3,
+        }]
+
+        rows = translate_segments(
+            [segment], "en", "zh", "test",
+            lambda _items: {"translations": [translation(0)]},
+            retries=0,
+        )
+        self.assertNotEqual(rows[0]["text"], "这是字幕提供的参考表达。")
+        self.assertFalse(str(
+            rows[0].get("translation_selection_source") or ""
+        ).startswith("ocr_"))
+
+    def test_exact_ocr_never_overrides_an_explicit_semantic_conflict(self):
+        segment = source()
+        segment["_ocr_translation_references"] = [{
+            "source_text": segment["text"],
+            "target_text": "这是含有错误否定的字幕。",
+            "confidence": "high",
+            "reference_tier": "exact",
+            "reference_policy": "direct",
+            "source_coverage": 1.0,
+            "missing_rate": 0.0,
+            "extra_rate": 0.0,
+            "frame_support": 3,
+            "adaptive_time_match": False,
+            "composed": False,
+        }]
+
+        def request(_items):
+            row = translation(0)
+            row["_ocr_candidate_audit"] = {
+                "raw": {
+                    "hard_conflicts": ["wrong_negation"],
+                    "semantic_equivalent": False,
+                }
+            }
+            return {"translations": [row]}
+
+        rows = translate_segments(
+            [segment], "en", "zh", "test", request, retries=0
+        )
+        self.assertNotEqual(rows[0]["text"], "这是含有错误否定的字幕。")
+        self.assertIn(
+            "wrong_negation",
+            " ".join(rows[0]["translation_ocr_admission"]),
+        )
 
     def test_language_and_identity_rules(self):
         for text,target in (("Any","zh"),("中文 sentence","en"),("","en"),("Hello","ja")):
@@ -357,12 +552,12 @@ class RoutingPolicyTests(unittest.TestCase):
     def decision(self,text,emotion):
         return describe_scheme3_decision("en",emotion,text)
 
-    def test_default_precedence_keeps_complexity_first_and_flags_the_override(self):
+    def test_default_precedence_keeps_reliable_strong_emotion(self):
         d=self.decision(LONG_EN,"angry")
-        self.assertEqual(d["planned_engine"],"confucius4")
-        self.assertEqual(d["rule_code"],"long_or_complex_text")
-        self.assertEqual(d["inputs"]["emotion_precedence"],"complexity_first")
-        self.assertTrue(d["inputs"]["emotion_overridden_by_complexity"])
+        self.assertEqual(d["planned_engine"],"indextts2")
+        self.assertEqual(d["rule_code"],"strong_emotion")
+        self.assertEqual(d["inputs"]["emotion_precedence"],"strong_emotion_first")
+        self.assertFalse(d["inputs"]["emotion_overridden_by_complexity"])
 
     def test_strong_emotion_first_is_opt_in_and_strong_only(self):
         with patch.dict(os.environ,{"AUTODUB_SCHEME3_EMOTION_PRECEDENCE":"strong_emotion_first"}):
@@ -377,7 +572,7 @@ class RoutingPolicyTests(unittest.TestCase):
     def test_unknown_precedence_falls_back_to_the_shipped_rule(self):
         with patch.dict(os.environ,{"AUTODUB_SCHEME3_EMOTION_PRECEDENCE":"nonsense"}):
             d=self.decision("short line","angry")
-        self.assertEqual(d["inputs"]["emotion_precedence"],"complexity_first")
+        self.assertEqual(d["inputs"]["emotion_precedence"],"strong_emotion_first")
         self.assertEqual(d["planned_engine"],"indextts2")
 
     def test_neutral_long_text_is_not_an_emotion_override(self):
@@ -394,12 +589,179 @@ class RoutingPolicyTests(unittest.TestCase):
         self.assertFalse(routed[0]["emotion_overridden_by_complexity"])
 
 
+class EmotionBackendTests(unittest.TestCase):
+    def test_indextts_uses_source_emotion_audio_when_runtime_supports_it(self):
+        captured = {}
+
+        class FakeIndex:
+            def infer(
+                self, *, spk_audio_prompt, text, output_path, verbose=False,
+                emo_audio_prompt=None, emo_alpha=1.0,
+            ):
+                captured.update(
+                    spk_audio_prompt=spk_audio_prompt,
+                    text=text,
+                    emo_audio_prompt=emo_audio_prompt,
+                    emo_alpha=emo_alpha,
+                )
+                wav(output_path, 0.5)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "reference.wav"
+            emotion_audio = Path(tmp) / "emotion.wav"
+            output = Path(tmp) / "output.wav"
+            wav(reference, 0.5)
+            wav(emotion_audio, 0.5)
+            backend = tts_worker.IndexTTSBackend.__new__(
+                tts_worker.IndexTTSBackend
+            )
+            backend.model = FakeIndex()
+            item = {
+                "ref_audio": str(reference),
+                "emotion_audio": str(emotion_audio),
+                "emotion": "angry",
+                "language": "en",
+                "text": "Stop now.",
+            }
+            backend.generate(item, output)
+        self.assertEqual(captured["emo_audio_prompt"], str(emotion_audio))
+        self.assertEqual(
+            item["emotion_control_mode"],
+            "indextts2_source_emotion_audio",
+        )
+
+
 class RouterTests(unittest.TestCase):
+    def test_best_candidate_uses_prosody_after_hard_quality_checks(self):
+        base = {
+            "content_completeness_quality": "passed",
+            "duration_selected_attempt": 0,
+            "audible_speech_quality": "passed",
+            "voice_consistency_quality": "passed",
+            "electricity_quality": "passed",
+            "actual_duration": 1.0,
+        }
+        flat = dict(base, prosody_similarity=0.2)
+        expressive = dict(base, prosody_similarity=0.8)
+        self.assertLess(
+            tts_router.TTSRouter._candidate_score(expressive, 1.0),
+            tts_router.TTSRouter._candidate_score(flat, 1.0),
+        )
+
+    def setUp(self):
+        # These fixtures synthesize tones, not speech. A server-wide ASR model
+        # export must not turn them into real content-verification jobs.
+        content_asr = patch.dict(
+            os.environ, {"AUTODUB_TTS_CONTENT_ASR_ENABLED": "0"}
+        )
+        content_asr.start()
+        self.addCleanup(content_asr.stop)
+
     def setup_router(self,tmp,disabled=False):
         ref=Path(tmp)/"ref.wav";wav(ref)
         router=tts_router.TTSRouter(SimpleNamespace(temp_dir=tmp,target_lang="en",source_lang="en",disable_tts_fallback=disabled),scheme="scheme3")
         router._speaker_references=lambda *args:{"A":{"audio":str(ref),"text":"source text"}}
         return router
+
+    def test_short_line_fallback_chain_reserves_a_third_engine(self):
+        self.assertEqual(
+            tts_router.TTSRouter._fallback_chain("f5tts", "zh"),
+            ["cosyvoice3", "indextts2"],
+        )
+        self.assertEqual(
+            tts_router.TTSRouter._fallback_chain("cosyvoice3", "zh"),
+            ["f5tts", "indextts2"],
+        )
+
+    def test_runtime_voice_overrides_stabilize_continuity_and_rescue_pollution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = self.setup_router(tmp)
+            continuous = [
+                dict(source(0), speaker="A", start=0.0, end=1.0,
+                     wespeaker_tts_embedding=[1.0, 0.0]),
+                dict(source(1), speaker="B", start=1.0, end=2.0,
+                     wespeaker_tts_embedding=[0.99, 0.02]),
+            ]
+            references = {
+                "A": {"audio": "a.wav", "text": "a", "source_segment_id": "0",
+                      "purity_score": 2.0, "duration": 2.0},
+                "B": {"audio": "b.wav", "text": "b", "source_segment_id": "1",
+                      "purity_score": 3.0, "duration": 3.0},
+            }
+            segment_refs = {
+                "0": {**references["A"], "source_segment_id": "0"},
+                "1": {**references["B"], "source_segment_id": "1"},
+            }
+            overrides, groups = router._build_voice_reference_overrides(
+                continuous, references, segment_refs
+            )
+            self.assertEqual(groups["0"], groups["1"])
+            self.assertEqual(overrides["0"]["audio"], overrides["1"]["audio"])
+            self.assertEqual(
+                overrides["0"]["voice_identity"],
+                overrides["1"]["voice_identity"],
+            )
+
+            polluted = [
+                dict(source(0), speaker="A", start=0.0, end=1.0,
+                     wespeaker_tts_embedding=[1.0, 0.0]),
+                dict(source(1), speaker="A", start=2.0, end=3.0,
+                     wespeaker_tts_embedding=[0.0, 1.0]),
+                dict(source(2), speaker="A", start=4.0, end=5.0,
+                     wespeaker_tts_embedding=[0.02, 0.999]),
+            ]
+            references = {
+                "A": {"audio": "male.wav", "text": "male",
+                      "source_segment_id": "0", "purity_score": 3.0,
+                      "duration": 3.0},
+            }
+            segment_refs = {
+                "1": {"audio": "one.wav", "text": "one",
+                      "source_segment_id": "1", "duration": 1.0},
+                "2": {"audio": "two.wav", "text": "two",
+                      "source_segment_id": "2", "duration": 1.0},
+            }
+            overrides, _ = router._build_voice_reference_overrides(
+                polluted, references, segment_refs
+            )
+            self.assertEqual(overrides["1"]["audio"], "two.wav")
+            self.assertEqual(overrides["2"]["audio"], "one.wav")
+            self.assertEqual(
+                overrides["1"]["reference_mode"],
+                "segment_identity_rescue",
+            )
+
+    def test_continuity_retry_sync_obeys_five_attempt_cap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = self.setup_router(tmp)
+            seed = {
+                "segment_id": "0", "voice_continuity_group": "g",
+                "model": "cosyvoice3", "attempted_engines": ["f5tts", "cosyvoice3"],
+                "generation_attempt_count": 4, "fallback_reason": "failed",
+                "fallback_count": 1, "target_language_raw": "zh",
+                "target_language": "zh", "text": "a", "speaker": "A",
+            }
+            peer = {
+                "segment_id": "1", "voice_continuity_group": "g",
+                "model": "f5tts", "attempted_engines": ["f5tts"],
+                "generation_attempt_count": 4, "fallback_reason": "",
+                "fallback_count": 0, "target_language_raw": "zh",
+                "target_language": "zh", "text": "b", "speaker": "A",
+            }
+            exhausted = {
+                "segment_id": "2", "voice_continuity_group": "g",
+                "model": "f5tts", "attempted_engines": ["f5tts"],
+                "generation_attempt_count": 5, "fallback_reason": "",
+                "fallback_count": 0, "target_language_raw": "zh",
+                "target_language": "zh", "text": "c", "speaker": "A",
+            }
+            retry = router._synchronize_continuity_retries(
+                [seed, peer, exhausted], [seed]
+            )
+            self.assertEqual([row["segment_id"] for row in retry], ["0", "1"])
+            self.assertEqual(peer["model"], "cosyvoice3")
+            self.assertIn("cosyvoice3", peer["attempted_engines"])
+            self.assertEqual(exhausted["model"], "f5tts")
 
     def worker(self,calls,failed):
         def run(model,plan,result,force=False):
@@ -441,6 +803,146 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(clips,[]);self.assertEqual(calls,["confucius4"])
             self.assertEqual(results[0]["status"],"failed")
 
+    def test_only_measured_reliable_source_overlap_is_preserved(self):
+        calls=[]
+        with tempfile.TemporaryDirectory() as tmp, patch("tts_router.preflight_models"):
+            router=self.setup_router(tmp)
+            reference = router._speaker_references(None, None)["A"]
+            router._speaker_references = lambda *_args: {
+                "A": dict(reference), "B": dict(reference)
+            }
+            rows=[
+                dict(source(0), start=0.0, end=2.0, speaker="A", tts_engine="f5tts"),
+                dict(source(1), start=1.6, end=2.6, speaker="B", tts_engine="f5tts"),
+            ]
+            with patch("tts_router._run_worker",side_effect=self.worker(calls,set())):
+                clips,_=router.run(rows,"unused")
+            self.assertAlmostEqual(clips[0]["allowed_overlap_seconds"],0.4)
+            self.assertTrue(clips[0]["allow_overlap"])
+
+            rows[1]["speaker_boundary_ambiguous"]=True
+            with patch("tts_router._run_worker",side_effect=self.worker([],set())):
+                clips,_=router.run(rows,"unused",force=True)
+            self.assertEqual(clips[0]["allowed_overlap_seconds"],0.0)
+
+    def test_missing_speaker_reference_uses_marked_reliable_fallback(self):
+        calls = []
+        def postprocess(source_path, destination, target_duration):
+            shutil.copy2(source_path, destination)
+            return {
+                "actual_duration": target_duration,
+                "atempo_capped": False,
+            }
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ), patch("tts_router._postprocess", side_effect=postprocess), patch(
+            "tts_router.electricity_quality", return_value={}
+        ), patch("tts_router.voice_consistency_quality", return_value={}):
+            router = self.setup_router(tmp)
+            segment = dict(source(), speaker="B", tts_engine="f5tts")
+            with patch(
+                "tts_router._run_worker",
+                side_effect=self.worker(calls, set()),
+            ):
+                clips, results = router.run([segment], "unused")
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(results[0]["status"], "success")
+        self.assertTrue(results[0]["reference_fallback"])
+        self.assertEqual(results[0]["reference_fallback_speaker"], "A")
+        self.assertEqual(calls, ["f5tts"])
+
+    def test_cross_speaker_reference_can_be_explicitly_disabled(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ), patch.dict(os.environ, {
+            "AUTODUB_TTS_ALLOW_CROSS_SPEAKER_REFERENCE": "0"
+        }):
+            router = self.setup_router(tmp)
+            with patch(
+                "tts_router._run_worker", side_effect=self.worker(calls, set())
+            ):
+                clips, results = router.run([
+                    dict(source(), speaker="B", tts_engine="f5tts")
+                ], "unused")
+        self.assertEqual(clips, [])
+        self.assertEqual(results[0]["status"], "failed")
+        self.assertEqual(
+            results[0]["error"], "no_safe_reference_audio_for_speaker"
+        )
+        self.assertEqual(calls, [])
+
+    def test_target_text_floor_expands_collapsed_timing_inside_hard_window(self):
+        calls = []
+        captured = []
+
+        def worker(model, plan, result, force=False):
+            payload = json.loads(Path(plan).read_text())["items"]
+            captured.extend(payload)
+            return self.worker(calls, set())(model, plan, result, force)
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ), patch("tts_router._run_worker", side_effect=worker):
+            router = self.setup_router(tmp)
+            segment = dict(
+                source(text="把手给我"), end=1.2, tts_engine="f5tts",
+                target_lang="zh", tts_placement_start=0.0,
+                tts_target_duration=0.15, tts_hard_end=1.2,
+            )
+            clips, results = router.run([segment], "unused")
+        self.assertEqual(len(clips), 1)
+        self.assertAlmostEqual(captured[0]["target_duration"], 0.72)
+        self.assertTrue(results[0]["target_duration_floor_applied"])
+
+    def test_same_voice_identity_uses_one_dominant_engine(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ):
+            router = self.setup_router(tmp)
+            rows = [
+                dict(source(0), tts_engine="f5tts"),
+                dict(source(1), tts_engine="f5tts"),
+                dict(source(2), tts_engine="cosyvoice3"),
+            ]
+            with patch(
+                "tts_router._run_worker", side_effect=self.worker(calls, set())
+            ):
+                _, results = router.run(rows, "unused")
+        self.assertEqual(calls, ["f5tts"])
+        self.assertEqual({row["planned_engine"] for row in results}, {"f5tts"})
+        self.assertEqual(
+            [row["rule_planned_engine"] for row in results],
+            ["f5tts", "f5tts", "cosyvoice3"],
+        )
+        self.assertTrue(results[2]["speaker_engine_locked"])
+
+    def test_reliable_expressive_line_is_not_flattened_by_engine_lock(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ):
+            router = self.setup_router(tmp)
+            rows = [
+                dict(source(0), tts_engine="f5tts"),
+                dict(source(1), tts_engine="f5tts"),
+                dict(
+                    source(2), tts_engine="indextts2", emotion="angry",
+                    raw_emotion="angry", emotion_reliable=True,
+                    emotion_score=0.92,
+                ),
+            ]
+            with patch(
+                "tts_router._run_worker", side_effect=self.worker(calls, set())
+            ):
+                _, results = router.run(rows, "unused")
+        self.assertEqual(calls, ["f5tts", "indextts2"])
+        expressive = results[2]
+        self.assertEqual(expressive["planned_engine"], "indextts2")
+        self.assertTrue(expressive["speaker_engine_lock_exempt"])
+        self.assertFalse(expressive["speaker_engine_locked"])
+
     def test_preflight_precedes_any_worker(self):
         with tempfile.TemporaryDirectory() as tmp, patch("tts_router.preflight_models",side_effect=RuntimeError("missing Vocos")),patch("tts_router._run_worker") as worker:
             clips, rows = self.setup_router(tmp).run([dict(source(),tts_engine="f5tts")],"unused")
@@ -460,7 +962,7 @@ class RouterTests(unittest.TestCase):
             self.assertEqual(rows[0]["actual_engine"],"indextts2")
             self.assertIn("missing Vocos",rows[0]["fallback_reason"])
 
-    def test_duration_violation_keeps_upstream_best_candidate(self):
+    def test_implausibly_short_audio_is_not_kept_as_success(self):
         calls=[]
         def worker(model,plan,result,force=False):
             calls.append(model)
@@ -474,17 +976,322 @@ class RouterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp,patch("tts_router.preflight_models"),patch("tts_router._run_worker",side_effect=worker),patch("tts_router._apply_atempo",side_effect=adapt):
             router=self.setup_router(tmp)
             clips,results=router.run([dict(source(text="short"),tts_engine="f5tts",translations_candidates=[{"text":"short"},{"text":"a longer candidate"}])],"unused")
-            self.assertEqual(results[0]["status"],"success")
-            self.assertEqual(results[0]["duration_quality"],"degraded")
+            self.assertEqual(results[0]["status"],"failed")
+            self.assertEqual(clips, [])
+            self.assertEqual(results[0]["audible_speech_quality"],"failed")
             self.assertEqual(results[0]["tts_text"],"short")
-            self.assertEqual(len(calls),1)
+            self.assertGreaterEqual(len(calls),1)
+
+    def test_low_voiced_ratio_alone_is_not_a_hard_fallback_failure(self):
+        self.assertFalse(tts_router._audible_failure_is_hard({
+            "audible_speech_quality": "failed",
+            "audible_speech_reason": "voiced_ratio_low:0.279<0.350",
+            "voiced_duration": 1.18,
+            "minimum_voiced_duration": 0.48,
+        }))
+        self.assertTrue(tts_router._audible_failure_is_hard({
+            "audible_speech_quality": "failed",
+            "audible_speech_reason": "voiced_too_short:0.100<0.220",
+            "voiced_duration": 0.10,
+            "minimum_voiced_duration": 0.22,
+        }))
+
+    def test_unsafe_overlength_generation_uses_engine_fallback(self):
+        calls=[]
+        def worker(model,plan,result,force=False):
+            calls.append(model)
+            data=json.loads(Path(result).read_text())
+            for item in json.loads(Path(plan).read_text())["items"]:
+                duration=2.0 if model=="confucius4" else 1.0
+                wav(item["raw_path"],duration)
+                data[item["segment_id"]].update(status="success",generated_duration=duration)
+            Path(result).write_text(json.dumps(data)); return 0
+        def postprocess(src,dst,target,**_kwargs):
+            shutil.copy2(src,dst)
+            actual=tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration":actual,
+                "post_trim_duration":actual,
+                "actual_duration":actual,
+                "atempo_factor":1.0,
+                "atempo_raw_factor":actual/target,
+                "atempo_capped":actual>target,
+                **tts_router.duration_adaptation_safety(actual,target),
+            }
+        with tempfile.TemporaryDirectory() as tmp,patch(
+            "tts_router.preflight_models"
+        ),patch("tts_router._run_worker",side_effect=worker),patch(
+            "tts_router._postprocess",side_effect=postprocess
+        ),patch("tts_router.electricity_quality",return_value={}),patch(
+            "tts_router.voice_consistency_quality",return_value={}
+        ):
+            router=self.setup_router(tmp)
+            _,results=router.run([
+                dict(source(),tts_engine="confucius4")
+            ],"unused")
+        self.assertEqual(calls,["confucius4","f5tts"])
+        self.assertEqual(results[0]["status"],"success")
+        self.assertEqual(results[0]["actual_engine"],"f5tts")
+        self.assertIn("unsafe compression",results[0]["fallback_reason"])
+
+    def test_formal_tts_can_request_two_targeted_retranslations(self):
+        calls = []
+        rewrites = iter(["rewrite one", "rewrite two"])
+
+        def worker(model, plan, result, force=False):
+            calls.append(model)
+            data = json.loads(Path(result).read_text())
+            durations = {"initial words": 2.0, "rewrite one": 1.4, "rewrite two": 1.1}
+            for item in json.loads(Path(plan).read_text())["items"]:
+                duration = durations[item["text"]]
+                wav(item["raw_path"], duration)
+                data[item["segment_id"]].update(
+                    status="success", generated_duration=duration
+                )
+            Path(result).write_text(json.dumps(data))
+            return 0
+
+        def postprocess(src, dst, target, **_kwargs):
+            shutil.copy2(src, dst)
+            natural = tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration": natural,
+                "post_trim_duration": natural,
+                "actual_duration": natural,
+                "atempo_factor": 1.0,
+                "atempo_raw_factor": natural / target,
+                "atempo_capped": False,
+            }
+
+        def rewrite(_segment, _text, _feedback, _history):
+            return {"text": next(rewrites), "native_fluency": "pass"}
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AUTODUB_TTS_DURATION_REWRITES": "2"}
+        ), patch(
+            "tts_router.preflight_models"
+        ), patch("tts_router._run_worker", side_effect=worker), patch(
+            "tts_router._postprocess", side_effect=postprocess
+        ), patch("tts_router.electricity_quality", return_value={}), patch(
+            "tts_router.voice_consistency_quality", return_value={}
+        ):
+            ref = Path(tmp) / "ref.wav"
+            wav(ref)
+            router = tts_router.TTSRouter(
+                SimpleNamespace(
+                    temp_dir=tmp, target_lang="en", source_lang="en",
+                    disable_tts_fallback=False,
+                ),
+                scheme="scheme3",
+                duration_rewriter=rewrite,
+            )
+            router._speaker_references = lambda *_args: {
+                "A": {"audio": str(ref), "text": "source text"}
+            }
+            segment = dict(
+                source(text="initial words"), end=2.0, tts_engine="f5tts",
+                tts_placement_start=0.0, tts_target_duration=1.0,
+                tts_hard_end=2.0,
+            )
+            clips, results = router.run([segment], "unused")
+            first_calls = list(calls)
+            quality_state = {
+                "segments_step3": [dict(segment, text="rewrite two")],
+                "audio_clips": clips,
+                "tts_router_results": results,
+                "tts_backend": "scheme3",
+            }
+            quality_config = SimpleNamespace(target_lang="en")
+            quality_state["tts_stage_manifest"] = {
+                "fingerprint": stage_fingerprint(
+                    quality_state, quality_config, "scheme3"
+                ),
+                "success": 1,
+            }
+            self.assertEqual(
+                validate_mix_state(quality_state, quality_config), []
+            )
+            calls.clear()
+            resumed_clips, resumed_results = router.run([segment], "unused")
+            self.assertEqual(calls, [])
+            self.assertEqual(resumed_results[0]["tts_text"], "rewrite two")
+            self.assertEqual(len(resumed_clips), 1)
+            rewritten_segment = dict(segment, text="rewrite two")
+            router.run([rewritten_segment], "unused")
+            self.assertEqual(calls, [])
+        self.assertEqual(first_calls, ["f5tts", "f5tts", "f5tts"])
+        self.assertEqual(results[0]["tts_text"], "rewrite two")
+        self.assertEqual(results[0]["duration_rewrite_count"], 2)
+        self.assertEqual(results[0]["duration_selected_attempt"], 2)
+        self.assertEqual(len(results[0]["duration_attempt_history"]), 3)
+        self.assertEqual(len(clips), 1)
+
+    def test_f5_uses_native_duration_for_credible_near_miss(self):
+        calls=[]
+        def worker(model,plan,result,force=False):
+            data=json.loads(Path(result).read_text())
+            for item in json.loads(Path(plan).read_text())["items"]:
+                calls.append(bool(item.get("measure_natural_duration")))
+                duration=1.3 if item.get("measure_natural_duration") else 1.0
+                wav(item["raw_path"],duration)
+                data[item["segment_id"]].update(status="success",generated_duration=duration)
+            Path(result).write_text(json.dumps(data)); return 0
+        def postprocess(src,dst,target,**_kwargs):
+            shutil.copy2(src,dst)
+            actual=tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration":actual,"post_trim_duration":actual,
+                "actual_duration":actual,"atempo_factor":1.0,
+                "atempo_raw_factor":actual/target,"atempo_capped":False,
+                **tts_router.duration_adaptation_safety(actual,target),
+            }
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ, {
+            "AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO": "1.18",
+            "AUTODUB_F5_NATIVE_DURATION_MIN_RATIO": "0.80",
+            "AUTODUB_F5_NATIVE_DURATION_MAX_RATIO": "1.50",
+            "AUTODUB_TTS_GENERATION_ANOMALY_RATIO": "2.00",
+        }),patch(
+            "tts_router.preflight_models"
+        ),patch("tts_router._run_worker",side_effect=worker),patch(
+            "tts_router._postprocess",side_effect=postprocess
+        ),patch("tts_router.electricity_quality",return_value={}),patch(
+            "tts_router.voice_consistency_quality",return_value={}
+        ),patch(
+            "tts_router.audible_speech_quality",
+            return_value={"audible_speech_quality": "passed"},
+        ),patch.object(
+            tts_router.TTSRouter, "_remember_candidate", return_value=None,
+        ):
+            router=self.setup_router(tmp)
+            router.duration_rewriter=lambda *_args,**_kwargs:None
+            segment=dict(source(),tts_engine="f5tts")
+            _,results=router.run([segment],"unused")
+            first_calls=list(calls)
+            calls.clear()
+            router.run([segment],"unused")
+        self.assertEqual(first_calls,[True,False])
+        self.assertEqual(calls,[])
+        self.assertTrue(results[0]["native_duration_control"])
+        self.assertEqual(
+            results[0]["duration_selection_reason"],
+            "f5_native_duration_final_pass",
+        )
+
+    def test_f5_native_duration_gate_is_separate_from_atempo_safety(self):
+        with patch.dict(os.environ, {
+            "AUTODUB_TTS_MAX_SAFE_COMPRESSION_RATIO": "1.25",
+            "AUTODUB_TTS_MAX_SAFE_SHORT_COMPRESSION_RATIO": "1.18",
+            "AUTODUB_F5_NATIVE_DURATION_MIN_RATIO": "0.80",
+            "AUTODUB_F5_NATIVE_DURATION_MAX_RATIO": "1.50",
+            "AUTODUB_TTS_GENERATION_ANOMALY_RATIO": "2.00",
+        }):
+            atempo = tts_router.duration_adaptation_safety(1.30, 1.00)
+            native = tts_router._f5_native_duration_eligibility(1.30, 1.00)
+            anomaly = tts_router._f5_native_duration_eligibility(2.10, 1.00)
+        self.assertFalse(atempo["safe_to_force_fit"])
+        self.assertTrue(native["f5_native_duration_eligible"])
+        self.assertEqual(
+            native["f5_native_duration_eligibility_reason"],
+            "credible_near_miss",
+        )
+        self.assertFalse(anomaly["f5_native_duration_eligible"])
+        self.assertEqual(
+            anomaly["f5_native_duration_eligibility_reason"],
+            "generation_anomaly",
+        )
+
+    def test_duration_candidate_selector_can_preserve_contextual_wording(self):
+        rewrites = iter(["awkward longer one", "awkward longer two"])
+        durations = {
+            "natural answer": 0.65,
+            "awkward longer one": 0.68,
+            "awkward longer two": 0.70,
+        }
+        def worker(_model, plan, result, force=False):
+            data = json.loads(Path(result).read_text())
+            for item in json.loads(Path(plan).read_text())["items"]:
+                wav(item["raw_path"], durations[item["text"]])
+                data[item["segment_id"]].update(status="success")
+            Path(result).write_text(json.dumps(data))
+            return 0
+        def postprocess(src, dst, target, **_kwargs):
+            shutil.copy2(src, dst)
+            actual = tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration": actual, "post_trim_duration": actual,
+                "actual_duration": actual, "atempo_factor": 1.0,
+                "atempo_raw_factor": actual / target, "atempo_capped": False,
+                **tts_router.duration_adaptation_safety(actual, target),
+            }
+        selected_payloads = []
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "tts_router.preflight_models"
+        ), patch("tts_router._run_worker", side_effect=worker), patch(
+            "tts_router._postprocess", side_effect=postprocess
+        ), patch("tts_router.electricity_quality", return_value={}), patch(
+            "tts_router.voice_consistency_quality", return_value={}
+        ):
+            router = self.setup_router(tmp, disabled=True)
+            router.duration_rewriter = lambda *_a, **_k: {"text": next(rewrites)}
+            router.duration_candidate_selector = lambda _segment, candidates: (
+                selected_payloads.append(candidates)
+                or {"selected_attempt": 0, "reason": "context is more natural"}
+            )
+            _, results = router.run([
+                dict(source(text="natural answer"), tts_engine="f5tts")
+            ], "unused")
+        self.assertEqual(results[0]["duration_selected_attempt"], 0)
+        self.assertEqual(results[0]["tts_text"], "natural answer")
+        self.assertEqual(len(selected_payloads[0]), 2)
+
+    def test_generation_attempt_budget_is_global_per_sentence(self):
+        calls = []
+        rewrites = iter(["rewrite one", "rewrite two", "rewrite three"])
+        def worker(_model, plan, result, force=False):
+            data = json.loads(Path(result).read_text())
+            for item in json.loads(Path(plan).read_text())["items"]:
+                calls.append(item["text"])
+                wav(item["raw_path"], 0.65)
+                data[item["segment_id"]].update(status="success")
+            Path(result).write_text(json.dumps(data))
+            return 0
+        def postprocess(src, dst, target, **_kwargs):
+            shutil.copy2(src, dst)
+            actual = tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration": actual,
+                "post_trim_duration": actual,
+                "actual_duration": actual,
+                "atempo_factor": 1.0,
+                "atempo_raw_factor": actual / target,
+                "atempo_capped": False,
+                **tts_router.duration_adaptation_safety(actual, target),
+            }
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AUTODUB_TTS_MAX_GENERATION_ATTEMPTS": "2"}
+        ), patch("tts_router.preflight_models"), patch(
+            "tts_router._run_worker", side_effect=worker
+        ), patch("tts_router._postprocess", side_effect=postprocess), patch(
+            "tts_router.electricity_quality", return_value={}
+        ), patch("tts_router.voice_consistency_quality", return_value={}):
+            router = self.setup_router(tmp, disabled=True)
+            router.duration_rewriter = lambda *_a, **_k: {
+                "text": next(rewrites)
+            }
+            _, results = router.run([
+                dict(source(text="natural answer"), tts_engine="f5tts")
+            ], "unused")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(results[0]["generation_attempt_count"], 2)
+        self.assertEqual(results[0]["generation_attempt_limit"], 2)
 
 
 class QualityTests(unittest.TestCase):
     def mix(self,tmp):
         p=Path(tmp)/"a.wav";wav(p)
         state={"segments_step3":[source()],"audio_clips":[{"segment_id":"0","file":str(p),"request_fingerprint":"fp"}],
-               "tts_router_results":[{"segment_id":"0","status":"success","request_fingerprint":"fp"}],"tts_backend":"scheme3"}
+               "tts_router_results":[{"segment_id":"0","status":"success","request_fingerprint":"fp",
+                                      "audible_speech_quality":"passed"}],"tts_backend":"scheme3"}
         request={"text":source()["text"],"language":"en","target_language":"en","emotion":"neutral",
                  "speaker":"A","ref_audio":str(p),"ref_text":"source","target_duration":1,"model":"f5tts"}
         fp=tts_router._request_fingerprint(request)
@@ -500,13 +1307,68 @@ class QualityTests(unittest.TestCase):
             state,config=self.mix(tmp);validate_mix_state(state,config)
             with self.assertRaises(RuntimeError):validate_mix_state(state,SimpleNamespace(target_lang="zh"))
             Path(state["audio_clips"][0]["file"]).unlink()
-            issues=validate_mix_state(state,config)
+            with self.assertRaises(RuntimeError):
+                validate_mix_state(state,config)
+            issues=validate_mix_state(
+                state,config,allow_missing=True,filter_missing=True
+            )
             self.assertTrue(issues)
             self.assertEqual(state["audio_clips"],[])
 
     def test_duration_gate(self):
         self.assertEqual(duration_quality(2.49,5.68)["duration_quality"],"failed")
         self.assertEqual(duration_quality(5.6,5.68)["duration_quality"],"passed")
+        self.assertEqual(duration_quality(0.45,0.70)["duration_quality"],"failed")
+        self.assertEqual(duration_quality(0.60,0.70)["duration_quality"],"passed")
+
+    def test_natural_duration_fit_uses_percentage_rules(self):
+        self.assertEqual(natural_duration_fit(0.7, 0.5)["natural_duration_fit"], "failed")
+        self.assertEqual(natural_duration_fit(0.4, 0.5)["natural_duration_fit"], "passed")
+        self.assertEqual(natural_duration_fit(2.5, 2.0)["duration_rewrite_direction"], "compress")
+        self.assertEqual(natural_duration_fit(1.5, 2.0)["duration_rewrite_direction"], "expand")
+
+    def test_trusted_ocr_uses_wider_percentage_band(self):
+        self.assertEqual(
+            natural_duration_fit(2.6, 2.0)["natural_duration_fit"],
+            "failed",
+        )
+        trusted = natural_duration_fit(2.6, 2.0, "ocr_direct")
+        self.assertEqual(trusted["natural_duration_fit"], "passed")
+        self.assertEqual(trusted["natural_duration_rule"], "trusted_ocr_ratio")
+
+    def test_silent_wav_fails_audible_speech_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "silent.wav"
+            with wave.open(str(path), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(1000)
+                stream.writeframes(b"\x00\x00" * 800)
+            result = audible_speech_quality(path, expected_text="把手给我")
+            self.assertEqual(result["audible_speech_quality"], "failed")
+            self.assertIn("near_silent", result["audible_speech_reason"])
+
+    def test_multi_clause_audio_requires_enough_voiced_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial.wav"
+            with wave.open(str(path), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(1000)
+                stream.writeframes(b"\x10\x27" * 400 + b"\x00\x00" * 600)
+            result = audible_speech_quality(
+                path, expected_text="现在闭上眼睛，走吧。"
+            )
+            self.assertEqual(result["expected_clause_count"], 2)
+            self.assertEqual(result["acoustic_completeness_quality"], "failed")
+            self.assertIn("voiced_ratio_low", result["audible_speech_reason"])
+
+    def test_light_duration_fit_is_ratio_based_and_ocr_aware(self):
+        standard = LightTTSSelector._duration_fit(2.6, 2.0, 3.0, "standard")
+        trusted = LightTTSSelector._duration_fit(2.6, 2.0, 3.0, "ocr_direct")
+        self.assertEqual(standard["duration_fit"], "borderline")
+        self.assertEqual(trusted["duration_fit"], "suitable")
+        self.assertAlmostEqual(trusted["duration_ratio"], 1.3)
 
     def test_tampered_wav_is_not_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -574,6 +1436,15 @@ class QualityTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def setUp(self):
+        # Pipeline fixtures also use synthetic WAVs; keep unit-test behavior
+        # independent from QWEN3_ASR_MODEL_DIR exported by the server shell.
+        content_asr = patch.dict(
+            os.environ, {"AUTODUB_TTS_CONTENT_ASR_ENABLED": "0"}
+        )
+        content_asr.start()
+        self.addCleanup(content_asr.stop)
+
     def functions(self,names,globals):
         tree=ast.parse((ROOT/"auto_dubbing_ver_2.0.py").read_text(encoding="utf-8-sig"))
         nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
@@ -601,7 +1472,8 @@ class PipelineTests(unittest.TestCase):
                 project_name="test",light_tts_enabled=False,
             )
             globals=self.functions({
-                "run_step_3", "_translation_candidates_fingerprint",
+                "run_step_3", "_refine_step3_timing",
+                "_translation_candidates_fingerprint",
                 "_routing_report_rows", "summarize_routing", "print_routing_report",
             },{"StateManager":Manager,"AdvancedTranslator":Translator})
             globals["run_step_3"](config)
@@ -668,6 +1540,89 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(mixed),1)
             self.assertEqual(Path(mixed[0][1]), ref)
             self.assertIn("只保留伴奏/静音",captured.getvalue())
+
+    def test_failed_tts_never_restores_source_vocal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vocals = root / "vocals.wav"
+            accomp = root / "accomp.wav"
+            wav(vocals, 2.0)
+            with wave.open(str(accomp), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(1000)
+                stream.writeframes(b"\x00\x00" * 2000)
+            state = {
+                "segments_step3": [dict(
+                    source(), translation_status="success"
+                )],
+                "audio_clips": [],
+                "tts_router_results": [{
+                    "segment_id": "0", "status": "failed"
+                }],
+                "vocals_path": str(vocals),
+                "accomp_path": str(accomp),
+            }
+            functions = self.functions({"restore_skipped_vocals"}, {})
+            output = functions["restore_skipped_vocals"](
+                state, SimpleNamespace(temp_dir=tmp)
+            )
+            self.assertEqual(Path(output), accomp)
+            self.assertEqual(Path(output).read_bytes(), accomp.read_bytes())
+
+    def test_step5_quality_failure_degrades_and_still_mixes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ref = Path(tmp) / "reference.wav"
+            wav(ref, 2.0)
+            state = {
+                "segments_step3": [dict(
+                    source(), translation_status="success"
+                )],
+                "audio_clips": [],
+                "tts_router_results": [{
+                    "segment_id": "0", "status": "failed"
+                }],
+                "vocals_path": str(ref),
+                "accomp_path": str(ref),
+                "duration": 2.0,
+                "tts_backend": "scheme3",
+            }
+            class Manager:
+                def __init__(self, _config): pass
+                def load(self): return state
+                def save(self, values): state.update(values)
+            mixed = []
+            class Mixer:
+                def __init__(self, _config): pass
+                def run(self, *args): mixed.append(args)
+            functions = self.functions(
+                {"run_step_5", "restore_skipped_vocals"},
+                {
+                    "StateManager": Manager,
+                    "Mixer": Mixer,
+                    "run_step_4": lambda *_args, **_kwargs: None,
+                },
+            )
+            issues = [
+                "0:missing or unsuccessful WAV",
+                "incomplete Step4: 0/1 dubbing segments",
+            ]
+            config = SimpleNamespace(
+                temp_dir=tmp, tts_backend="scheme3"
+            )
+            with patch(
+                "tts_quality.validate_mix_state", return_value=issues
+            ):
+                functions["run_step_5"](config, "unused.mp4")
+            self.assertEqual(len(mixed), 1)
+            self.assertEqual(
+                state["agent_delivery_report"]["failed_tts_segment_ids"],
+                ["0"],
+            )
+            self.assertEqual(
+                state["agent_delivery_report"]["fallback"],
+                "no_audible_generated_candidate",
+            )
 
     def test_routing_report_summarizes_emotion_coverage(self):
         neutral=dict(source(0),text="hello",emotion="neutral",emotion_reliable=False,

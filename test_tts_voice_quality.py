@@ -9,6 +9,7 @@ Runs offline (no GPU / no model downloads). Place in the repo root and run:
     python test_tts_voice_quality.py
 """
 import importlib.util
+import json
 import math
 import os
 import shutil
@@ -17,12 +18,644 @@ import tempfile
 import unittest
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import tts_router
-from tts_quality import electricity_quality
+from tts_quality import (
+    audible_speech_quality,
+    duration_adaptation_safety,
+    electricity_quality,
+    voice_consistency_quality,
+)
+from tts_content_verifier import (
+    content_completeness_quality,
+    reference_leakage_quality,
+    synthesized_content_quality,
+)
 
 HAS_LIBROSA = importlib.util.find_spec("librosa") is not None
+HAS_PYDUB = importlib.util.find_spec("pydub") is not None
+
+
+class TrialSynthesisTests(unittest.TestCase):
+    @staticmethod
+    def _fake_worker(durations):
+        calls = []
+
+        def run(_model, plan_path, result_path, **_kwargs):
+            items = json.loads(Path(plan_path).read_text(encoding="utf-8"))["items"]
+            results = {}
+            for item, duration in zip(items, durations):
+                calls.append(item)
+                write_wav(Path(item["raw_path"]), duration, sample=tone())
+                results[item["segment_id"]] = {"status": "success"}
+            Path(result_path).write_text(
+                json.dumps(results), encoding="utf-8"
+            )
+            return 0
+
+        return calls, run
+
+    def test_user_selected_engine_tries_at_most_three_and_returns_best(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "trial.wav"
+            calls, worker = self._fake_worker([2.4, 1.03, 1.5])
+
+            def postprocess(source, destination, _target):
+                shutil.copy2(source, destination)
+                index = int(Path(source).stem.rsplit("_", 1)[-1]) - 1
+                actual = [2.4, 1.03, 1.5][index]
+                return {"actual_duration": actual, "post_trim_duration": actual}
+
+            with patch("tts_router.preflight_models"), patch(
+                "tts_router._run_worker", side_effect=worker
+            ) as run_worker, patch(
+                "tts_router._postprocess", side_effect=postprocess
+            ), patch(
+                "tts_router.electricity_quality",
+                return_value={"electricity_quality": "passed"},
+            ), patch(
+                "tts_router.audible_speech_quality",
+                return_value={"audible_speech_quality": "passed"},
+            ), patch("tts_router._trial_content_asr_enabled", return_value=False):
+                result = tts_router.synthesize(
+                    "测试句子", "zh", "neutral", str(Path(tmp) / "ref.wav"),
+                    str(output), target_duration=1.0, engine="cosyvoice3",
+                    max_attempts=99,
+                )
+
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(run_worker.call_count, 1)
+            self.assertEqual(result["trial_attempt_limit"], 3)
+            self.assertEqual(result["trial_attempt_count"], 3)
+            self.assertEqual(result["trial_selected_attempt"], 2)
+            self.assertEqual(result["actual_engine"], "cosyvoice3")
+            self.assertTrue(result["adoption_recommended"])
+            self.assertTrue(output.is_file())
+
+    def test_trial_never_selects_reference_leaking_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "trial.wav"
+            durations = [1.0, 1.2, 1.5]
+            _calls, worker = self._fake_worker(durations)
+
+            def postprocess(source, destination, _target):
+                shutil.copy2(source, destination)
+                index = int(Path(source).stem.rsplit("_", 1)[-1]) - 1
+                return {
+                    "actual_duration": durations[index],
+                    "post_trim_duration": durations[index],
+                }
+
+            def audit(command, **_kwargs):
+                output_path = Path(command[command.index("--output") + 1])
+                output_path.write_text(json.dumps({
+                    "1": {
+                        "content_completeness_quality": "passed",
+                        "reference_leakage_quality": "failed",
+                        "reference_leakage_detected": True,
+                    },
+                    "2": {
+                        "content_completeness_quality": "passed",
+                        "reference_leakage_quality": "passed",
+                        "reference_leakage_detected": False,
+                    },
+                    "3": {
+                        "content_completeness_quality": "passed",
+                        "reference_leakage_quality": "passed",
+                        "reference_leakage_detected": False,
+                    },
+                }), encoding="utf-8")
+                return SimpleNamespace(returncode=0)
+
+            with patch("tts_router.preflight_models"), patch(
+                "tts_router._run_worker", side_effect=worker
+            ), patch("tts_router._postprocess", side_effect=postprocess), patch(
+                "tts_router.electricity_quality",
+                return_value={"electricity_quality": "passed"},
+            ), patch(
+                "tts_router.audible_speech_quality",
+                return_value={"audible_speech_quality": "passed"},
+            ), patch("tts_router._trial_content_asr_enabled", return_value=True), patch(
+                "tts_router.subprocess.run", side_effect=audit
+            ):
+                result = tts_router.synthesize(
+                    "测试句子", "zh", "neutral", str(Path(tmp) / "ref.wav"),
+                    str(output), target_duration=1.0, engine="f5tts",
+                )
+
+            self.assertEqual(result["trial_selected_attempt"], 2)
+            self.assertFalse(result["reference_leakage_detected"])
+            self.assertTrue(result["attempt_history"][0]["reference_leakage_detected"])
+
+
+class VoiceConsistencyTests(unittest.TestCase):
+    def test_off_policy_skips_without_loading_audio_features(self):
+        with patch.dict(os.environ, {
+            "AUTODUB_TTS_VOICE_CONSISTENCY_POLICY": "off"
+        }):
+            result = voice_consistency_quality("missing.wav", "missing.wav")
+        self.assertEqual(result["voice_consistency_quality"], "skipped")
+        self.assertEqual(result["voice_consistency_policy"], "off")
+
+    def test_gross_wespeaker_mismatch_blocks_even_under_warn_policy(self):
+        class Vector:
+            def __init__(self, similarity):
+                self.similarity = similarity
+
+            def __matmul__(self, _other):
+                return self.similarity
+
+        with patch.dict(os.environ, {
+            "AUTODUB_TTS_WESPEAKER_VOICE_POLICY": "warn",
+        }), patch(
+            "tts_quality._preferred_voice_embedding",
+            side_effect=[
+                (Vector(0.20), "wespeaker_simamresnet100"),
+                (Vector(0.20), "wespeaker_simamresnet100"),
+            ],
+        ):
+            result = voice_consistency_quality("reference.wav", "tts.wav")
+        self.assertTrue(result["voice_gross_mismatch"])
+        self.assertEqual(result["voice_consistency_quality"], "failed")
+        self.assertEqual(result["voice_consistency_policy"], "block")
+
+
+class ContentCompletenessTests(unittest.TestCase):
+    def test_content_asr_outage_is_recorded_without_stopping_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            clip = Path(tmp) / "candidate.wav"
+            write_wav(clip, 1.0, sample=tone())
+            item = {
+                "segment_id": "0", "text": "我没有。",
+                "planned_text": "我没有。", "language": "zh",
+                "target_language": "zh", "emotion": "neutral",
+                "speaker": "A", "ref_audio": "speaker.wav",
+                "ref_text": "reference", "target_duration": 1.0,
+                "start": 0.0, "model": "cosyvoice3",
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            results = {"0": {
+                "segment_id": "0", "status": "success",
+                "file": str(clip), "audio_sha256": tts_router._file_sha256(clip),
+                "audible_speech_quality": "passed",
+            }}
+            with patch.object(
+                router, "_content_asr_enabled", return_value=True
+            ), patch("tts_router.subprocess.run", return_value=SimpleNamespace(
+                returncode=1
+            )), patch.object(router, "_remember_candidate"):
+                updated = router._run_content_asr_audit([item], results)
+            self.assertEqual(updated["0"]["status"], "success")
+            self.assertTrue(updated["0"]["content_asr_unavailable"])
+            self.assertEqual(
+                updated["0"]["reference_leakage_quality"], "unverified"
+            )
+
+    def test_chinese_target_blocks_leaked_english_reference_sentence(self):
+        result = synthesized_content_quality(
+            "你好，杰克。",
+            "你好，杰克。 Hello, Jack.",
+            "Hello, Jack.",
+            "zh",
+        )
+        self.assertTrue(result["reference_leakage_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "failed")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+        self.assertEqual(
+            result["content_completeness_match_rule"],
+            "reference_leakage_blocked",
+        )
+
+    def test_chinese_target_blocks_one_word_from_long_reference(self):
+        result = synthesized_content_quality(
+            "踩到栏杆上去。",
+            "那close踩到栏杆上去。",
+            "Now close your eyes.",
+            "zh",
+        )
+        self.assertTrue(result["reference_leakage_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "failed")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+        self.assertAlmostEqual(
+            result["reference_leakage_reference_coverage"], 0.25
+        )
+        self.assertAlmostEqual(
+            result["reference_leakage_recognized_coverage"], 1.0
+        )
+        self.assertIn(
+            "reference_latin_in_chinese_target",
+            result["reference_leakage_reason"],
+        )
+
+    def test_emotion_prompt_leakage_is_also_a_hard_failure(self):
+        result = synthesized_content_quality(
+            "踩到栏杆上去。",
+            "现在把眼睛闭上，踩到栏杆上去。",
+            "你好，杰克。",
+            "zh",
+            "现在把眼睛闭上。",
+        )
+        self.assertEqual(result["reference_leakage_quality"], "failed")
+        self.assertTrue(result["emotion_reference_leakage_detected"])
+        self.assertIn(
+            "emotion_prompt_", result["reference_leakage_reason"]
+        )
+
+    def test_chinese_target_blocks_unexpected_foreign_word_without_ref_match(self):
+        result = synthesized_content_quality(
+            "踩到栏杆上去。",
+            "那hello踩到栏杆上去。",
+            "Step up onto the rail.",
+            "zh",
+        )
+        self.assertTrue(result["reference_leakage_detected"])
+        self.assertTrue(result["cross_language_contamination_detected"])
+        self.assertIn(
+            "unexpected_latin_in_chinese_target",
+            result["reference_leakage_reason"],
+        )
+
+    def test_chinese_target_allows_latin_name_present_in_target_text(self):
+        result = synthesized_content_quality(
+            "你好，Jack。",
+            "你好，Jack。",
+            "Hello, Jack.",
+            "zh",
+        )
+        self.assertFalse(result["reference_leakage_detected"])
+        self.assertFalse(result["cross_language_contamination_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "passed")
+
+    def test_english_target_blocks_leaked_chinese_reference_sentence(self):
+        result = reference_leakage_quality(
+            "Give me your hand.",
+            "Give me your hand. 把手给我。",
+            "把手给我。",
+            "en",
+        )
+        self.assertTrue(result["reference_leakage_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "failed")
+
+    def test_target_only_speech_does_not_trigger_reference_leakage(self):
+        result = reference_leakage_quality(
+            "你好，杰克。", "你好，杰克。", "Hello, Jack.", "zh"
+        )
+        self.assertFalse(result["reference_leakage_detected"])
+        self.assertEqual(result["reference_leakage_quality"], "passed")
+
+    def test_explicit_content_asr_switch_overrides_server_model_export(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "QWEN3_ASR_MODEL_DIR": tmp,
+            "AUTODUB_TTS_CONTENT_ASR_ENABLED": "0",
+        }):
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            self.assertFalse(router._content_asr_enabled())
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
+            "QWEN3_ASR_MODEL_DIR": tmp,
+            "AUTODUB_TTS_CONTENT_ASR_ENABLED": "1",
+        }):
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            self.assertTrue(router._content_asr_enabled())
+
+    def test_short_chinese_line_rejects_one_swallowed_character(self):
+        result = content_completeness_quality("杰克你好", "杰你好", "zh")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+
+    def test_punctuation_difference_does_not_fail_complete_speech(self):
+        result = content_completeness_quality(
+            "现在闭上眼睛，走吧。", "现在闭上眼睛走吧", "zh"
+        )
+        self.assertEqual(result["content_completeness_quality"], "passed")
+
+    def test_missing_english_word_is_rejected_for_short_line(self):
+        result = content_completeness_quality(
+            "Give me your hand", "Give me hand", "en"
+        )
+        self.assertEqual(result["content_completeness_quality"], "failed")
+
+    def test_safe_chinese_particle_is_not_mistaken_for_missing_content(self):
+        result = content_completeness_quality("手给我", "把手给我", "zh")
+        self.assertEqual(result["content_completeness_quality"], "passed")
+        self.assertEqual(
+            result["content_completeness_match_rule"],
+            "expected_contained_with_safe_particles",
+        )
+        self.assertEqual(result["content_completeness_warnings"], [
+            "tts_asr_safe_extra=把"
+        ])
+
+    def test_added_negation_is_not_treated_as_a_safe_particle(self):
+        result = content_completeness_quality("给我", "别给我", "zh")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+
+    def test_missing_expected_particle_still_fails(self):
+        result = content_completeness_quality("把手给我", "手给我", "zh")
+        self.assertEqual(result["content_completeness_quality"], "failed")
+
+    def test_content_policy_has_separate_fingerprint_from_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "candidate.wav"
+            write_wav(audio, 1.0, sample=tone())
+            item = {
+                "text": "你好，杰克。",
+                "language": "zh",
+                "target_language": "zh",
+                "emotion": "neutral",
+                "speaker": "A",
+                "target_duration": 1.0,
+                "model": "f5tts",
+                "final_path": str(audio),
+            }
+            metadata = {
+                "file": str(audio),
+                "audio_sha256": tts_router._file_sha256(audio),
+            }
+            with patch.dict(os.environ, {
+                "AUTODUB_TTS_CONTENT_ASR_MIN_SIMILARITY": "0.72"
+            }):
+                generation_a = tts_router._request_fingerprint(item)
+                audit_a = tts_router._content_audit_fingerprint(item, metadata)
+            with patch.dict(os.environ, {
+                "AUTODUB_TTS_CONTENT_ASR_MIN_SIMILARITY": "0.80"
+            }):
+                generation_b = tts_router._request_fingerprint(item)
+                audit_b = tts_router._content_audit_fingerprint(item, metadata)
+            self.assertEqual(generation_a, generation_b)
+            self.assertNotEqual(audit_a, audit_b)
+
+    def test_legacy_audio_migrates_only_when_generation_request_matches(self):
+        item = {
+            "text": "你好，杰克。",
+            "language": "zh",
+            "target_language": "zh",
+            "emotion": "neutral",
+            "speaker": "A",
+            "ref_audio": "speaker.wav",
+            "ref_text": "reference",
+            "target_duration": 0.8,
+            "start": 7.71,
+            "model": "cosyvoice3",
+            "reference_segment_id": 4,
+            "reference_purity_score": 0.9,
+            "translation_selection_source": "standard",
+        }
+        metadata = {
+            "generation_request": {
+                key: item.get(key)
+                for key in tts_router.GENERATION_REQUEST_KEYS
+            }
+        }
+        self.assertTrue(
+            tts_router._legacy_generation_request_matches(item, metadata)
+        )
+        changed = dict(item, text="完全不同的文本")
+        self.assertFalse(
+            tts_router._legacy_generation_request_matches(changed, metadata)
+        )
+
+    def test_agent_fallback_uses_best_generated_candidate_not_source_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            weak = Path(tmp) / "weak.wav"
+            complete = Path(tmp) / "complete.wav"
+            write_wav(weak, 1.0, sample=tone(freq=330.0))
+            write_wav(complete, 1.0, sample=tone(freq=550.0))
+            item = {
+                "segment_id": "0",
+                "text": "你好，杰克。",
+                "planned_text": "你好，杰克。",
+                "language": "zh",
+                "target_language": "zh",
+                "emotion": "neutral",
+                "speaker": "A",
+                "ref_audio": "speaker.wav",
+                "ref_text": "reference",
+                "target_duration": 1.0,
+                "start": 7.71,
+                "model": "f5tts",
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            router._remember_candidate(item, {
+                "file": str(weak),
+                "actual_duration": 1.0,
+                "audible_speech_quality": "passed",
+                "content_completeness_quality": "failed",
+                "reference_leakage_quality": "passed",
+                "reference_leakage_detected": False,
+                "voice_consistency_quality": "passed",
+                "error": "content mismatch",
+            }, "content_audit")
+            router._remember_candidate(item, {
+                "file": str(complete),
+                "actual_duration": 1.0,
+                "audible_speech_quality": "passed",
+                "content_completeness_quality": "passed",
+                "reference_leakage_quality": "passed",
+                "reference_leakage_detected": False,
+                "voice_consistency_quality": "passed",
+                "error": "strict duration policy",
+            }, "content_audit")
+            item["start"] = 9.25
+            adopted = router._adopt_best_generated_candidate(item)
+            self.assertIsNotNone(adopted)
+            self.assertTrue(adopted["agent_degraded_candidate"])
+            self.assertEqual(adopted["status"], "success")
+            self.assertEqual(item["start"], 9.25)
+            self.assertEqual(
+                tts_router._file_sha256(Path(adopted["file"])),
+                tts_router._file_sha256(complete),
+            )
+
+    def test_reference_leak_candidate_can_never_be_best_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            leaked = Path(tmp) / "leaked.wav"
+            write_wav(leaked, 1.0, sample=tone())
+            item = {
+                "segment_id": "0",
+                "text": "你好，杰克。",
+                "planned_text": "你好，杰克。",
+                "language": "zh",
+                "target_language": "zh",
+                "emotion": "neutral",
+                "speaker": "A",
+                "ref_audio": "speaker.wav",
+                "ref_text": "Hello, Jack.",
+                "target_duration": 1.0,
+                "start": 0.0,
+                "model": "f5tts",
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            router._remember_candidate(item, {
+                "file": str(leaked),
+                "actual_duration": 1.0,
+                "audible_speech_quality": "passed",
+                "content_completeness_quality": "passed",
+                "reference_leakage_quality": "failed",
+                "reference_leakage_detected": True,
+                "reference_leakage_reason": "reference_latin_in_chinese_target",
+                "voice_consistency_quality": "passed",
+            }, "content_audit")
+            self.assertIsNone(router._adopt_best_generated_candidate(item))
+
+    def test_agent_fallback_uses_bounded_fit_for_unsafe_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            overlong = Path(tmp) / "overlong.wav"
+            write_wav(overlong, 5.0, sample=tone())
+            item = {
+                "segment_id": "0", "text": "把手给我。",
+                "planned_text": "把手给我。", "language": "zh",
+                "target_language": "zh", "emotion": "neutral",
+                "speaker": "A", "ref_audio": "speaker.wav",
+                "ref_text": "reference", "target_duration": 1.0,
+                "start": 0.0, "model": "f5tts",
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            with patch("tts_router._edge_silence_metrics", return_value={
+                "detected_leading_silence_seconds": 0.0,
+                "detected_trailing_silence_seconds": 0.0,
+            }):
+                router._remember_candidate(item, {
+                    "file": str(overlong), "actual_duration": 5.0,
+                    "post_trim_duration": 5.0,
+                    "audible_speech_quality": "passed",
+                    "content_completeness_quality": "passed",
+                    "reference_leakage_quality": "passed",
+                    "reference_leakage_detected": False,
+                    "voice_consistency_quality": "passed",
+                    "electricity_quality": "passed",
+                }, "content_audit")
+            with patch(
+                "tts_router._apply_atempo_exact",
+                return_value={
+                    "forced_duration_fit": True,
+                    "forced_atempo_factor": 1.18,
+                },
+            ) as exact:
+                adopted = router._adopt_best_generated_candidate(item)
+            self.assertIsNotNone(adopted)
+            self.assertTrue(adopted["agent_degraded_candidate"])
+            self.assertTrue(adopted["agent_unsafe_duration_fallback"])
+            exact.assert_called_once()
+
+    def test_agent_fallback_can_use_content_degraded_candidate_after_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            clip = Path(tmp) / "wrong.wav"
+            write_wav(clip, 1.0, sample=tone())
+            item = {
+                "segment_id": "0", "text": "我没有。",
+                "planned_text": "我没有。", "language": "zh",
+                "target_language": "zh", "emotion": "neutral",
+                "speaker": "A", "ref_audio": "speaker.wav",
+                "ref_text": "reference", "target_duration": 1.0,
+                "start": 0.0, "model": "cosyvoice3",
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            with patch("tts_router._edge_silence_metrics", return_value={
+                "detected_leading_silence_seconds": 0.0,
+                "detected_trailing_silence_seconds": 0.0,
+            }):
+                router._remember_candidate(item, {
+                    "file": str(clip), "actual_duration": 1.0,
+                    "audible_speech_quality": "passed",
+                    "content_completeness_quality": "failed",
+                    "reference_leakage_quality": "passed",
+                    "reference_leakage_detected": False,
+                    "voice_consistency_quality": "passed",
+                    "electricity_quality": "passed",
+                }, "content_audit")
+            adopted = router._adopt_best_generated_candidate(item)
+            self.assertIsNotNone(adopted)
+            self.assertTrue(adopted["agent_degraded_candidate"])
+            self.assertEqual(adopted["content_completeness_quality"], "failed")
+
+    def test_agent_fallback_rejects_completely_silent_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            clip = Path(tmp) / "silent.wav"
+            write_wav(clip, 1.0)
+            item = {
+                "segment_id": "0", "text": "我没有。",
+                "planned_text": "我没有。", "language": "zh",
+                "target_language": "zh", "emotion": "neutral",
+                "speaker": "A", "ref_audio": "speaker.wav",
+                "ref_text": "reference", "target_duration": 1.0,
+                "start": 0.0, "model": "cosyvoice3",
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            router._remember_candidate(item, {
+                "file": str(clip), "actual_duration": 1.0,
+                "audible_speech_quality": "failed",
+                "reference_leakage_quality": "passed",
+                "reference_leakage_detected": False,
+            }, "engine_generation")
+            self.assertIsNone(router._adopt_best_generated_candidate(item))
+
+    def test_raw_generation_survives_postprocess_failure_as_agent_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            router = tts_router.TTSRouter(
+                SimpleNamespace(temp_dir=tmp), scheme="scheme3"
+            )
+            raw = Path(tmp) / "raw.wav"
+            write_wav(raw, 1.0, sample=tone())
+            item = {
+                "segment_id": "0", "text": "我没有。",
+                "planned_text": "我没有。", "language": "zh",
+                "target_language": "zh", "emotion": "neutral",
+                "speaker": "A", "ref_audio": "speaker.wav",
+                "ref_text": "reference", "target_duration": 1.0,
+                "start": 0.0, "model": "cosyvoice3",
+                "raw_path": str(raw),
+                "final_path": str(Path(tmp) / "missing-final.wav"),
+                "measure_natural_duration": True,
+                "translation_selection_source": "standard",
+            }
+            item["request_fingerprint"] = tts_router._request_fingerprint(item)
+            router._remember_candidate(item, {
+                "status": "failed",
+                "error": "postprocess_failed",
+                "reference_leakage_quality": "passed",
+                "reference_leakage_detected": False,
+            }, "engine_generation")
+            with patch.object(
+                router, "_content_asr_enabled", return_value=False
+            ):
+                adopted = router._adopt_best_generated_candidate(item)
+            self.assertIsNotNone(adopted)
+            self.assertEqual(adopted["status"], "success")
+            self.assertTrue(adopted["agent_degraded_candidate"])
 
 
 def write_wav(path, duration_s, rate=16000, sample=None):
@@ -54,6 +687,21 @@ def noise(seed=12345):
     return f
 
 
+@unittest.skipUnless(HAS_PYDUB, "pydub not installed")
+class AudibleSpeechTests(unittest.TestCase):
+    def test_near_silent_short_line_is_not_accepted_as_audible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "near_silent.wav"
+            quiet = lambda i: 0.015 * math.sin(2 * math.pi * 440.0 * i / 16000)
+            write_wav(path, 0.30, sample=quiet)
+            result = audible_speech_quality(path, expected_text="我没有。")
+        self.assertEqual(result["audible_speech_quality"], "failed")
+        self.assertTrue(
+            "near_silent_dbfs" in result["audible_speech_reason"]
+            or "voiced_too_short" in result["audible_speech_reason"]
+        )
+
+
 def copy_adapt(source, destination, target_duration):
     shutil.copy2(source, destination)
     return destination
@@ -75,9 +723,52 @@ class AtempoFactorTests(unittest.TestCase):
     def test_slowdown_is_clamped_but_not_capped(self):
         # An under-length clip is a real failure, not an accepted state.
         factor, capped, raw = tts_router._atempo_factor(0.1, 1.0)
-        self.assertEqual(factor, 0.8)
+        self.assertEqual(factor, 0.9)
         self.assertFalse(capped)
         self.assertEqual(raw, 0.1)
+
+    def test_exact_filter_chain_supports_large_speedup(self):
+        chain = tts_router._atempo_filter_chain(5.0)
+        factors = [float(part.split("=")[1]) for part in chain.split(",")]
+        self.assertTrue(all(0.5 <= factor <= 2.0 for factor in factors))
+        self.assertAlmostEqual(math.prod(factors), 5.0, places=6)
+
+
+class AdvancedArtifactGateTests(unittest.TestCase):
+    def test_two_independent_artifact_signals_trigger_retry(self):
+        metrics = {
+            "spectral_flatness": 0.01,
+            "hf_energy_ratio": 0.01,
+            "spectral_flux": 0.80,
+            "pitch_jump_ratio": 0.40,
+            "clipping_ratio": 0.0,
+            "rms": 0.2,
+            "duration": 1.0,
+            "sample_rate": 16000,
+        }
+        with patch("tts_quality.electricity_metrics", return_value=metrics), patch.dict(
+            os.environ, {"AUTODUB_TTS_ADVANCED_ARTIFACT_GATE_ENABLED": "1"}
+        ):
+            result = electricity_quality("unused.wav")
+        self.assertEqual(result["electricity_quality"], "failed")
+        self.assertEqual(len(result["electricity_artifact_indicators"]), 2)
+
+    def test_one_advisory_artifact_signal_does_not_block(self):
+        metrics = {
+            "spectral_flatness": 0.01,
+            "hf_energy_ratio": 0.01,
+            "spectral_flux": 0.80,
+            "pitch_jump_ratio": 0.0,
+            "clipping_ratio": 0.0,
+            "rms": 0.2,
+            "duration": 1.0,
+            "sample_rate": 16000,
+        }
+        with patch("tts_quality.electricity_metrics", return_value=metrics), patch.dict(
+            os.environ, {"AUTODUB_TTS_ADVANCED_ARTIFACT_GATE_ENABLED": "1"}
+        ):
+            result = electricity_quality("unused.wav")
+        self.assertEqual(result["electricity_quality"], "passed")
 
 
 class TrimSilenceTests(unittest.TestCase):
@@ -100,6 +791,50 @@ class TrimSilenceTests(unittest.TestCase):
             tts_router._trim_silence(src, dst)
             self.assertAlmostEqual(tts_router._wav_duration(dst), 1.0, delta=0.05)
 
+    def test_low_level_model_noise_before_speech_is_removed_adaptively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            dst = Path(tmp) / "dst.wav"
+            voice = tone()
+            # The prefix is above the old fixed -45 dBFS threshold, but far
+            # below the actual speech level and must not delay playback.
+            write_wav(
+                src,
+                1.4,
+                sample=lambda i: (
+                    0.007 if i < 6400
+                    else voice(i) if i < 22400
+                    else 0.0
+                ),
+            )
+            before = tts_router._edge_silence_metrics(src)
+            tts_router._trim_silence(src, dst)
+            after = tts_router._edge_silence_metrics(dst)
+            self.assertGreater(
+                before["detected_leading_silence_seconds"], 0.30
+            )
+            self.assertLessEqual(
+                after["detected_leading_silence_seconds"], 0.09
+            )
+            self.assertLess(tts_router._wav_duration(dst), 1.20)
+
+    def test_short_quiet_initial_consonant_is_not_trimmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            dst = Path(tmp) / "dst.wav"
+            voice = tone()
+            write_wav(
+                src,
+                0.8,
+                sample=lambda i: 0.007 if i < 960 else voice(i),
+            )
+            tts_router._trim_silence(src, dst)
+            # A 60 ms quiet onset is shorter than the 80 ms silence rule and
+            # protects initial consonants such as the missing sound in 杰克.
+            self.assertAlmostEqual(
+                tts_router._wav_duration(dst), 0.8, delta=0.04
+            )
+
 
 class PostprocessTests(unittest.TestCase):
     def test_postprocess_records_metrics(self):
@@ -115,7 +850,68 @@ class PostprocessTests(unittest.TestCase):
             self.assertAlmostEqual(post["actual_duration"], post["post_trim_duration"], delta=0.05)
             self.assertIn("atempo_factor", post)
             self.assertIn("atempo_capped", post)
+            self.assertIn("source_trimmed_leading_silence_seconds", post)
+            self.assertIn("audible_leading_silence_seconds", post)
             self.assertTrue(dst.is_file())
+
+    def test_postprocess_force_fits_only_moderate_overlength_audio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "raw.wav"
+            dst = Path(tmp) / "final.wav"
+            write_wav(src, 1.15, sample=tone())
+
+            def exact(source, destination, target):
+                write_wav(destination, target, sample=tone())
+                return {
+                    "forced_duration_fit": True,
+                    "forced_atempo_factor": 1.15,
+                    "forced_atempo_chain": "atempo=1.15",
+                }
+
+            with patch(
+                "tts_router._trim_silence",
+                side_effect=lambda source, destination: shutil.copy2(
+                    source, destination
+                ),
+            ), patch("tts_router._apply_atempo", side_effect=copy_adapt), patch(
+                "tts_router._apply_atempo_exact", side_effect=exact
+            ):
+                post = tts_router._postprocess(src, dst, 1.0)
+            self.assertTrue(post["forced_duration_fit"])
+            self.assertAlmostEqual(post["actual_duration"], 1.0, delta=0.05)
+
+    def test_postprocess_keeps_preview_and_skips_unsafe_force_fit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "raw.wav"
+            dst = Path(tmp) / "final.wav"
+            write_wav(src, 3.0, sample=tone())
+            with patch(
+                "tts_router._trim_silence",
+                side_effect=lambda source, destination: shutil.copy2(
+                    source, destination
+                ),
+            ), patch("tts_router._apply_atempo", side_effect=copy_adapt), patch(
+                "tts_router._apply_atempo_exact"
+            ) as exact:
+                post = tts_router._postprocess(src, dst, 1.0)
+            exact.assert_not_called()
+            self.assertTrue(post["force_fit_skipped"])
+            self.assertTrue(post["unsafe_duration_compression"])
+            self.assertAlmostEqual(post["actual_duration"], 3.0, delta=0.05)
+
+    def test_confucius_example_exceeds_safe_compression_limit(self):
+        result = duration_adaptation_safety(5.35, 3.44)
+        self.assertAlmostEqual(result["duration_ratio"], 5.35 / 3.44)
+        self.assertTrue(result["unsafe_duration_compression"])
+        self.assertFalse(result["safe_to_force_fit"])
+
+    def test_short_sentence_uses_stricter_compression_limit(self):
+        short = duration_adaptation_safety(1.25, 1.0)
+        longer = duration_adaptation_safety(3.75, 3.0)
+        self.assertTrue(short["short_duration_compression_policy"])
+        self.assertTrue(short["unsafe_duration_compression"])
+        self.assertFalse(longer["short_duration_compression_policy"])
+        self.assertFalse(longer["unsafe_duration_compression"])
 
 
 @unittest.skipUnless(HAS_LIBROSA, "librosa not installed")

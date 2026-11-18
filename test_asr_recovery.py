@@ -2,8 +2,10 @@
 
 import unittest
 import json
+import os
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from asr_recovery import (
     acoustic_dialogue_score,
@@ -20,17 +22,166 @@ from light_tts_selector import (
 from ocr_translation_reference import prepare_ocr_translation_references
 from run_step2_wespeaker import invalidate_downstream_state
 from speaker_alignment import merge_adjacent_speaker_turns
-from speech_activity import attach_coarse_tts_placement
+from speech_activity import (
+    attach_coarse_tts_placement,
+    attach_precise_tts_placement,
+    fuse_speech_regions,
+)
 from tts_router import _tts_timing
 from ocr_v211_integration import (
     _load_initial_recovery_state,
     _partition_deferred_regions,
     _recover_deferred_from_ocr,
     apply_stable_bilingual_entity_corrections,
+    filter_unsupported_recovered_micro_segments,
+    ocr_recovery_timing_plausibility,
+    persistent_ocr_overlay_texts,
+    preserve_speaker_timing_skeleton,
 )
 
 
 class OCRTimelineTests(unittest.TestCase):
+    def test_persistent_text_across_distant_regions_is_overlay(self):
+        records = [
+            {"segment_id": "a", "timestamp": 1.0, "text": "没有毛绒绒"},
+            {"segment_id": "b", "timestamp": 8.0, "text": "没有毛绒绒"},
+            {"segment_id": "c", "timestamp": 16.0, "text": "没有毛绒绒"},
+        ]
+        self.assertEqual(
+            persistent_ocr_overlay_texts(records), ["没有毛绒绒"]
+        )
+
+    def test_repeated_local_subtitle_is_not_overlay(self):
+        records = [
+            {"segment_id": "a", "timestamp": 1.0, "text": "来吧"},
+            {"segment_id": "a", "timestamp": 1.2, "text": "来吧"},
+            {"segment_id": "a", "timestamp": 1.4, "text": "来吧"},
+        ]
+        self.assertEqual(persistent_ocr_overlay_texts(records), [])
+
+    def test_ocr_text_rewrite_keeps_separate_speaker_timing_skeleton(self):
+        source = {
+            "text": "wrong word. Next line.",
+            "qwen3_time_stamps": [
+                {"text": "wrong", "start": 0.1, "end": 0.5},
+                {"text": "word", "start": 0.6, "end": 1.0},
+                {"text": "Next", "start": 2.0, "end": 2.3},
+                {"text": "line", "start": 2.4, "end": 2.8},
+            ],
+        }
+        result = {"text": "right word. Next line.", "qwen3_time_stamps": []}
+        preserve_speaker_timing_skeleton(source, result)
+        self.assertTrue(result["speaker_timing_skeleton_valid"])
+        self.assertEqual(result["speaker_timing_text"], source["text"])
+        self.assertEqual(
+            result["speaker_timing_time_stamps"], source["qwen3_time_stamps"]
+        )
+        self.assertEqual(result["qwen3_time_stamps"], [])
+        self.assertFalse(result["corrected_token_alignment_valid"])
+
+    def test_impossible_dense_ocr_recovery_timing_is_rejected(self):
+        audit = ocr_recovery_timing_plausibility(
+            "没有毛绒绒", 20.41, 20.70
+        )
+        self.assertFalse(audit["plausible"])
+        self.assertGreater(audit["lexical_rate"], audit["max_lexical_rate"])
+
+    def test_short_ocr_interjection_remains_possible(self):
+        audit = ocr_recovery_timing_plausibility("来吧", 1.0, 1.30)
+        self.assertTrue(audit["plausible"])
+
+    def test_single_unpunctuated_ocr_line_cannot_create_dialogue_from_energy(self):
+        regions = [{
+            "id": "acoustic-only",
+            "start": 20.27,
+            "end": 21.08,
+            "acoustic_candidate": True,
+            "dialogue_evidence": False,
+        }]
+        records = {"acoustic-only": [
+            {"timestamp": 20.30, "text": "没有毛绒绒"},
+            {"timestamp": 20.60, "text": "没有毛绒绒"},
+        ]}
+        recovered, remaining, audit = _recover_deferred_from_ocr(
+            regions, records, "zh"
+        )
+        self.assertEqual(recovered, [])
+        self.assertEqual(remaining[0]["asr_recovery_status"], "unresolved_uncertain")
+        self.assertEqual(audit[0]["status"], "rejected_unverified_ocr_text")
+
+    def test_unverified_single_han_retry_is_quarantined_not_spoken(self):
+        segments = [{
+            "id": 6,
+            "start": 20.27,
+            "end": 20.97,
+            "text": "是。",
+            "asr_origin": "coverage_retry_cross_source_consensus",
+            "asr_recovery_status": "accepted_precise",
+        }]
+        kept, uncertain, audit = filter_unsupported_recovered_micro_segments(
+            segments, []
+        )
+        self.assertEqual(kept, [])
+        self.assertEqual(len(uncertain), 1)
+        self.assertEqual(uncertain[0]["asr_recovery_status"], "unresolved_uncertain")
+        self.assertFalse(audit[0]["accepted"])
+
+    def test_primary_single_han_reply_is_never_filtered(self):
+        segments = [{
+            "id": 1,
+            "start": 1.0,
+            "end": 1.5,
+            "text": "好。",
+            "asr_origin": "primary",
+            "asr_recovery_status": "primary",
+        }]
+        kept, uncertain, audit = filter_unsupported_recovered_micro_segments(
+            segments, []
+        )
+        self.assertEqual(kept, segments)
+        self.assertEqual(uncertain, [])
+        self.assertEqual(audit, [])
+
+    def test_stable_matching_ocr_can_confirm_single_han_retry(self):
+        segments = [{
+            "id": 1,
+            "start": 1.0,
+            "end": 1.8,
+            "text": "好。",
+            "asr_origin": "coverage_retry_cross_source_consensus",
+        }]
+        records = [
+            {"timestamp": 1.2, "text": "好。"},
+            {"timestamp": 1.5, "text": "好。"},
+        ]
+        kept, uncertain, audit = filter_unsupported_recovered_micro_segments(
+            segments, records
+        )
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(uncertain, [])
+        self.assertTrue(audit[0]["accepted"])
+
+    def test_ocr_generated_punctuation_does_not_admit_single_character_text(self):
+        regions = [{
+            "id": "punctuated-artifact",
+            "start": 20.27,
+            "end": 20.97,
+            "acoustic_candidate": True,
+            "acoustic_dialogue_score": 0.70,
+            "dialogue_evidence": False,
+        }]
+        records = {"punctuated-artifact": [
+            {"timestamp": 20.30, "text": "是。"},
+            {"timestamp": 20.60, "text": "是。"},
+        ]}
+        recovered, remaining, audit = _recover_deferred_from_ocr(
+            regions, records, "zh"
+        )
+        self.assertEqual(recovered, [])
+        self.assertEqual(remaining[0]["asr_recovery_status"], "unresolved_uncertain")
+        # Single-character OCR is discarded before event admission.
+        self.assertEqual(audit[0]["status"], "deferred")
+
     def test_coarse_tts_placement_uses_acoustic_onset_without_moving_bounds(self):
         segment = {
             "id": 7,
@@ -54,7 +205,121 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertAlmostEqual(duration, 2.94)
         ideal, available = LightTTSSelector._speech_window(refined[0])
         self.assertAlmostEqual(ideal, 2.94)
-        self.assertAlmostEqual(available, 6.66)
+        self.assertAlmostEqual(available, 2.94)
+
+    def test_stable_ocr_trims_implausible_leading_activity_without_mutating_step2(self):
+        segment = {
+            "id": 70,
+            "start": 40.0,
+            "end": 50.0,
+            "text": "Do the magic!",
+            "speaker": "SPEAKER_07",
+            "asr_recovery_status": "accepted_coarse",
+            "timestamp_precision": "coarse",
+            "ocr_subtitle_first_seen": 43.0,
+            "ocr_recovery_frame_count": 3,
+        }
+        refined, audit = attach_coarse_tts_placement(
+            [segment], [(40.2, 46.2)], ocr_max_lead_seconds=0.35
+        )
+        row = refined[0]
+        self.assertEqual(row["start"], 40.0)
+        self.assertEqual(row["end"], 50.0)
+        self.assertEqual(row["speaker"], "SPEAKER_07")
+        self.assertEqual(row["tts_placement_start"], 42.59)
+        self.assertEqual(row["speech_anchor_start"], 42.65)
+        self.assertEqual(
+            row["coarse_timing_ocr_lead_guard"]["original_acoustic_start"],
+            40.2,
+        )
+        self.assertEqual(
+            audit[0]["ocr_lead_guard"]["guarded_acoustic_start"], 42.65
+        )
+
+    def test_ocr_lead_guard_requires_repeated_frames_and_implausible_span(self):
+        base = {
+            "id": 71,
+            "start": 40.0,
+            "end": 50.0,
+            "text": "Do the magic!",
+            "speaker": "SPEAKER_03",
+            "asr_recovery_status": "accepted_coarse",
+            "timestamp_precision": "coarse",
+            "ocr_subtitle_first_seen": 43.0,
+        }
+        one_frame = dict(base, ocr_recovery_frame_count=1)
+        refined, _ = attach_coarse_tts_placement(
+            [one_frame], [(40.2, 46.2)], ocr_max_lead_seconds=0.35
+        )
+        self.assertEqual(refined[0]["tts_placement_start"], 40.14)
+        self.assertIsNone(refined[0]["coarse_timing_ocr_lead_guard"])
+
+        short_span = dict(base, ocr_recovery_frame_count=3)
+        refined, _ = attach_coarse_tts_placement(
+            [short_span], [(42.0, 43.4)], ocr_max_lead_seconds=0.35
+        )
+        self.assertEqual(refined[0]["tts_placement_start"], 41.94)
+        self.assertIsNone(refined[0]["coarse_timing_ocr_lead_guard"])
+
+    def test_coarse_window_does_not_span_a_long_internal_silence(self):
+        segment = {
+            "id": 10,
+            "start": 10.0,
+            "end": 20.0,
+            "text": "Recovered dialogue",
+            "asr_recovery_status": "accepted_coarse",
+            "timestamp_precision": "coarse",
+        }
+        refined, audit = attach_coarse_tts_placement(
+            [segment], [(10.5, 12.0), (15.0, 17.0)]
+        )
+        self.assertEqual(refined[0]["tts_placement_start"], 10.44)
+        self.assertEqual(refined[0]["tts_placement_end"], 12.08)
+        self.assertEqual(
+            refined[0]["coarse_timing_excluded_islands"], [[15.0, 17.0]]
+        )
+        self.assertTrue(refined[0]["coarse_timing_requires_local_recovery"])
+        self.assertEqual(audit[0]["excluded_islands"], [[15.0, 17.0]])
+
+    def test_primary_coarse_timing_keeps_all_owned_islands_but_not_silence(self):
+        segment = {
+            "id": 11, "start": 10.0, "end": 20.0,
+            "text": "One complete sentence.",
+            "asr_recovery_status": "primary", "timestamp_precision": "coarse",
+        }
+        refined, _audit = attach_coarse_tts_placement(
+            [segment], [(10.5, 12.0), (15.0, 17.0)]
+        )
+        self.assertEqual(refined[0]["tts_placement_start"], 10.44)
+        self.assertEqual(refined[0]["tts_hard_end"], 17.08)
+        self.assertLess(refined[0]["tts_target_duration"], 4.0)
+        self.assertEqual(len(refined[0]["tts_speech_islands"]), 2)
+
+    def test_precise_tts_uses_mix_window_not_transport_bounds(self):
+        placement, duration = _tts_timing({
+                "start": 10.0,
+                "end": 13.0,
+                "speech_start": 10.25,
+                "speech_end": 12.4,
+                "mix_start": 10.25,
+                "mix_end": 12.4,
+            })
+        self.assertEqual(placement, 10.25)
+        self.assertAlmostEqual(duration, 2.15)
+
+    def test_precise_tts_expands_stale_mix_window_to_complete_sentence_words(self):
+        placement, duration = _tts_timing({
+            "start": 10.0,
+            "end": 15.0,
+            "mix_start": 13.0,
+            "mix_end": 14.0,
+            "qwen3_time_stamps": [
+                {"text": "Complete", "start": 10.4, "end": 11.2},
+                {"text": "sentence", "start": 13.0, "end": 14.0},
+            ],
+        })
+        self.assertEqual(placement, 10.4)
+        self.assertAlmostEqual(duration, 3.6)
 
     def test_precise_segment_is_unchanged_by_coarse_timing_refiner(self):
         segment = {
@@ -71,6 +336,275 @@ class OCRTimelineTests(unittest.TestCase):
         refined, audit = attach_coarse_tts_placement([segment], [(13.1, 17.2)])
         self.assertEqual(refined[0], segment)
         self.assertEqual(audit, [])
+
+    def test_precise_timing_counts_speech_islands_not_long_internal_pause(self):
+        segment = {
+            "id": 2, "start": 10.0, "end": 15.0, "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Hello", "start": 10.2, "end": 10.8},
+                {"text": "again", "start": 13.0, "end": 13.7},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(10.18, 10.82), (12.98, 13.72)]
+        )
+        self.assertLess(refined[0]["tts_target_duration"], 2.0)
+        self.assertGreater(refined[0]["tts_hard_end"] - refined[0]["tts_placement_start"], 3.0)
+        self.assertEqual(len(refined[0]["tts_internal_pauses"]), 1)
+        self.assertEqual(audit[0]["precision"], "word_vad_consensus")
+
+    def test_precise_vad_cannot_delay_past_first_word_onset(self):
+        segment = {
+            "id": 3, "start": 7.71, "end": 8.53,
+            "text": "Hello, Jack.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Hello", "start": 7.76, "end": 8.05},
+                {"text": "Jack", "start": 8.08, "end": 8.48},
+            ],
+        }
+        refined, _ = attach_precise_tts_placement(
+            [segment], [(7.84, 8.50)]
+        )
+        self.assertLessEqual(refined[0]["tts_placement_start"], 7.76)
+        self.assertGreaterEqual(refined[0]["tts_target_duration"], 0.70)
+
+    def test_precise_short_word_keeps_trailing_silence_as_physical_window(self):
+        segment = {
+            "id": 4, "start": 20.0, "end": 21.2,
+            "text": "Go.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Go", "start": 20.10, "end": 20.25},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(20.08, 20.28)]
+        )
+        row = refined[0]
+        self.assertEqual(row["tts_aligned_speech_end"], 20.33)
+        self.assertEqual(row["tts_hard_end"], 21.2)
+        self.assertGreaterEqual(row["tts_target_duration"], 0.35)
+        self.assertEqual(audit[0]["hard_end"], 21.2)
+
+    def test_short_sentence_borrows_bounded_leading_slack_before_next_turn(self):
+        segment = {
+            "id": 6, "start": 41.97, "end": 43.49,
+            "text": "Step up.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Step", "start": 42.93, "end": 43.33},
+                {"text": "up", "start": 43.33, "end": 43.49},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(42.83, 43.49)]
+        )
+        row = refined[0]
+        self.assertAlmostEqual(row["tts_original_placement_start"], 42.87)
+        # The pronunciation slack remains diagnostic, while the public
+        # sentence boundary is now the authoritative playback anchor.
+        self.assertAlmostEqual(row["tts_placement_start"], 41.97)
+        self.assertTrue(row["tts_sentence_start_anchored"])
+        self.assertAlmostEqual(row["tts_leading_slack_used"], 0.18)
+        self.assertAlmostEqual(row["tts_target_duration"], 0.80)
+        self.assertEqual(row["tts_hard_end"], 43.49)
+        self.assertAlmostEqual(audit[0]["leading_slack_used"], 0.18)
+
+    def test_leading_slack_is_capped_and_never_crosses_sentence_start(self):
+        segment = {
+            "id": 9, "start": 10.0, "end": 10.5,
+            "text": "A complete longer sentence.",
+            "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "sentence", "start": 10.42, "end": 10.5},
+            ],
+        }
+        refined, _ = attach_precise_tts_placement(
+            [segment], [(10.40, 10.5)]
+        )
+        row = refined[0]
+        self.assertGreaterEqual(row["tts_placement_start"], row["start"])
+        self.assertLessEqual(row["tts_leading_slack_used"], 0.35)
+
+    def test_ambiguous_boundary_does_not_borrow_leading_slack(self):
+        segment = {
+            "id": 10, "start": 30.0, "end": 31.0,
+            "text": "Step up.", "timestamp_precision": "word",
+            "speaker_boundary_ambiguous": True,
+            "qwen3_time_stamps": [
+                {"text": "Step", "start": 30.70, "end": 30.85},
+                {"text": "up", "start": 30.85, "end": 31.0},
+            ],
+        }
+        refined, _ = attach_precise_tts_placement(
+            [segment], [(30.68, 31.0)]
+        )
+        self.assertEqual(refined[0]["tts_leading_slack_used"], 0.0)
+
+    def test_long_pause_places_continuous_translation_at_dominant_island(self):
+        segment = {
+            "id": 7, "start": 43.49, "end": 49.61,
+            "text": "Now hold on to the railing.",
+            "timestamp_precision": "word",
+            "speaker_boundary_ambiguous": True,
+            "qwen3_time_stamps": [
+                {"text": "Now", "start": 43.49, "end": 43.73},
+                {"text": "hold", "start": 48.13, "end": 48.45},
+                {"text": "on", "start": 48.45, "end": 48.69},
+                {"text": "the", "start": 48.69, "end": 48.77},
+                {"text": "railing", "start": 48.77, "end": 49.17},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(43.47, 43.75), (48.11, 49.19)]
+        )
+        row = refined[0]
+        self.assertEqual(
+            row["tts_timing_reason"],
+            "dominant_island_after_long_pause",
+        )
+        self.assertAlmostEqual(row["tts_original_placement_start"], 43.49)
+        self.assertAlmostEqual(row["tts_placement_start"], 48.07)
+        self.assertAlmostEqual(row["tts_aligned_speech_end"], 49.25)
+        self.assertEqual(row["tts_hard_end"], 49.61)
+        self.assertLess(row["tts_target_duration"], 2.0)
+        self.assertEqual(row["tts_internal_pauses"], [[43.73, 48.13]])
+        self.assertEqual(
+            row["tts_dominant_word_island"],
+            {
+                "index": 1,
+                "start": 48.13,
+                "end": 49.17,
+                "duration": 1.04,
+                "activity_share": 0.8125,
+            },
+        )
+        self.assertEqual(
+            audit[0]["dominant_word_island"],
+            row["tts_dominant_word_island"],
+        )
+        self.assertFalse(row["tts_onset_shift_limited"])
+        self.assertFalse(row["tts_sentence_start_anchored"])
+
+    def test_long_interval_with_words_at_tail_uses_audible_onset(self):
+        segment = {
+            "id": 12, "start": 57.74, "end": 60.75,
+            "text": "Hold on.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Hold", "start": 59.95, "end": 60.30},
+                {"text": "on", "start": 60.30, "end": 60.69},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(59.93, 60.71)]
+        )
+        row = refined[0]
+        self.assertAlmostEqual(row["tts_unbounded_placement_start"], 59.90)
+        self.assertAlmostEqual(row["tts_placement_start"], 59.90)
+        self.assertEqual(
+            row["tts_timing_reason"], "trailing_word_island_consensus"
+        )
+        self.assertFalse(row["tts_sentence_start_anchored"])
+        self.assertFalse(row["tts_onset_shift_limited"])
+        self.assertTrue(row["tts_trailing_word_island_mode"])
+        self.assertFalse(audit[0]["onset_shift_limited"])
+
+    def test_stable_ocr_and_vad_can_resolve_large_word_island_conflict(self):
+        segment = {
+            "id": 20, "start": 10.0, "end": 15.0,
+            "text": "A complete sentence.", "timestamp_precision": "word",
+            "ocr_subtitle_first_seen": 13.0,
+            "ocr_subtitle_last_seen": 13.8,
+            "ocr_recovery_frame_count": 3,
+            "qwen3_time_stamps": [
+                {"text": "wrong", "start": 11.3, "end": 11.7},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(11.28, 11.72), (13.18, 14.02)]
+        )
+        row = refined[0]
+        self.assertEqual(
+            row["tts_timing_reason"], "ocr_vad_word_conflict_consensus"
+        )
+        self.assertAlmostEqual(row["tts_placement_start"], 13.12)
+        self.assertEqual(row["tts_speech_islands"], [[13.18, 14.02]])
+        self.assertIsNotNone(audit[0]["ocr_vad_fusion"])
+
+    def test_long_interval_with_trailing_room_keeps_sentence_anchor(self):
+        segment = {
+            "id": 5, "start": 37.32, "end": 41.20,
+            "text": "Go on.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Go", "start": 38.22, "end": 38.42},
+                {"text": "on", "start": 38.42, "end": 38.68},
+            ],
+        }
+        refined, _ = attach_precise_tts_placement(
+            [segment], [(38.20, 38.70)]
+        )
+        row = refined[0]
+        self.assertAlmostEqual(row["tts_placement_start"], 37.32)
+        self.assertTrue(row["tts_sentence_start_anchored"])
+        self.assertFalse(row["tts_trailing_word_island_mode"])
+
+    def test_legacy_bounded_shift_requires_explicit_anchor_opt_out(self):
+        segment = {
+            "id": 12, "start": 57.74, "end": 60.75,
+            "text": "Hold on.", "timestamp_precision": "word",
+            "qwen3_time_stamps": [
+                {"text": "Hold", "start": 59.95, "end": 60.30},
+                {"text": "on", "start": 60.30, "end": 60.69},
+            ],
+        }
+        with patch.dict(
+            os.environ,
+            {"AUTODUB_TTS_PRESERVE_SENTENCE_START": "0"},
+        ):
+            refined, _ = attach_precise_tts_placement(
+                [segment], [(59.93, 60.71)]
+            )
+        self.assertAlmostEqual(refined[0]["tts_placement_start"], 58.04)
+        self.assertFalse(refined[0]["tts_sentence_start_anchored"])
+
+    def test_ambiguous_implausible_word_span_uses_local_ratio_guard(self):
+        segment = {
+            "id": 7, "start": 43.49, "end": 49.61,
+            "text": "Hold on to the railing.",
+            "timestamp_precision": "word",
+            "speaker_boundary_ambiguous": True,
+            "qwen3_time_stamps": [
+                {"text": "Hold", "start": 43.51, "end": 44.2},
+                {"text": "on", "start": 44.3, "end": 45.0},
+                {"text": "to", "start": 45.1, "end": 45.8},
+                {"text": "the", "start": 46.0, "end": 47.0},
+                {"text": "railing", "start": 47.1, "end": 49.25},
+            ],
+        }
+        refined, audit = attach_precise_tts_placement(
+            [segment], [(43.5, 49.3)]
+        )
+        row = refined[0]
+        self.assertEqual(
+            row["tts_timing_reason"], "ambiguous_word_span_ratio_guard"
+        )
+        # The ambiguous word span still controls the natural speech target,
+        # while the sentence's trailing silence remains a separate physical
+        # fitting window.
+        self.assertLess(
+            row["tts_aligned_speech_end"] - row["tts_placement_start"],
+            3.6,
+        )
+        self.assertEqual(row["tts_hard_end"], row["end"])
+        self.assertLess(row["tts_target_duration"], 3.6)
+        self.assertLess(row["tts_timing_confidence"], 0.7)
+        self.assertIsNotNone(audit[0]["ratio_guard"])
+
+    def test_source_activity_can_only_extend_existing_vocal_edges(self):
+        fused = fuse_speech_regions(
+            [(5.0, 6.0)], [(1.0, 2.0), (4.9, 6.15)]
+        )
+        self.assertEqual(len(fused), 1)
+        self.assertAlmostEqual(fused[0][0], 4.9)
+        self.assertAlmostEqual(fused[0][1], 6.15)
 
     def test_coarse_tts_placement_is_idempotent(self):
         segment = {
@@ -349,6 +883,31 @@ class OCRTimelineTests(unittest.TestCase):
             self.assertTrue(reference["repetition_count_mismatch"])
             self.assertEqual(reference["reference_policy"], "repair_or_compress")
 
+    def test_exact_ocr_can_use_adaptive_temporal_margin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory) / "ocr_optimized"
+            cache_dir.mkdir(parents=True)
+            frame_text = (
+                "<ref>Hold on to the railing.</ref>\n"
+                "<ref>请抓紧栏杆。</ref>"
+            )
+            (cache_dir / "ocr_frames.json").write_text(
+                json.dumps({
+                    "a": {"status": "ok", "timestamp": 11.1, "segment_id": "7", "text": frame_text},
+                    "b": {"status": "ok", "timestamp": 11.3, "segment_id": "7", "text": frame_text},
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            result = prepare_ocr_translation_references(
+                directory,
+                [{"id": 7, "start": 8.0, "end": 10.0,
+                  "text": "Hold on to the railing."}],
+                "en", "zh",
+            )
+            reference = result["references_by_segment"]["7"][0]
+            self.assertTrue(reference["adaptive_time_match"])
+            self.assertGreater(reference["temporal_outside_seconds"], 0.8)
+
     def test_coarse_duration_uses_full_slot_for_hard_gate(self):
         ideal, available = LightTTSSelector._speech_window({
             "start": 43.03,
@@ -567,6 +1126,52 @@ class OCRTimelineTests(unittest.TestCase):
         self.assertEqual(recovered, [])
         self.assertEqual(remaining[0]["asr_recovery_status"], "unresolved_blocking")
         self.assertTrue(remaining[0]["dialogue_evidence"])
+
+    def test_dense_but_impossible_ocr_is_not_promoted_to_dialogue(self):
+        regions = [{
+            "id": "deferred-dense",
+            "start": 20.41,
+            "end": 20.70,
+            "candidate_kind": "confirmed_empty_primary_chunk",
+            "dialogue_evidence": True,
+        }]
+        records = {"deferred-dense": [
+            {"timestamp": 20.42, "text": "没有毛绒绒"},
+            {"timestamp": 20.62, "text": "没有毛绒绒"},
+        ]}
+        recovered, remaining, audit = _recover_deferred_from_ocr(
+            regions, records, "zh"
+        )
+        self.assertEqual(recovered, [])
+        self.assertEqual(remaining[0]["asr_recovery_status"], "unresolved_blocking")
+        self.assertTrue(remaining[0]["requires_contextual_asr_retry"])
+        self.assertEqual(audit[0]["status"], "rejected_implausible_timing")
+
+    def test_partial_ocr_acceptance_keeps_rejected_interval_unresolved(self):
+        regions = [{
+            "id": "deferred-partial",
+            "start": 0.0,
+            "end": 2.0,
+            "candidate_kind": "confirmed_empty_primary_chunk",
+            "dialogue_evidence": True,
+        }]
+        records = {"deferred-partial": [
+            {"timestamp": 0.02, "text": "没有毛绒绒"},
+            {"timestamp": 0.08, "text": "没有毛绒绒"},
+            {"timestamp": 0.32, "text": "来吧"},
+            {"timestamp": 0.50, "text": "来吧"},
+        ]}
+        recovered, remaining, audit = _recover_deferred_from_ocr(
+            regions, records, "zh"
+        )
+        self.assertEqual([item["text"] for item in recovered], ["来吧"])
+        self.assertEqual(len(remaining), 1)
+        self.assertTrue(remaining[0]["requires_contextual_asr_retry"])
+        self.assertEqual(
+            recovered[0]["asr_recovered_parent_start"], recovered[0]["start"]
+        )
+        self.assertEqual(audit[0]["status"], "accepted_coarse")
+        self.assertEqual(len(audit[0]["rejected_events"]), 1)
 
 
 class AcousticConsensusTests(unittest.TestCase):
