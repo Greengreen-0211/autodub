@@ -8,6 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from asr_recovery import (
+    _bbox_from_coordinates,
+    _inside_subtitle_region,
+    _ocr_lines_with_bbox,
     acoustic_dialogue_score,
     build_recovery_groups,
     classify_recovery_evidence,
@@ -20,6 +23,7 @@ from light_tts_selector import (
     classify_coarse_recovery_duration,
 )
 from ocr_translation_reference import prepare_ocr_translation_references
+from ocr_v211_integration import estimate_subtitle_region
 from run_step2_wespeaker import invalidate_downstream_state
 from speaker_alignment import merge_adjacent_speaker_turns
 from speech_activity import (
@@ -1252,6 +1256,93 @@ class AcousticConsensusTests(unittest.TestCase):
         )
         self.assertIsNone(selected)
         self.assertGreaterEqual(decision["effective_threshold"], 0.94)
+
+
+class SubtitleRegionTests(unittest.TestCase):
+    """Screen signs / viewer counters must not become dubbed dialogue."""
+
+    REGION = {"x_min": 225.5, "x_max": 771.5, "y_min": 903.9, "y_max": 1011.1}
+
+    def test_bbox_parsing(self):
+        self.assertEqual(
+            _bbox_from_coordinates("(372,926),(625,991)"),
+            [372.0, 926.0, 625.0, 991.0],
+        )
+        self.assertIsNone(_bbox_from_coordinates("no coordinates here"))
+
+    def test_lines_keep_their_own_boxes(self):
+        lines = _ocr_lines_with_bbox(
+            "冀A·60(841,720),(902,778)有一个人前来买瓜(372,926),(625,991)"
+        )
+        self.assertEqual([text for text, _ in lines], ["冀A·60", "有一个人前来买瓜"])
+        self.assertEqual(lines[0][1], [841.0, 720.0, 902.0, 778.0])
+        self.assertEqual(lines[1][1], [372.0, 926.0, 625.0, 991.0])
+
+    def test_region_membership(self):
+        self.assertTrue(_inside_subtitle_region([372, 926, 625, 991], self.REGION))
+        # shop sign in the middle of the frame
+        self.assertFalse(_inside_subtitle_region([239, 430, 339, 526], self.REGION))
+        # viewer counter shares the bottom band but sits at the far left
+        self.assertFalse(_inside_subtitle_region([112, 964, 158, 991], self.REGION))
+        # absent evidence must never drop text
+        self.assertTrue(_inside_subtitle_region(None, self.REGION))
+        self.assertTrue(_inside_subtitle_region([0, 0, 1, 1], None))
+
+    def test_recovery_rejects_signs_inside_subtitle_band(self):
+        frames = [
+            {"timestamp": 4.0, "text": "香草莓(239,430),(339,526)"},
+            {"timestamp": 4.5, "text": "香草莓(239,430),(339,526)"},
+            {"timestamp": 5.0, "text": "特甜(254,515),(340,612)"},
+            {"timestamp": 5.5, "text": "特甜(254,515),(340,612)"},
+            {"timestamp": 6.0, "text": "5元2斤(255,606),(347,726)"},
+            {"timestamp": 6.5, "text": "5元2斤(255,606),(347,726)"},
+        ]
+        leaked, _ = ocr_source_events(frames, "zh", region_start=3.8, region_end=6.9)
+        self.assertTrue(leaked, "baseline must reproduce the sign promotion")
+        filtered, decision = ocr_source_events(
+            frames, "zh", region_start=3.8, region_end=6.9,
+            subtitle_region=self.REGION,
+        )
+        self.assertEqual(filtered, [])
+        self.assertGreater(decision["outside_subtitle_region"], 0)
+
+    def test_estimate_region_from_asr_matched_lines(self):
+        segments = [
+            {"id": 0, "start": 0.0, "end": 2.0, "text": "有一个人前来买瓜。"},
+            {"id": 1, "start": 2.0, "end": 4.0, "text": "你嫌贵，我还嫌贵呢。"},
+        ]
+        frames = []
+        for timestamp in (0.5, 1.0, 1.5):
+            frames.append({"timestamp": timestamp,
+                           "text": "有一个人前来买瓜(372,925),(625,991)"})
+        for timestamp in (2.5, 3.0, 3.5):
+            frames.append({"timestamp": timestamp,
+                           "text": "你嫌贵我还嫌贵呢(372,926),(625,989)"})
+        # unrelated overlay text must not widen the band
+        frames.append({"timestamp": 1.0, "text": "6人正在看(112,964),(158,991)"})
+        frames.append({"timestamp": 1.0, "text": "香草莓(239,430),(339,526)"})
+
+        region = estimate_subtitle_region(frames, segments)
+        self.assertIsNotNone(region)
+        self.assertTrue(_inside_subtitle_region([372, 925, 625, 991], region))
+        self.assertFalse(_inside_subtitle_region([112, 964, 158, 991], region))
+        self.assertFalse(_inside_subtitle_region([239, 430, 339, 526], region))
+
+    def test_estimate_region_needs_enough_evidence(self):
+        segments = [{"id": 0, "start": 0.0, "end": 2.0, "text": "有一个人前来买瓜。"}]
+        frames = [{"timestamp": 1.0, "text": "有一个人前来买瓜(372,925),(625,991)"}]
+        self.assertIsNone(estimate_subtitle_region(frames, segments))
+
+    def test_recovery_keeps_real_subtitles(self):
+        frames = [
+            {"timestamp": 11.9, "text": "哥们儿这瓜多少钱一斤呐(320,925),(677,991)"},
+            {"timestamp": 12.5, "text": "哥们儿这瓜多少钱一斤呐(320,926),(677,991)"},
+        ]
+        events, _ = ocr_source_events(
+            frames, "zh", region_start=11.9, region_end=13.0,
+            subtitle_region=self.REGION,
+        )
+        self.assertEqual([event["text"] for event in events], ["哥们儿这瓜多少钱一斤呐"])
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import re
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple, Type
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type
 from urllib.parse import urlsplit, urlunsplit
 
 from autodub_ocr_runtime import VERSION as OCR_OPTIMIZED_VERSION
@@ -833,6 +833,91 @@ def ocr_recovery_timing_plausibility(
     }
 
 
+def estimate_subtitle_region(
+    frame_records: Sequence[Mapping[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
+    *,
+    minimum_matches: int = 4,
+) -> Optional[Dict[str, float]]:
+    """从与真实 ASR 文本对齐的 OCR 行反推屏幕字幕区域。
+
+    画面里除了字幕还会有店铺招牌、路牌、观看人数等叠加文字。它们通常
+    不在字幕所在的版面区域，但文本本身完全合法，靠内容无法剔除。这里用
+    「OCR 行能与某条 ASR 文本对上」作为字幕样本，取这些框的分位数得到
+    字幕带，供恢复流程只在该区域内采纳文字。
+
+    样本不足时返回 ``None``，调用方应退回原行为而不是误删正文。
+    """
+    from asr_recovery import _ocr_lines_with_bbox, normalize_text, text_similarity
+
+    spans: List[tuple[float, float, str]] = []
+    for segment in segments:
+        try:
+            start, end = float(segment["start"]), float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = str(segment.get("text") or "").strip()
+        if text:
+            spans.append((start, end, normalize_text(text)))
+    if not spans:
+        return None
+
+    boxes: List[List[float]] = []
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        nearby = [
+            text
+            for start, end, text in spans
+            if start - 0.4 <= timestamp <= end + 0.4
+        ]
+        if not nearby:
+            continue
+        joined = " ".join(nearby)
+        for line, bbox in _ocr_lines_with_bbox(str(record.get("text") or "")):
+            if not bbox:
+                continue
+            key = normalize_text(line)
+            if len(key) < 2:
+                continue
+            matched = key in joined or any(
+                text_similarity(text, line) >= 0.55 for text in nearby
+            )
+            if matched:
+                boxes.append(bbox)
+
+    if len(boxes) < max(1, minimum_matches):
+        return None
+
+    def percentile(values: List[float], quantile: float) -> float:
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        position = quantile * (len(ordered) - 1)
+        lower = int(math.floor(position))
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    lefts = [box[0] for box in boxes]
+    tops = [box[1] for box in boxes]
+    rights = [box[2] for box in boxes]
+    bottoms = [box[3] for box in boxes]
+    x_low, x_high = percentile(lefts, 0.03), percentile(rights, 0.97)
+    y_low, y_high = percentile(tops, 0.03), percentile(bottoms, 0.97)
+    x_margin = max(20.0, 0.10 * max(1.0, x_high - x_low))
+    y_margin = max(10.0, 0.30 * max(1.0, y_high - y_low))
+    return {
+        "x_min": round(x_low - x_margin, 2),
+        "x_max": round(x_high + x_margin, 2),
+        "y_min": round(y_low - y_margin, 2),
+        "y_max": round(y_high + y_margin, 2),
+        "sample_count": float(len(boxes)),
+    }
+
+
 def persistent_ocr_overlay_texts(
     frame_records: Sequence[Mapping[str, Any]],
 ) -> List[str]:
@@ -967,6 +1052,7 @@ def _recover_deferred_from_ocr(
     source_language: str,
     known_segments: Sequence[Dict[str, Any]] = (),
     persistent_overlay_texts: Sequence[str] = (),
+    subtitle_region: Optional[Mapping[str, float]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Promote stable ordered subtitle events to coarse ASR segments."""
     from asr_recovery import coarse_segment, ocr_source_events
@@ -991,6 +1077,7 @@ def _recover_deferred_from_ocr(
             region_start=float(region["start"]),
             region_end=float(region["end"]),
             exclude_texts=[*known_neighbor_texts, *persistent_overlay_texts],
+            subtitle_region=subtitle_region,
         )
         record = {
             "id": region_id,
@@ -1317,6 +1404,18 @@ def run_step_1b_optimized(
     ocr_recovery_audit: List[Dict[str, Any]] = []
     remaining_deferred = recovery_groups
     if enabled and recovery_groups:
+        # OCR 行里混着招牌、路牌、观看人数等画面文字。用能与真实 ASR 对齐的
+        # OCR 行反推字幕版面区域，恢复流程只在该区域内采纳文字。
+        subtitle_region = estimate_subtitle_region(all_frame_records, segments)
+        if subtitle_region:
+            print(
+                "ℹ️ 字幕区域估计: "
+                f"x=[{subtitle_region['x_min']:.0f},{subtitle_region['x_max']:.0f}] "
+                f"y=[{subtitle_region['y_min']:.0f},{subtitle_region['y_max']:.0f}] "
+                f"(样本 {int(subtitle_region['sample_count'])})"
+            )
+        else:
+            print("ℹ️ 字幕区域样本不足，本轮不按位置过滤 OCR 文字。")
         recovered_segments, remaining_deferred, ocr_recovery_audit = (
             _recover_deferred_from_ocr(
                 recovery_groups,
@@ -1324,6 +1423,7 @@ def run_step_1b_optimized(
                 str(config.ocr_source_language or state.get("src_lang", "")),
                 segments,
                 persistent_ocr_overlay_texts(all_frame_records),
+                subtitle_region=subtitle_region,
             )
         )
         if recovered_segments:
