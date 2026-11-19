@@ -918,6 +918,155 @@ def estimate_subtitle_region(
     }
 
 
+_SUBTITLE_OVERRIDE_MAX_CONTENT_TOKENS = 12
+_SUBTITLE_OVERRIDE_MIN_COVERAGE = 0.5
+_SUBTITLE_OVERRIDE_MIN_FRAMES = 2
+_SUBTITLE_OVERRIDE_MIN_LENGTH_RATIO = 0.5
+_SUBTITLE_OVERRIDE_MAX_LENGTH_RATIO = 2.0
+
+
+def _content_token_count(text: str) -> int:
+    return len(re.findall(r"[㐀-鿿]|[A-Za-z0-9]+", str(text or "")))
+
+
+def _window_subtitle_lines(
+    frame_records: Sequence[Mapping[str, Any]],
+    start: float,
+    end: float,
+    source_language: str,
+    subtitle_region: Optional[Mapping[str, float]],
+) -> List[Dict[str, Any]]:
+    """收集覆盖该时间窗、且落在字幕区域内的源语言 OCR 行。"""
+    from asr_recovery import (
+        _inside_subtitle_region,
+        _language_matches,
+        _ocr_lines_with_bbox,
+        normalize_text,
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        if not (start - 0.6 <= timestamp <= end + 0.6):
+            continue
+        for line, bbox in _ocr_lines_with_bbox(str(record.get("text") or "")):
+            if not line or not _inside_subtitle_region(bbox, subtitle_region):
+                continue
+            if not _language_matches(line, source_language):
+                continue
+            rows.append({
+                "timestamp": timestamp,
+                "text": line,
+                "key": normalize_text(line),
+            })
+    return rows
+
+
+def apply_short_utterance_subtitle_overrides(
+    segments: Sequence[Mapping[str, Any]],
+    corrected: Sequence[Dict[str, Any]],
+    frame_records: Sequence[Mapping[str, Any]],
+    source_language: str,
+    subtitle_region: Optional[Mapping[str, float]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """用明确无误的整句字幕替换短句的 ASR 文本。
+
+    冻结 B 只在「未变化的上下文能区分两种读法」时才允许改写；四个字的短句
+    根本没有此类上下文，因此真实的识别错误（如 ASR 的「丫头，过来。」对应
+    屏幕字幕「带他过来」）在那里永远无法被纠正。
+
+    这条规则范围很窄，只在同时满足以下条件时生效：
+    - 冻结 B 没有改动该句；
+    - 该句很短（内容词 <= 12）；
+    - 时间窗内只有**一条**源语言字幕，且至少出现在 2 帧；
+    - 该字幕覆盖了至少一半的片段时长；
+    - 字幕与 ASR 的文本长度相当（0.5x ~ 2x）。
+
+    命中后写入 ``ocr_optimized`` 与 ``speaker_timing_*``，并在审计里留痕。
+    """
+    from asr_recovery import normalize_text
+
+    output: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    for source, result in zip(segments, corrected):
+        original = str(source.get("text") or "")
+        if not subtitle_region or not original.strip():
+            output.append(result)
+            continue
+        if str(result.get("text") or "") != original:
+            # 冻结 B 已经改过这一句，绝不再叠加第二次改写
+            output.append(result)
+            continue
+        try:
+            start, end = float(source["start"]), float(source["end"])
+        except (KeyError, TypeError, ValueError):
+            output.append(result)
+            continue
+        if end <= start:
+            output.append(result)
+            continue
+        if _content_token_count(original) > _SUBTITLE_OVERRIDE_MAX_CONTENT_TOKENS:
+            output.append(result)
+            continue
+        rows = _window_subtitle_lines(
+            frame_records, start, end, source_language, subtitle_region
+        )
+        keys = {row["key"] for row in rows if row["key"]}
+        if len(keys) != 1:
+            # 没有字幕，或同一时间窗有多条不同字幕 → 无法确定，保守保留 ASR
+            output.append(result)
+            continue
+        key = next(iter(keys))
+        timestamps = {
+            round(row["timestamp"], 3) for row in rows if row["key"] == key
+        }
+        if len(timestamps) < _SUBTITLE_OVERRIDE_MIN_FRAMES:
+            output.append(result)
+            continue
+        if key == normalize_text(original):
+            output.append(result)
+            continue
+        forms: Dict[str, int] = {}
+        for row in rows:
+            if row["key"] == key:
+                forms[row["text"]] = forms.get(row["text"], 0) + 1
+        text = max(forms, key=lambda value: (forms[value], len(value)))
+        first_seen, last_seen = min(timestamps), max(timestamps)
+        coverage = (min(last_seen, end) - max(first_seen, start)) / (end - start)
+        if coverage < _SUBTITLE_OVERRIDE_MIN_COVERAGE:
+            output.append(result)
+            continue
+        ratio = _content_token_count(text) / max(1, _content_token_count(original))
+        if not (
+            _SUBTITLE_OVERRIDE_MIN_LENGTH_RATIO
+            <= ratio
+            <= _SUBTITLE_OVERRIDE_MAX_LENGTH_RATIO
+        ):
+            output.append(result)
+            continue
+        updated = _ocr_update_segment(source, {
+            "accepted": True,
+            "corrected_text": text,
+            "reason": "short_utterance_subtitle_override",
+        })
+        preserve_speaker_timing_skeleton(source, updated)
+        audit.append({
+            "segment_id": source.get("id"),
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "original_text": original,
+            "corrected_text": text,
+            "frame_support": len(timestamps),
+            "coverage": round(coverage, 4),
+            "reason": "short_utterance_subtitle_override",
+        })
+        output.append(updated)
+    return output, audit
+
+
 def persistent_ocr_overlay_texts(
     frame_records: Sequence[Mapping[str, Any]],
 ) -> List[str]:
@@ -1393,20 +1542,9 @@ def run_step_1b_optimized(
                 {"reason": f"{type(exc).__name__}: {exc}", "action": "preserve_asr"},
             )
         segments = OCRV211Corrector(config, legacy_corrector_cls).correct(raw_segments, ocr_texts)
-    else:
-        print("⚠️ OCR 已关闭，跳过 HunyuanOCR 辅助。")
-        segments = [
-            _ocr_update_segment(segment, _ocr_keep(segment["text"], "ocr_disabled"))
-            for segment in raw_segments
-        ]
-
-    recovered_segments: List[Dict[str, Any]] = []
-    ocr_recovery_audit: List[Dict[str, Any]] = []
-    remaining_deferred = recovery_groups
-    if enabled and recovery_groups:
-        # OCR 行里混着招牌、路牌、观看人数等画面文字。用能与真实 ASR 对齐的
-        # OCR 行反推字幕版面区域，恢复流程只在该区域内采纳文字。
-        subtitle_region = estimate_subtitle_region(all_frame_records, segments)
+        # 用能与真实 ASR 对齐的 OCR 行反推字幕版面区域；招牌、路牌、观看人数
+        # 等画面文字都在区域之外，后续两处判断都会用到它。
+        subtitle_region = estimate_subtitle_region(all_frame_records, raw_segments)
         if subtitle_region:
             print(
                 "ℹ️ 字幕区域估计: "
@@ -1416,6 +1554,28 @@ def run_step_1b_optimized(
             )
         else:
             print("ℹ️ 字幕区域样本不足，本轮不按位置过滤 OCR 文字。")
+        segments, subtitle_override_audit = apply_short_utterance_subtitle_overrides(
+            raw_segments,
+            segments,
+            all_frame_records,
+            str(config.ocr_source_language or state.get("src_lang", "")),
+            subtitle_region,
+        )
+        if subtitle_override_audit:
+            print(f"✅ OCR 短句字幕覆盖: {len(subtitle_override_audit)} 句改用屏幕字幕文本。")
+    else:
+        print("⚠️ OCR 已关闭，跳过 HunyuanOCR 辅助。")
+        subtitle_region = None
+        subtitle_override_audit = []
+        segments = [
+            _ocr_update_segment(segment, _ocr_keep(segment["text"], "ocr_disabled"))
+            for segment in raw_segments
+        ]
+
+    recovered_segments: List[Dict[str, Any]] = []
+    ocr_recovery_audit: List[Dict[str, Any]] = []
+    remaining_deferred = recovery_groups
+    if enabled and recovery_groups:
         recovered_segments, remaining_deferred, ocr_recovery_audit = (
             _recover_deferred_from_ocr(
                 recovery_groups,
@@ -1586,6 +1746,7 @@ def run_step_1b_optimized(
         "asr_uncovered_regions": updated_uncovered,
         "asr_recovery_report_initial": deepcopy(initial_recovery_report),
         "asr_ocr_recovery_report": ocr_recovery_audit,
+        "asr_ocr_subtitle_override_report": subtitle_override_audit,
         "asr_boundary_repair_report": boundary_repair_audit,
         "asr_ocr_entity_correction_report": entity_correction_audit,
         "asr_recovery_micro_fragment_report": micro_fragment_audit,

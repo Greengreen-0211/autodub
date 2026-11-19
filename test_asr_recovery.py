@@ -23,7 +23,10 @@ from light_tts_selector import (
     classify_coarse_recovery_duration,
 )
 from ocr_translation_reference import prepare_ocr_translation_references
-from ocr_v211_integration import estimate_subtitle_region
+from ocr_v211_integration import (
+    apply_short_utterance_subtitle_overrides,
+    estimate_subtitle_region,
+)
 from run_step2_wespeaker import invalidate_downstream_state
 from speaker_alignment import merge_adjacent_speaker_turns
 from speech_activity import (
@@ -1343,6 +1346,87 @@ class SubtitleRegionTests(unittest.TestCase):
             subtitle_region=self.REGION,
         )
         self.assertEqual([event["text"] for event in events], ["哥们儿这瓜多少钱一斤呐"])
+
+
+class ShortSubtitleOverrideTests(unittest.TestCase):
+    """A short utterance may take its on-screen subtitle text verbatim."""
+
+    REGION = {"x_min": 291.0, "x_max": 708.0, "y_min": 810.0, "y_max": 933.0}
+    BOX = "(430,833),(570,910)"
+
+    def _segment(self, text="丫头，过来。", start=31.47, end=32.12):
+        return {"id": 8, "start": start, "end": end, "text": text,
+                "qwen3_time_stamps": [{"text": "丫", "start": 31.63, "end": 31.71}]}
+
+    def _frames(self, line="带他过来", times=(31.58, 31.80, 32.01)):
+        return [{"timestamp": t, "text": f"{line}{self.BOX}", "segment_id": "8"}
+                for t in times]
+
+    def test_overrides_whole_short_utterance(self):
+        seg = self._segment()
+        out, audit = apply_short_utterance_subtitle_overrides(
+            [seg], [dict(seg)], self._frames(), "zh", self.REGION
+        )
+        self.assertEqual(out[0]["text"], "带他过来")
+        self.assertEqual(len(audit), 1)
+        self.assertEqual(audit[0]["reason"], "short_utterance_subtitle_override")
+
+    def test_no_region_means_no_override(self):
+        seg = self._segment()
+        out, audit = apply_short_utterance_subtitle_overrides(
+            [seg], [dict(seg)], self._frames(), "zh", None
+        )
+        self.assertEqual(out[0]["text"], "丫头，过来。")
+        self.assertEqual(audit, [])
+
+    def test_frozen_b_change_is_never_overridden_twice(self):
+        seg = self._segment()
+        corrected = dict(seg, text="丫头过来")
+        out, audit = apply_short_utterance_subtitle_overrides(
+            [seg], [corrected], self._frames(), "zh", self.REGION
+        )
+        self.assertEqual(out[0]["text"], "丫头过来")
+        self.assertEqual(audit, [])
+
+    def test_competing_subtitles_are_ambiguous(self):
+        seg = self._segment()
+        frames = self._frames() + [
+            {"timestamp": 31.90, "text": "另一个字(300,833),(600,910)", "segment_id": "8"}
+        ]
+        out, audit = apply_short_utterance_subtitle_overrides(
+            [seg], [dict(seg)], frames, "zh", self.REGION
+        )
+        self.assertEqual(out[0]["text"], "丫头，过来。")
+        self.assertEqual(audit, [])
+
+    def test_single_frame_is_not_stable(self):
+        seg = self._segment()
+        out, audit = apply_short_utterance_subtitle_overrides(
+            [seg], [dict(seg)], self._frames(times=(31.80,)), "zh", self.REGION
+        )
+        self.assertEqual(out[0]["text"], "丫头，过来。")
+        self.assertEqual(audit, [])
+
+    def test_long_utterance_is_left_alone(self):
+        long_text = "你别以为房产证不是你的名字，我们就查不出来。"
+        seg = self._segment(text=long_text, start=16.07, end=21.26)
+        frames = [{"timestamp": t, "text": f"你别以为房产证{self.BOX}", "segment_id": "5"}
+                  for t in (16.5, 17.4, 18.3)]
+        out, audit = apply_short_utterance_subtitle_overrides(
+            [seg], [dict(seg)], frames, "zh", self.REGION
+        )
+        self.assertEqual(out[0]["text"], long_text)
+        self.assertEqual(audit, [])
+
+    def test_subtitle_outside_region_is_ignored(self):
+        seg = self._segment()
+        frames = [{"timestamp": t, "text": "带他过来(239,430),(339,526)", "segment_id": "8"}
+                  for t in (31.58, 31.80, 32.01)]
+        out, audit = apply_short_utterance_subtitle_overrides(
+            [seg], [dict(seg)], frames, "zh", self.REGION
+        )
+        self.assertEqual(out[0]["text"], "丫头，过来。")
+        self.assertEqual(audit, [])
 
 
 if __name__ == "__main__":
