@@ -8,7 +8,7 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.17.0-balanced-compact"
+RULE_VERSION = "translation-v2.18.0-pause-aware-compact"
 LANGUAGE_VERSION = "target-script-v2"
 PROMPT_VERSION = "native-dubbing-ocr-v17-role-separated"
 
@@ -32,6 +32,53 @@ TRANSLATION_POLICIES = ("best_available", "fail_fast", "skip_failed")
 DEFAULT_TRANSLATION_POLICY = "best_available"
 SKIPPED_STATUS = "skipped"
 USABLE_TRANSLATION_STATUSES = {"success", "degraded_best_available"}
+
+
+def spoken_translation_budget(
+    source_text: Any,
+    speech_duration: float,
+    target_language: Any,
+) -> dict:
+    """Return a conservative translation-only speaking budget.
+
+    The old English budget used the whole slot at 2.8 words/second. That can
+    fit on paper while leaving no time for clause boundaries or breathing.
+    Reserve part of the existing slot for source-side semantic boundaries,
+    then expose preferred and maximum word/character counts to the translator.
+    This function does not change timestamps or audio processing.
+    """
+    duration = max(0.1, float(speech_duration or 0.0))
+    source = str(source_text or "").strip()
+    clauses = [
+        value for value in re.split(r"[，,；;：:。！？!?…]+", source)
+        if value.strip()
+    ]
+    pause_count = min(3, max(0, len(clauses) - 1))
+    target_code = language_code(target_language)
+    pause_each = 0.20 if target_code == "en" else 0.16
+    pause_reserve = min(duration * 0.22, pause_count * pause_each)
+    spoken_seconds = max(duration * 0.72, duration - pause_reserve)
+    if target_code == "en":
+        preferred = max(1, int(spoken_seconds * 2.25))
+        maximum = max(preferred, int(spoken_seconds * 2.45))
+        unit = "spoken_words"
+    elif target_code == "zh":
+        preferred = max(2, int(spoken_seconds * 4.0))
+        maximum = max(preferred, int(spoken_seconds * 4.4))
+        unit = "cjk_characters"
+    else:
+        preferred = round(spoken_seconds, 3)
+        maximum = round(duration, 3)
+        unit = "seconds"
+    return {
+        "unit": unit,
+        "preferred": preferred,
+        "maximum": maximum,
+        "source_clause_count": max(1, len(clauses)),
+        "recommended_internal_pauses": pause_count,
+        "pause_reserve_seconds": round(pause_reserve, 3),
+        "effective_spoken_seconds": round(spoken_seconds, 3),
+    }
 
 
 def resolve_translation_policy(explicit: Any = None) -> str:
@@ -941,22 +988,9 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
         except (TypeError, ValueError):
             pass
         speech_duration = max(0.1, speech_duration)
-        target_code = language_code(target)
-        if target_code == "en":
-            compact_budget = {
-                "unit": "spoken_words",
-                "maximum": max(1, int(speech_duration * 2.8)),
-            }
-        elif target_code == "zh":
-            compact_budget = {
-                "unit": "cjk_characters",
-                "maximum": max(2, int(speech_duration * 4.5)),
-            }
-        else:
-            compact_budget = {
-                "unit": "seconds",
-                "maximum": round(speech_duration, 3),
-            }
+        compact_budget = spoken_translation_budget(
+            segment.get("text", ""), speech_duration, target
+        )
         inputs[i] = {"id": sid, "speaker": segment.get("speaker", "Unknown"),
                      "text_asr_corrected": segment.get("text", ""),
                      "previous_text": before, "next_text": after,
@@ -975,6 +1009,7 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                      "ocr_source_spelling_hints": source_spelling_hints}
         rows[i]["translation_entity_glossary"] = required_entities
         rows[i]["translation_ocr_references"] = references
+        rows[i]["translation_spoken_budget"] = compact_budget
 
     def save():
         if checkpoint:

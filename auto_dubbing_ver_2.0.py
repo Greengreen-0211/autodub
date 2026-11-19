@@ -2950,15 +2950,24 @@ class AdvancedTranslator:
                     "interjection and expressed emotion. Add no fact, filler or attitude. The preferred wording must "
                     "sound like contemporary dialogue a native speaker would actually say, not subtitle prose or "
                     "source-language word order. Keep official names from entity_glossary exactly. "
-                    "For each item produce role=native_standard as the most natural complete line, phrased concisely "
-                    "enough for speech and normally no longer than about 110% of compact_spoken_budget. Produce "
-                    "role=faithful_compact as an equally natural, semantically complete spoken line that stays within "
-                    "compact_spoken_budget whenever the language permits. Compact means tighter native syntax, "
-                    "contractions, implicit subjects and removal of redundant function words; it never means a summary "
-                    "or deletion of an independent proposition. If a semantically matching OCR target exists, also "
+                    "For each item produce role=native_standard as the most natural complete spoken line. It should "
+                    "normally stay at or below compact_spoken_budget.maximum, not merely sound fluent as written. "
+                    "Produce role=faithful_compact as an equally natural, semantically complete line targeting "
+                    "compact_spoken_budget.preferred and never exceeding maximum when a faithful native formulation "
+                    "can fit. For Chinese-to-English, actively avoid explanatory expansion: use contractions, pronouns "
+                    "already resolved by context, compact phrasal verbs and idiomatic ellipsis; do not repeat a subject, "
+                    "object, title or relationship that native dialogue can leave implicit. Remove discourse fillers, "
+                    "duplicate modifiers and literal source-language scaffolding that add no proposition. Compact never "
+                    "means a summary or deletion of an independent proposition. If no semantically complete rendering "
+                    "can meet maximum, return the shortest complete native wording rather than dropping meaning. "
+                    "Use compact_spoken_budget.recommended_internal_pauses as a prosody requirement: when the source "
+                    "contains multiple clauses or propositions, preserve their order and insert natural comma, semicolon "
+                    "or sentence boundaries so the spoken line has breathing points. Never fuse multiple clauses into an "
+                    "unpunctuated run-on merely to appear shorter. If a semantically matching OCR target exists, also "
                     "produce role=ocr_adapted. Preserve its names, official terms, idiomatic lexical core and useful "
-                    "established wording, but when the exact subtitle exceeds compact_spoken_budget, compress its "
-                    "surrounding syntax rather than copying the whole line verbatim. Omit that role when no trustworthy "
+                    "established wording, but when the exact subtitle exceeds compact_spoken_budget.maximum, retain "
+                    "those lexical anchors while compressing or restructuring its surrounding syntax rather than "
+                    "copying the whole line verbatim. Omit that role when no trustworthy "
                     "OCR target exists. OCR is never allowed to alter "
                     "clear ASR meaning. A preferred_if_complete OCR line may "
                     "be direct only when it covers the full source and is natural when spoken; otherwise choose "
@@ -3274,6 +3283,9 @@ class AdvancedTranslator:
             "entity_glossary": required_entities,
             "trusted_ocr_references": ocr_references,
             "trusted_ocr_anchor_texts": trusted_ocr_anchors,
+            "compact_spoken_budget": dict(
+                segment.get("translation_spoken_budget") or {}
+            ),
             "current_translation_source": str(
                 segment.get("translation_selection_source") or "standard"
             ),
@@ -3292,8 +3304,11 @@ class AdvancedTranslator:
             "trusted_ocr_anchor_texts as established native subtitle wording: preserve its idiomatic lexical core "
             "and do not replace it with a more literal synonym merely to improve duration. Minimal syntactic "
             "compression is allowed only when the same meaning, register and scene interpretation remain clear. "
-            "When direction=compress, use idiomatic compression, implicit subjects, contractions and shorter "
-            "faithful syntax; do not summarize. When direction=expand, make already present relationships or "
+            "When direction=compress, target compact_spoken_budget.preferred: use idiomatic compression, implicit "
+            "subjects, contractions and shorter faithful syntax; do not summarize. Remove redundant modifiers, "
+            "repeated referents and explanatory scaffolding before changing any content word. Preserve natural "
+            "punctuation between clauses and do not turn a multi-clause line into an unpunctuated run-on just to "
+            "shorten it. When direction=expand, make already present relationships or "
             "subjects naturally explicit and use a fuller native construction; do not invent content. "
             "A trusted OCR reference may supply established native wording only when its source coverage is "
             "complete for this line. Avoid returning any previous_attempt verbatim unless no safe alternative "
@@ -3495,7 +3510,7 @@ def _translation_candidates_fingerprint(
     config: DubbingConfig,
 ) -> str:
     payload = {
-        "version": "translation-v2.17.0:balanced-compact-v1:target-script-v2:native-dubbing-ocr-v17:glossary-v2",
+        "version": "translation-v2.18.0:pause-aware-compact-v2:target-script-v2:native-dubbing-ocr-v17:glossary-v2",
         "source_language": src_lang,
         "target_language": target_lang,
         "model": config.model_name,

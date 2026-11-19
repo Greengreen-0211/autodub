@@ -17,6 +17,7 @@ import wave
 from translation_quality import (
     applicable_glossary_entries,
     prepare_tts_punctuation,
+    spoken_translation_budget,
     translate_segments,
     require_translated,
     validate_translation,
@@ -58,6 +59,53 @@ def translation(sid, tiny=False):
 
 
 class TranslationTests(unittest.TestCase):
+    def test_english_spoken_budget_reserves_multi_clause_pauses(self):
+        single = spoken_translation_budget(
+            "I know what happened", 4.0, "en"
+        )
+        multi = spoken_translation_budget(
+            "I know what happened, but I cannot explain it, so we must go.",
+            4.0,
+            "en",
+        )
+        self.assertEqual(single["recommended_internal_pauses"], 0)
+        self.assertEqual(multi["recommended_internal_pauses"], 2)
+        self.assertLess(multi["maximum"], single["maximum"])
+        self.assertLessEqual(multi["preferred"], multi["maximum"])
+        self.assertEqual(multi["unit"], "spoken_words")
+
+    def test_translation_request_contains_pause_aware_budget(self):
+        captured = []
+
+        def request(items):
+            captured.extend(items)
+            return {"translations": [{
+                "id": "0",
+                "text": "I know what happened, but I can't explain. We must go.",
+                "translations_candidates": [
+                    {
+                        "role": "native_standard",
+                        "text": "I know what happened, but I can't explain. We must go.",
+                    },
+                    {
+                        "role": "faithful_compact",
+                        "text": "I know, but I can't explain. We have to go.",
+                    },
+                ],
+            }]}
+
+        segment = source(
+            text="我知道发生了什么，但是现在不能解释，所以我们得走。"
+        )
+        segment["end"] = 4.0
+        rows = translate_segments(
+            [segment], "zh", "en", "test", request, retries=0
+        )
+        budget = captured[0]["compact_spoken_budget"]
+        self.assertEqual(budget["unit"], "spoken_words")
+        self.assertEqual(budget["recommended_internal_pauses"], 2)
+        self.assertEqual(rows[0]["translation_spoken_budget"], budget)
+
     def test_translation_candidate_roles_survive_backend_validation(self):
         validated = validate_translation(
             {
