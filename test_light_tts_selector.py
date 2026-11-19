@@ -104,7 +104,7 @@ def check_selection_and_resume() -> None:
         assert len(backend.calls) == 4
 
 
-def check_native_dialogue_beats_compact_duration_inside_tolerance() -> None:
+def check_compact_dialogue_avoids_rushed_native_inside_safety_tolerance() -> None:
     native = "That is the natural answer in this scene."
     compact = "Natural answer."
     backend = FakeLightTTS({native: 2.7, compact: 2.0})
@@ -135,13 +135,13 @@ def check_native_dialogue_beats_compact_duration_inside_tolerance() -> None:
         selected, rows = LightTTSSelector(
             directory, backend=backend
         ).select([segment], target_language="en")
-    assert selected[0]["text"] == native
-    assert rows[0]["selection_reason"] == "native_standard_duration_borderline"
-    assert rows[0]["selected_candidate_role"] == "native_standard"
+    assert selected[0]["text"] == compact
+    assert rows[0]["selection_reason"] == "faithful_compact_duration_comfortable"
+    assert rows[0]["selected_candidate_role"] == "faithful_compact"
 
 
 if __name__ == "__main__":
     check_candidate_normalization()
     check_selection_and_resume()
-    check_native_dialogue_beats_compact_duration_inside_tolerance()
+    check_compact_dialogue_avoids_rushed_native_inside_safety_tolerance()
     print("light TTS selector tests: PASS")
