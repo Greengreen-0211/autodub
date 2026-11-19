@@ -8,7 +8,7 @@ import re
 import unicodedata
 from typing import Any, Callable
 
-RULE_VERSION = "translation-v2.16.0-scene-native"
+RULE_VERSION = "translation-v2.17.0-balanced-compact"
 LANGUAGE_VERSION = "target-script-v2"
 PROMPT_VERSION = "native-dubbing-ocr-v17-role-separated"
 

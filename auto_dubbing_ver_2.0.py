@@ -2950,15 +2950,22 @@ class AdvancedTranslator:
                     "interjection and expressed emotion. Add no fact, filler or attitude. The preferred wording must "
                     "sound like contemporary dialogue a native speaker would actually say, not subtitle prose or "
                     "source-language word order. Keep official names from entity_glossary exactly. "
-                    "For each item produce role=native_standard as the most natural complete line and "
-                    "role=faithful_compact as a shorter but equally natural line. If a semantically matching OCR "
-                    "target exists, also produce role=ocr_adapted, retaining its established native wording wherever "
-                    "complete; omit that role when no trustworthy OCR target exists. OCR is never allowed to alter "
+                    "For each item produce role=native_standard as the most natural complete line, phrased concisely "
+                    "enough for speech and normally no longer than about 110% of compact_spoken_budget. Produce "
+                    "role=faithful_compact as an equally natural, semantically complete spoken line that stays within "
+                    "compact_spoken_budget whenever the language permits. Compact means tighter native syntax, "
+                    "contractions, implicit subjects and removal of redundant function words; it never means a summary "
+                    "or deletion of an independent proposition. If a semantically matching OCR target exists, also "
+                    "produce role=ocr_adapted. Preserve its names, official terms, idiomatic lexical core and useful "
+                    "established wording, but when the exact subtitle exceeds compact_spoken_budget, compress its "
+                    "surrounding syntax rather than copying the whole line verbatim. Omit that role when no trustworthy "
+                    "OCR target exists. OCR is never allowed to alter "
                     "clear ASR meaning. A preferred_if_complete OCR line may "
                     "be direct only when it covers the full source and is natural when spoken; otherwise choose "
                     "minimal_repair, semantic_hint or ignore. For composed cards, preserve their order and put only "
-                    "the uncovered source clauses into ocr_hybrid_text. Duration and compact_spoken_budget are soft "
-                    "planning hints: never make native_standard telegraphic merely to fit. Every candidate must keep "
+                    "the uncovered source clauses into ocr_hybrid_text. Duration and compact_spoken_budget are spoken "
+                    "delivery targets, not permission to drop meaning: never make native_standard telegraphic merely "
+                    "to fit, but do not add explanatory wording that the source does not require. Every candidate must keep "
                     "the same scene interpretation, register and emotion. Return exact IDs and strict JSON: "
                     '{"translations":[{"id":"supplied-id","text":"translation",'
                     '"ocr_reference_action":"semantic_hint","ocr_reference_complete":false,'
@@ -3412,6 +3419,13 @@ class AdvancedTranslator:
                     "natural_duration_ratio": round(float(
                         candidate.get("natural_duration_ratio") or 0.0
                     ), 4),
+                    "comfortable_delivery": (
+                        candidate.get("duration_comfort_fit") == "comfortable"
+                        if candidate.get("duration_comfort_fit") is not None
+                        else 0.80 <= float(
+                            candidate.get("natural_duration_ratio") or 0.0
+                        ) <= 1.10
+                    ),
                     "natural_duration_fit": candidate.get("natural_duration_fit"),
                     "prosody_similarity": candidate.get("prosody_similarity"),
                     "prosody_quality": candidate.get("prosody_quality"),
@@ -3427,9 +3441,12 @@ class AdvancedTranslator:
             "(3) preserve an independently trusted, complete OCR subtitle's established native wording when it "
             "is semantically correct and natural in context; "
             "(4) idiomatic contemporary native speech, figurative interpretation and appropriate register; "
-            "(5) when available, source-prosody similarity; "
-            "(6) natural_duration_fit and closeness to ratio 1.0. "
-            "Never choose translationese or awkward wording merely because its duration is closer. "
+            "(5) comfortable_delivery: among candidates that pass requirements 1-4, prefer a complete concise "
+            "line in the 0.80-1.10 natural-duration band over a more verbose line that requires noticeable "
+            "acceleration; (6) when available, source-prosody similarity; "
+            "(7) natural_duration_fit and closeness to ratio 1.0. Never choose a summary, translationese or "
+            "awkward wording merely because its duration is closer, but do not preserve unnecessary wording "
+            "when an equally complete native candidate avoids rushed delivery. "
             "Return strict JSON: "
             '{"selected_attempt":0,"semantic_complete":true,'
             '"context_consistent":true,"native_fluent":true,"reason":"short reason"}'
@@ -3465,7 +3482,7 @@ class AdvancedTranslator:
             return {
                 "selected_attempt": selected,
                 "reason": str(result.get("reason") or "")[:240],
-                "policy": "semantics_context_native_before_duration_v1",
+                "policy": "semantics_context_compact_comfort_v2",
             }
         finally:
             client.close()
@@ -3478,7 +3495,7 @@ def _translation_candidates_fingerprint(
     config: DubbingConfig,
 ) -> str:
     payload = {
-        "version": "translation-v2.16.0:target-script-v2:native-dubbing-ocr-v17:glossary-v2",
+        "version": "translation-v2.17.0:balanced-compact-v1:target-script-v2:native-dubbing-ocr-v17:glossary-v2",
         "source_language": src_lang,
         "target_language": target_lang,
         "model": config.model_name,

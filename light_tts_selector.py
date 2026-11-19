@@ -305,6 +305,23 @@ class LightTTSSelector:
         else:
             lower = float(os.getenv("AUTODUB_LIGHT_TTS_MIN_RATIO", "0.75"))
             upper = float(os.getenv("AUTODUB_LIGHT_TTS_MAX_RATIO", "1.25"))
+        # The broad bounds above are safety/continuation limits.  They must not
+        # also define the preferred listening experience: a line at 1.20x can
+        # be technically usable yet sound rushed after final fitting.  Keep a
+        # separate comfort band so a semantically validated compact candidate
+        # can win before downstream acceleration is required.
+        comfort_lower = float(os.getenv(
+            "AUTODUB_LIGHT_TTS_COMFORT_MIN_RATIO",
+            "0.78" if target >= 1.0 else "0.70",
+        ))
+        comfort_upper = float(os.getenv(
+            "AUTODUB_LIGHT_TTS_OCR_COMFORT_MAX_RATIO"
+            if trusted_ocr else (
+                "AUTODUB_LIGHT_TTS_SHORT_COMFORT_MAX_RATIO"
+                if target < 2.0 else "AUTODUB_LIGHT_TTS_COMFORT_MAX_RATIO"
+            ),
+            "1.12" if trusted_ocr else ("1.08" if target < 2.0 else "1.10"),
+        ))
         borderline_lower = max(0.05, lower - 0.15)
         borderline_upper = upper + 0.15
         if actual > available:
@@ -326,6 +343,11 @@ class LightTTSSelector:
             status = "borderline"
         else:
             status = "rejected"
+        comfort_fit = (
+            "comfortable"
+            if actual <= available and comfort_lower <= ratio <= comfort_upper
+            else ("too_short" if ratio < comfort_lower else "too_long")
+        )
         return {
             "duration_fit": status,
             "duration_error": absolute,
@@ -333,6 +355,9 @@ class LightTTSSelector:
             "duration_ratio": ratio,
             "duration_lower_ratio": lower,
             "duration_upper_ratio": upper,
+            "duration_comfort_fit": comfort_fit,
+            "duration_comfort_lower_ratio": comfort_lower,
+            "duration_comfort_upper_ratio": comfort_upper,
             "duration_provenance": str(provenance or "standard"),
             "required_speed_factor": required_speed,
         }
@@ -480,12 +505,36 @@ class LightTTSSelector:
             for row in standard
             if row["duration_fit"] == "rejected"
         )
-        # Deterministic provenance order: exact OCR remains ahead of repaired
-        # OCR, including when it needs no more than 10% downstream atempo.
+        def comfortable(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            return [
+                row for row in rows
+                if row.get("duration_comfort_fit") == "comfortable"
+                and row.get("duration_fit") != "rejected"
+            ]
+
+        # Preserve trusted OCR and the natural standard line when either fits
+        # at a comfortable speaking rate.  Once both require noticeable
+        # acceleration, a validated compact candidate in the comfort band is
+        # preferable to mechanically speeding up a more verbose sentence.
+        for rows, reason in (
+            (direct, "ocr_direct_duration_comfortable"),
+            (repaired, "ocr_assisted_duration_comfortable"),
+            (native_standard, "native_standard_duration_comfortable"),
+            (compact, "faithful_compact_duration_comfortable"),
+        ):
+            usable = comfortable(rows)
+            if usable:
+                return min(
+                    usable, key=lambda row: float(row["duration_error"])
+                ), reason
+
+        # Deterministic fallback order once no candidate is comfortable. OCR
+        # is still retained where possible, but it no longer outranks a
+        # complete compact line that avoids rushed delivery.
         trusted_tiers = (
             (direct, "ocr_direct", "suitable"),
-            (direct, "ocr_direct", "speed_adjustable"),
             (repaired, "ocr_assisted", "suitable"),
+            (direct, "ocr_direct", "speed_adjustable"),
             (repaired, "ocr_assisted", "speed_adjustable"),
             (direct, "ocr_direct", "borderline"),
             (repaired, "ocr_assisted", "borderline"),
@@ -697,6 +746,11 @@ class LightTTSSelector:
                 "duration_relative_error": selected.get("duration_relative_error"),
                 "required_speed_factor": selected.get("required_speed_factor"),
                 "duration_fit": selected.get("duration_fit"),
+                "duration_comfort_fit": selected.get("duration_comfort_fit"),
+                "duration_comfort_bounds": [
+                    selected.get("duration_comfort_lower_ratio"),
+                    selected.get("duration_comfort_upper_ratio"),
+                ],
                 "selection_reason": selection_reason,
                 "selected_candidate_role": candidates[selected_index].get(
                     "_candidate_role", "unknown"

@@ -480,6 +480,87 @@ class TranslationTests(unittest.TestCase):
 
 
 class LightTests(unittest.TestCase):
+    @staticmethod
+    def _duration_backend(durations):
+        class Backend:
+            name = "fake"
+            extension = ".wav"
+            signature = "compact-translation-test"
+
+            def synthesize(self, text, language, path):
+                wav(path, durations[text])
+
+        return Backend()
+
+    def test_compact_candidate_beats_rushed_native_standard(self):
+        native = "That is the complete but unnecessarily extended native answer."
+        compact = "That's the complete answer."
+        segment = dict(
+            source(text=native),
+            start=0.0,
+            end=3.0,
+            tts_placement_start=0.0,
+            tts_target_duration=2.0,
+            tts_hard_end=3.0,
+            translations_candidates=[
+                {
+                    "text": native,
+                    "_selection_priority": "native_standard",
+                    "_candidate_role": "native_standard",
+                },
+                {
+                    "text": compact,
+                    "_selection_priority": "faithful_variant",
+                    "_candidate_role": "faithful_compact",
+                },
+            ],
+        )
+        backend = self._duration_backend({native: 2.4, compact: 2.0})
+        with tempfile.TemporaryDirectory() as tmp:
+            rows, audit = LightTTSSelector(tmp, backend=backend).select(
+                [segment], target_language="en"
+            )
+        self.assertEqual(rows[0]["text"], compact)
+        self.assertEqual(
+            audit[0]["selection_reason"],
+            "faithful_compact_duration_comfortable",
+        )
+        self.assertEqual(audit[0]["duration_comfort_fit"], "comfortable")
+
+    def test_trusted_ocr_still_wins_when_delivery_is_comfortable(self):
+        ocr = "That's the wording used in the trusted subtitle."
+        compact = "That's the trusted wording."
+        segment = dict(
+            source(text=ocr),
+            start=0.0,
+            end=3.0,
+            tts_placement_start=0.0,
+            tts_target_duration=2.0,
+            tts_hard_end=3.0,
+            translations_candidates=[
+                {
+                    "text": ocr,
+                    "_selection_priority": "ocr_direct",
+                    "_candidate_role": "ocr_adapted",
+                },
+                {
+                    "text": compact,
+                    "_selection_priority": "faithful_variant",
+                    "_candidate_role": "faithful_compact",
+                },
+            ],
+        )
+        backend = self._duration_backend({ocr: 2.16, compact: 2.0})
+        with tempfile.TemporaryDirectory() as tmp:
+            rows, audit = LightTTSSelector(tmp, backend=backend).select(
+                [segment], target_language="en"
+            )
+        self.assertEqual(rows[0]["text"], ocr)
+        self.assertEqual(
+            audit[0]["selection_reason"],
+            "ocr_direct_duration_comfortable",
+        )
+
     def test_zh_voice_detection_and_selftest(self):
         def run(command,**kwargs):
             if command[-1]=="--voices":
@@ -1176,6 +1257,73 @@ class RouterTests(unittest.TestCase):
             results[0]["duration_selection_reason"],
             "f5_native_duration_final_pass",
         )
+
+    def test_safe_but_rushed_tts_triggers_compact_rewrite(self):
+        calls = []
+        feedbacks = []
+
+        def worker(_model, plan, result, force=False):
+            data = json.loads(Path(result).read_text())
+            for item in json.loads(Path(plan).read_text())["items"]:
+                calls.append(item["text"])
+                duration = 1.18 if item["text"] == "verbose line" else 1.04
+                wav(item["raw_path"], duration)
+                data[item["segment_id"]].update(status="success")
+            Path(result).write_text(json.dumps(data))
+            return 0
+
+        def postprocess(src, dst, target, **_kwargs):
+            if Path(src).resolve() != Path(dst).resolve():
+                shutil.copy2(src, dst)
+            actual = tts_router._wav_duration(Path(src))
+            return {
+                "pre_trim_duration": actual,
+                "post_trim_duration": actual,
+                "actual_duration": actual,
+                "atempo_factor": 1.0,
+                "atempo_raw_factor": actual / target,
+                "atempo_capped": False,
+                **tts_router.duration_adaptation_safety(actual, target),
+            }
+
+        def rewrite(_segment, _text, feedback, _history):
+            feedbacks.append(feedback)
+            return {"text": "compact line", "native_fluency": "pass"}
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"AUTODUB_TTS_DURATION_REWRITES": "1"}
+        ), patch("tts_router.preflight_models"), patch(
+            "tts_router._run_worker", side_effect=worker
+        ), patch("tts_router._postprocess", side_effect=postprocess), patch(
+            "tts_router.electricity_quality", return_value={}
+        ), patch("tts_router.voice_consistency_quality", return_value={}), patch(
+            "tts_router._f5_native_duration_eligibility",
+            return_value={
+                "f5_native_duration_eligible": False,
+                "f5_native_duration_eligibility_reason": "test_disabled",
+            },
+        ), patch(
+            "tts_router._apply_atempo_exact",
+            return_value={
+                "atempo_factor": 1.04,
+                "forced_atempo_factor": 1.04,
+            },
+        ):
+            router = self.setup_router(tmp, disabled=True)
+            router.duration_rewriter = rewrite
+            _, results = router.run([
+                dict(source(text="verbose line"), tts_engine="f5tts")
+            ], "unused")
+
+        self.assertEqual(calls, ["verbose line", "compact line"])
+        self.assertEqual(
+            feedbacks[0]["natural_duration_fit"], "passed"
+        )
+        self.assertEqual(
+            feedbacks[0]["duration_rewrite_direction"], "compress"
+        )
+        self.assertEqual(results[0]["tts_text"], "compact line")
+        self.assertEqual(results[0]["duration_selected_attempt"], 1)
 
     def test_f5_native_duration_gate_is_separate_from_atempo_safety(self):
         with patch.dict(os.environ, {
