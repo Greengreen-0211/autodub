@@ -139,6 +139,28 @@ def natural_duration_fit(actual: float, target: float, provenance: str = "") -> 
         passed = lower <= ratio <= upper
         rule = "standard_ratio"
     passed = actual > 0.0 and lower <= ratio <= upper
+    # The broad band above is a safety/admissibility gate.  A clip can be
+    # technically usable there while still needing enough acceleration to
+    # sound hurried.  Keep a narrower delivery-comfort band so the router can
+    # ask for a concise, meaning-preserving rewrite before resorting to
+    # time-stretching.  Trusted OCR receives a little extra room, but not the
+    # former 1.35x blanket preference.
+    comfort_lower = float(
+        os.getenv("AUTODUB_TTS_COMFORT_MIN_RATIO", "0.80")
+    )
+    comfort_upper = float(
+        os.getenv(
+            "AUTODUB_TTS_OCR_COMFORT_MAX_RATIO"
+            if trusted_ocr else "AUTODUB_TTS_COMFORT_MAX_RATIO",
+            "1.12" if trusted_ocr else "1.10",
+        )
+    )
+    comfort_passed = bool(
+        actual > 0.0 and comfort_lower <= ratio <= comfort_upper
+    )
+    comfort_direction = "suitable"
+    if not comfort_passed:
+        comfort_direction = "expand" if actual < target else "compress"
     direction = "suitable"
     if not passed:
         direction = "expand" if actual < target else "compress"
@@ -154,6 +176,12 @@ def natural_duration_fit(actual: float, target: float, provenance: str = "") -> 
         "natural_duration_rule": rule,
         "natural_duration_provenance": str(provenance or "standard"),
         "natural_duration_fit": "passed" if passed else "failed",
+        "duration_comfort_fit": (
+            "comfortable" if comfort_passed else "uncomfortable"
+        ),
+        "duration_comfort_lower_ratio": comfort_lower,
+        "duration_comfort_upper_ratio": comfort_upper,
+        "duration_comfort_rewrite_direction": comfort_direction,
         "duration_rewrite_direction": direction,
         "duration_log_distance": distance,
     }

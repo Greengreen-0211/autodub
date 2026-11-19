@@ -3354,13 +3354,34 @@ class TTSRouter:
                     _generation_attempt_limit()
                 ):
                     break
-                if current_candidate["fit"]["natural_duration_fit"] == "passed":
+                if (
+                    current_candidate["fit"].get("duration_comfort_fit")
+                    == "comfortable"
+                    or (
+                        current_candidate["fit"].get("natural_duration_fit")
+                        == "passed"
+                        and current_candidate["fit"].get(
+                            "duration_comfort_rewrite_direction"
+                        ) != "compress"
+                    )
+                ):
                     break
                 try:
+                    rewrite_feedback = dict(current_candidate["fit"])
+                    # A candidate inside the broad safety band may still need
+                    # obvious acceleration.  Tell the rewriter to compress in
+                    # that case instead of reporting the misleading
+                    # "suitable" direction from the safety-only decision.
+                    rewrite_feedback["duration_rewrite_direction"] = (
+                        rewrite_feedback.get(
+                            "duration_comfort_rewrite_direction"
+                        )
+                        or rewrite_feedback.get("duration_rewrite_direction")
+                    )
                     rewrite = self.duration_rewriter(
                         dict(item.get("source_segment") or {}),
                         item["text"],
-                        current_candidate["fit"],
+                        rewrite_feedback,
                         [
                             {
                                 "text": candidate["text"],
@@ -3400,7 +3421,12 @@ class TTSRouter:
                 candidate for candidate in valid
                 if candidate["fit"]["natural_duration_fit"] == "passed"
             ]
-            selection_pool = passing or valid
+            comfortable = [
+                candidate for candidate in passing
+                if candidate["fit"].get("duration_comfort_fit")
+                == "comfortable"
+            ]
+            selection_pool = comfortable or passing or valid
             chosen = None
             selector_result = None
             if self.duration_candidate_selector is not None and len(valid) > 1:
@@ -3441,16 +3467,29 @@ class TTSRouter:
             if chosen is None:
                 if selector_result is not None:
                     selector_result = None
-                # Rewrites are not intrinsically better than the original.
-                # Prefer an explicitly context-approved rewrite; otherwise
-                # preserve the earlier/native wording before using duration as
-                # the final tie-breaker.
+                # Rewrites are not intrinsically better than the original,
+                # but neither should attempt zero win automatically when it
+                # requires obvious acceleration.  All entries in this pool
+                # have already passed the semantic/content gates; within that
+                # safe set, prefer contextual approval and a comfortable
+                # 0.80-1.10 natural-duration band before preserving attempt 0.
+                def comfort_distance(candidate):
+                    ratio = float(
+                        candidate["fit"].get("natural_duration_ratio") or 0.0
+                    )
+                    if ratio < 0.80:
+                        return 0.80 - ratio
+                    if ratio > 1.10:
+                        return ratio - 1.10
+                    return 0.0
+
                 chosen = min(
                     selection_pool,
                     key=lambda candidate: (
                         -int(bool((candidate.get("rewrite") or {}).get(
                             "preferred_for_context", False
                         ))),
+                        comfort_distance(candidate),
                         0 if int(candidate["attempt"]) == 0 else 1,
                         float(candidate["fit"]["duration_log_distance"]),
                     ),
