@@ -1297,6 +1297,20 @@ def translate_segments(segments: list[dict], source: str, target: str, model: st
                 valid["translation_ocr_action"] = ocr_action
                 valid["translation_ocr_admission"] = admission_notes
                 valid["translation_ocr_rejections"] = rejected_ocr
+                budget = inputs[i]["compact_spoken_budget"]
+                if budget["unit"] == "spoken_words":
+                    max_words = budget["maximum"]
+                    for candidate in valid["translations_candidates"]:
+                        if candidate.get("_candidate_role") != "faithful_compact":
+                            continue
+                        word_count = len(re.findall(
+                            r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?",
+                            candidate["text"]
+                        ))
+                        if word_count > max_words:
+                            valid["translation_warnings"].append(
+                                f"compact_budget_exceeded:{word_count}/{max_words}"
+                            )
                 rows[i].update(valid)
                 for warning in valid["translation_warnings"]:
                     if warning != "candidate_lengths_similar":
