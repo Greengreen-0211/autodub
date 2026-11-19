@@ -2958,7 +2958,10 @@ class AdvancedTranslator:
                     "be direct only when it covers the full source and is natural when spoken; otherwise choose "
                     "minimal_repair, semantic_hint or ignore. For composed cards, preserve their order and put only "
                     "the uncovered source clauses into ocr_hybrid_text. Duration and compact_spoken_budget are soft "
-                    "planning hints: never make native_standard telegraphic merely to fit. Every candidate must keep "
+                    "planning hints, not hard limits. For faithful_compact, aim to stay within compact_spoken_budget "
+                    "using concise, natural speech while preserving key facts, names, numbers, negations and tone. "
+                    "If the budget cannot be met without losing meaning or fluency, prioritize faithful wording. "
+                    "Never make native_standard telegraphic merely to fit. Every candidate must keep "
                     "the same scene interpretation, register and emotion. Return exact IDs and strict JSON: "
                     '{"translations":[{"id":"supplied-id","text":"translation",'
                     '"ocr_reference_action":"semantic_hint","ocr_reference_complete":false,'
