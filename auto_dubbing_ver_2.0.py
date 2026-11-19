@@ -192,6 +192,7 @@ class DubbingConfig:
             os.path.join(self.index_tts_root, "checkpoints"),
         )
         self.tts_backend = os.getenv("AUTODUB_TTS_BACKEND", "scheme3").strip().lower()
+        self.enable_elastic_timing = _env_bool("AUTODUB_TTS_ELASTIC_TIMING_ENABLED", False)
         self.light_tts_enabled = _env_bool("AUTODUB_LIGHT_TTS_ENABLED", True)
         self.light_tts_backend = os.getenv("AUTODUB_LIGHT_TTS_BACKEND", "auto").strip().lower()
         # Subtitle rendering is a post-Step-5 delivery enhancement.  It never
@@ -4573,19 +4574,56 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
             duration_rewriter=duration_rewriter,
             duration_candidate_selector=duration_candidate_selector,
         )
-        clips, router_results = tts_router.run(
-            dubbing_segments, state["vocals_path"], force=force
-        )
+        elastic_fingerprint = None
+        if getattr(config, "enable_elastic_timing", False):
+            from elastic_timing import (
+                ElasticTimingSettings, conflicting_elastic_clips,
+                elastic_stage_fingerprint, plan_elastic_windows,
+            )
+
+            settings = ElasticTimingSettings.from_config(config)
+            windows = plan_elastic_windows(state, settings)
+            elastic_fingerprint = elastic_stage_fingerprint(state, settings)
+            early_shift = float(os.getenv(
+                "AUTODUB_TTS_MAX_COMPLETE_CLIP_EARLY_SHIFT_SECONDS", "0.35"
+            ))
+            while True:
+                clips, router_results = tts_router.run(
+                    dubbing_segments, state["vocals_path"], force=force,
+                    elastic_windows=windows,
+                )
+                conflicts = conflicting_elastic_clips(
+                    clips, router_results, state.get("duration", 0.0),
+                    maximum_early_shift_seconds=early_shift,
+                )
+                if not conflicts:
+                    break
+                # The existing mix scheduler can start a long final clip early.
+                # Revoke any conflicting reservation and reuse other jobs' WAVs.
+                for sid in conflicts:
+                    windows[sid].update(
+                        maximum_end=windows[sid]["source_end"],
+                        reason="rejected_by_mix_schedule",
+                    )
+                print(f"↩️ 弹性时间窗与实际混音排程冲突，按原流程重做: {', '.join(sorted(conflicts))}")
+                force = False
+        else:
+            clips, router_results = tts_router.run(
+                dubbing_segments, state["vocals_path"], force=force
+            )
         result_by_id = {str(item.get("segment_id")): item for item in router_results}
         enriched_segments = []
         for index, segment in enumerate(state["segments_step3"]):
             updated = segment.copy()
+            updated.pop("tts_elastic_timing", None)
             metadata = result_by_id.get(str(segment.get("id", index)), {})
             if is_skipped(segment) and not metadata:
                 updated.update({"tts_status": "skipped", "dubbing_enabled": False})
                 enriched_segments.append(updated)
                 continue
             if metadata:
+                if "elastic_timing" in metadata:
+                    updated["tts_elastic_timing"] = metadata["elastic_timing"]
                 updated.update({
                     "tts_status": metadata.get("status"),
                     "tts_model": metadata.get("model"),
@@ -4758,6 +4796,13 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
         fingerprint_state = dict(state)
         fingerprint_state["segments_step3"] = enriched_segments
         fingerprint_state["tts_backend"] = scheme
+        stage_manifest = {
+            "fingerprint": stage_fingerprint(fingerprint_state, config, scheme),
+            "total": len(enriched_segments),
+            "success": sum(r.get("status") == "success" for r in router_results),
+        }
+        if elastic_fingerprint is not None:
+            stage_manifest["elastic_timing_fingerprint"] = elastic_fingerprint
         state_mgr.save({
             "segments_step3": enriched_segments,
             "segments_scheme3": enriched_segments if scheme == "scheme3" else state.get("segments_scheme3", state["segments_step3"]),
@@ -4767,9 +4812,7 @@ def run_step_4(config: DubbingConfig, backend: str = "scheme3", force: bool = Fa
             "tts_quality_decision_audit_path": str(
                 tts_router.root / "quality_decision_audit.json"
             ),
-            "tts_stage_manifest": {"fingerprint": stage_fingerprint(fingerprint_state, config, scheme),
-                                   "total": len(enriched_segments),
-                                   "success": sum(r.get("status") == "success" for r in router_results)},
+            "tts_stage_manifest": stage_manifest,
         })
         if scheme == "scheme3":
             from scheme3_policy import write_segments_json
@@ -4812,6 +4855,15 @@ def run_step_5(config: DubbingConfig, input_file: str) -> None:
         return
     if state.get("input_file") and Path(state["input_file"]).resolve() != Path(input_file).resolve():
         raise RuntimeError("Step5 blocked: input video differs from checkpoint")
+    elastic_fingerprint = None
+    if getattr(config, "enable_elastic_timing", False):
+        from elastic_timing import ElasticTimingSettings, elastic_stage_fingerprint
+
+        elastic_fingerprint = elastic_stage_fingerprint(
+            state, ElasticTimingSettings.from_config(config),
+        )
+    if (state.get("tts_stage_manifest") or {}).get("elastic_timing_fingerprint") != elastic_fingerprint:
+        raise RuntimeError("Step5 blocked: elastic timing settings or evidence changed; rerun Step4")
     from tts_quality import validate_mix_state
     quality_issues = validate_mix_state(
         state, config, allow_missing=True, filter_missing=False

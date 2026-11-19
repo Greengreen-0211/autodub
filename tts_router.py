@@ -68,7 +68,15 @@ GENERATION_REQUEST_KEYS = (
     "translation_selection_source",
     "emotion_audio", "emotion_reliable", "emotion_reliability_source",
     "emotion_reference_text",
+    "elastic_timing_window",
 )
+
+
+def _generation_request(item: Dict[str, Any]) -> Dict[str, Any]:
+    request = {key: item.get(key) for key in GENERATION_REQUEST_KEYS}
+    if request["elastic_timing_window"] is None:
+        del request["elastic_timing_window"]
+    return request
 
 
 def _generation_attempt_limit() -> int:
@@ -327,6 +335,8 @@ def _request_fingerprint(item: Dict[str, Any]) -> str:
         )
     }
     payload["version"] = "tts-request-v2.9.0-generation-only"
+    if item.get("elastic_timing_window") is not None:
+        payload["elastic_timing_window"] = item["elastic_timing_window"]
     payload["worker_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_worker.py").read_bytes()).hexdigest()
     payload["policy_sha256"] = hashlib.sha256(Path(__file__).with_name("scheme3_policy.py").read_bytes()).hexdigest()
     payload["quality_sha256"] = hashlib.sha256(Path(__file__).with_name("tts_quality.py").read_bytes()).hexdigest()
@@ -798,6 +808,7 @@ def _postprocess(
     target_duration: float,
     *,
     allow_force_fit: bool = True,
+    elastic_window: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Trim silence then time-scale to target; return post-processing metrics."""
     trimmed = destination.with_name(destination.stem + ".trim.wav")
@@ -806,8 +817,18 @@ def _postprocess(
         source_edges = _edge_silence_metrics(source)
         _trim_silence(source, trimmed)
         post_trim = _wav_duration(trimmed)
-        factor, capped, raw = _atempo_factor(post_trim, target_duration)
-        _apply_atempo(trimmed, destination, target_duration)
+        timing = {}
+        if elastic_window is not None:
+            from elastic_timing import decide_elastic_timing
+
+            timing = decide_elastic_timing(elastic_window, post_trim)
+        if timing.get("applied"):
+            target_duration = post_trim
+            factor, capped, raw = 1.0, False, 1.0
+            shutil.copy2(trimmed, destination)
+        else:
+            factor, capped, raw = _atempo_factor(post_trim, target_duration)
+            _apply_atempo(trimmed, destination, target_duration)
         forced = {}
         adaptation = duration_adaptation_safety(post_trim, target_duration)
         natural_duration = _wav_duration(destination)
@@ -861,7 +882,23 @@ def _postprocess(
         ],
         **adaptation,
         **forced,
+        **({"elastic_timing": timing} if timing else {}),
     }
+
+
+def _postprocess_job(item: Dict[str, Any], *, allow_force_fit: bool) -> Dict[str, Any]:
+    options = {} if allow_force_fit else {"allow_force_fit": False}
+    if item.get("elastic_timing_window") is not None:
+        options["elastic_window"] = item["elastic_timing_window"]
+    return _postprocess(
+        Path(item["raw_path"]), Path(item["final_path"]),
+        item["target_duration"], **options,
+    )
+
+
+def _timing_quality_target(target: float, metadata: Dict[str, Any]) -> float:
+    timing = metadata.get("elastic_timing") or {}
+    return float(timing["tts_duration"]) if timing.get("applied") else target
 
 
 def _leading_silence_failure(metadata: Dict[str, Any]) -> str:
@@ -1229,9 +1266,7 @@ class TTSRouter:
             "candidate_text": str(item.get("text") or ""),
             "planned_text": str(item.get("planned_text") or ""),
             "reference_audio_sha256": reference_sha,
-            "generation_request": {
-                key: item.get(key) for key in GENERATION_REQUEST_KEYS
-            },
+            "generation_request": _generation_request(item),
             "request_fingerprint": item.get("request_fingerprint"),
         }
         replaced = False
@@ -1451,6 +1486,16 @@ class TTSRouter:
         item["final_path"] = str(destination)
         item["request_fingerprint"] = _request_fingerprint(item)
         result = dict(chosen)
+        result.pop("elastic_timing", None)
+        if item.get("elastic_timing_window") is not None:
+            from elastic_timing import decide_elastic_timing
+
+            window = item["elastic_timing_window"]
+            result["elastic_timing"] = decide_elastic_timing(
+                {**window, "maximum_end": window["source_end"],
+                 "reason": "degraded_candidate_legacy_alignment"},
+                actual,
+            )
         try:
             edge_metrics = _edge_silence_metrics(destination)
         except Exception as exc:
@@ -1514,9 +1559,7 @@ class TTSRouter:
             actual_duration=actual,
             audio_sha256=_file_sha256(destination),
             request_fingerprint=item["request_fingerprint"],
-            generation_request={
-                key: item.get(key) for key in GENERATION_REQUEST_KEYS
-            },
+            generation_request=_generation_request(item),
             generation_attempt_count=int(
                 item.get("generation_attempt_count") or 0
             ),
@@ -2480,7 +2523,11 @@ class TTSRouter:
                 continue
         return output
 
-    def run(self, segments: Iterable[Dict[str, Any]], vocal_path: str, *, force: bool = False) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def run(
+        self, segments: Iterable[Dict[str, Any]], vocal_path: str, *,
+        force: bool = False,
+        elastic_windows: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         from translation_quality import is_skipped, require_translated
         # Segments without any safe target-language text never reach a TTS
         # engine. Step 5 leaves their position silent instead of restoring the
@@ -2835,20 +2882,31 @@ class TTSRouter:
                 item["target_duration"] = min(
                     float(item["target_duration"]), item["hard_duration"]
                 )
+            window = (elastic_windows or {}).get(item["segment_id"])
+            if window is not None:
+                item["elastic_timing_window"] = {
+                    **window, "placement_start": item["start"],
+                    "legacy_end": item["end"],
+                }
             item["request_fingerprint"] = _request_fingerprint(item)
             item["planned_request_fingerprint"] = item["request_fingerprint"]
 
         active = []
         for item in items:
             known = previous.get(item["segment_id"], {})
-            item["generation_attempt_count"] = max(
-                int(item.get("generation_attempt_count") or 0),
-                int(known.get("generation_attempt_count") or 0),
-            )
             reused = False
             saved_generation = known.get("generation_request")
             if not isinstance(saved_generation, dict):
                 saved_generation = {}
+            elastic_policy_changed = (
+                saved_generation.get("elastic_timing_window")
+                != item.get("elastic_timing_window")
+            )
+            if not elastic_policy_changed:
+                item["generation_attempt_count"] = max(
+                    int(item.get("generation_attempt_count") or 0),
+                    int(known.get("generation_attempt_count") or 0),
+                )
             # A fallback engine or a duration-directed rewrite may differ from
             # the original Step 3 plan.  It is safe to migrate that successful
             # waveform only while the Step 3 source text itself is unchanged.
@@ -2880,7 +2938,7 @@ class TTSRouter:
                 planned_text_unchanged
                 and _legacy_generation_request_matches(migration_probe, known)
             )
-            planned_compatible = (
+            planned_compatible = not elastic_policy_changed and (
                 known.get("planned_request_fingerprint")
                 == item["planned_request_fingerprint"]
                 or legacy_generation_match
@@ -2914,7 +2972,8 @@ class TTSRouter:
                         or legacy_generation_match
                     )
                     actual = _wav_duration(known_file) if valid else 0
-                    measured_quality = duration_quality(actual, item["target_duration"])["duration_quality"]
+                    quality_target = _timing_quality_target(item["target_duration"], known)
+                    measured_quality = duration_quality(actual, quality_target)["duration_quality"]
                     saved_quality = str(known.get("duration_quality", ""))
                     current_audible = (
                         audible_speech_quality(
@@ -2934,7 +2993,7 @@ class TTSRouter:
                         forced_factor = float("inf")
                     maximum_safe = duration_adaptation_safety(
                         max(actual, 0.001) * max(1.0, forced_factor),
-                        max(float(item["target_duration"]), 0.001),
+                        max(float(quality_target), 0.001),
                     )["maximum_safe_compression_ratio"]
                     historical_transform_safe = (
                         not bool(known.get("unsafe_duration_compression"))
@@ -2972,10 +3031,7 @@ class TTSRouter:
                             known["planned_request_fingerprint"] = item[
                                 "planned_request_fingerprint"
                             ]
-                            known["generation_request"] = {
-                                key: resumed.get(key)
-                                for key in GENERATION_REQUEST_KEYS
-                            }
+                            known["generation_request"] = _generation_request(resumed)
                             known.pop("content_asr_request_fingerprint", None)
                         known = {
                             **dict(known),
@@ -3073,6 +3129,8 @@ class TTSRouter:
         for item in items:
             sid = item["segment_id"]
             metadata = dict(previous.get(sid, {}))
+            timing = metadata.get("elastic_timing") or {}
+            placement_end = timing["allowed_end"] if timing.get("applied") else item["end"]
             metadata.update(segment_id=sid, planned_engine=item["planned_engine"],
                             rule_planned_engine=item.get("rule_planned_engine", item["planned_engine"]),
                             speaker_engine_locked=bool(item.get("speaker_engine_locked", False)),
@@ -3097,12 +3155,9 @@ class TTSRouter:
                                 item.get("generation_attempt_count") or 0
                             ),
                             generation_attempt_limit=_generation_attempt_limit(),
-                            generation_request={
-                                key: item.get(key)
-                                for key in GENERATION_REQUEST_KEYS
-                            },
+                             generation_request=_generation_request(item),
                             placement_start=item["start"],
-                            placement_end=item["end"],
+                             placement_end=placement_end,
                             placement_source=item.get("placement_source", "segment_start"),
                             speaker=item["speaker"], emotion=item["emotion"],
                             emotion_score=item.get("emotion_score"),
@@ -3154,7 +3209,7 @@ class TTSRouter:
                     source_end = float(source_segment.get("end"))
                 except (TypeError, ValueError):
                     source_end = float(item["end"])
-                clips.append({"segment_id":sid, "start":item["start"], "end":item["end"], "file":metadata["file"],
+                clips.append({"segment_id":sid, "start":item["start"], "end":placement_end, "file":metadata["file"],
                               "tts_engine":item["model"], "request_fingerprint":item["request_fingerprint"],
                               "source_start":source_start,
                               "source_end":source_end,
@@ -3230,6 +3285,7 @@ class TTSRouter:
                 ),
                 "forced_atempo_factor": metadata.get("forced_atempo_factor"),
                 "duration_ratio": metadata.get("duration_ratio"),
+                **({"elastic_timing": metadata["elastic_timing"]} if "elastic_timing" in metadata else {}),
                 "status": metadata.get("status", "failed"),
             })
         _atomic_json(self.root / "quality_decision_audit.json", audit_rows)
@@ -3269,7 +3325,7 @@ class TTSRouter:
                 )
                 fit = natural_duration_fit(
                     natural,
-                    item["target_duration"],
+                    _timing_quality_target(item["target_duration"], current),
                     str(
                         (item.get("source_segment") or {}).get(
                             "translation_selection_source", "standard"
@@ -3450,7 +3506,7 @@ class TTSRouter:
             final_metadata = dict(chosen["metadata"])
             native_duration_control = False
             chosen_safety = duration_adaptation_safety(
-                chosen["fit"]["natural_duration"], item["target_duration"]
+                chosen["fit"]["natural_duration"], chosen["fit"]["target_duration"]
             )
             native_eligibility = _f5_native_duration_eligibility(
                 chosen["fit"]["natural_duration"], item["target_duration"]
@@ -3521,16 +3577,14 @@ class TTSRouter:
                         final_metadata = native_metadata
                         native_duration_control = True
             try:
-                post = _postprocess(
-                    Path(item["raw_path"]), Path(item["final_path"]),
-                    item["target_duration"], allow_force_fit=False,
-                )
+                post = _postprocess_job(item, allow_force_fit=False)
                 final_metadata.update(post)
                 hard_duration = float(
                     item.get("hard_duration") or item["target_duration"]
                 )
                 if (
-                    hard_duration > 0.04
+                    not (post.get("elastic_timing") or {}).get("applied")
+                    and hard_duration > 0.04
                     and float(post["actual_duration"]) > hard_duration + 0.01
                 ):
                     collision_safety = duration_adaptation_safety(
@@ -3571,7 +3625,9 @@ class TTSRouter:
                             Path(item["final_path"])
                         )
                 actual = float(final_metadata["actual_duration"])
-                final_metadata.update(duration_quality(actual, item["target_duration"]))
+                final_metadata.update(duration_quality(
+                    actual, _timing_quality_target(item["target_duration"], post),
+                ))
                 final_metadata.update(audible_speech_quality(
                     Path(item["final_path"]), expected_text=item["text"]
                 ))
@@ -3846,21 +3902,14 @@ class TTSRouter:
                     metadata.update(status="failed",error=f"{model} worker exited with {code}")
                 if metadata.get("status")=="success":
                     try:
-                        if self.duration_rewriter is None:
-                            post = _postprocess(
-                                Path(item["raw_path"]), Path(item["final_path"]),
-                                item["target_duration"],
-                            )
-                        else:
-                            post = _postprocess(
-                                Path(item["raw_path"]), Path(item["final_path"]),
-                                item["target_duration"], allow_force_fit=False,
-                            )
+                        post = _postprocess_job(
+                            item, allow_force_fit=self.duration_rewriter is None,
+                        )
                         actual = post["actual_duration"]
                         metadata.update(post)
                         metadata.update(file=item["final_path"], actual_duration=actual,
                                         audio_sha256=_file_sha256(Path(item["final_path"])),
-                                        **duration_quality(actual, item["target_duration"]))
+                                        **duration_quality(actual, _timing_quality_target(item["target_duration"], post)))
                         # When atempo was deliberately capped to keep the voice
                         # natural, keep that fact in the audit metadata.
                         if metadata["atempo_capped"] and metadata["duration_quality"]=="failed":
