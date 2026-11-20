@@ -472,7 +472,7 @@ _COORDINATE_PREFIX = re.compile(
     r"^\s*(?:\[?\s*\d{1,4}\s*[,;:]\s*\d{1,4}[^\]]*\]?\s*)+"
 )
 _SPOTTING_RECORD = re.compile(
-    r"<ref>(.*?)</ref>\s*(?:<quad>.*?</quad>)?", re.I | re.S
+    r"<ref>(.*?)</ref>\s*(?:<quad>(.*?)</quad>)?", re.I | re.S
 )
 _PLAIN_COORD_RECORD = re.compile(
     r"(.*?)(\(\s*\d+\s*,\s*\d+\s*\)\s*,\s*"
@@ -483,28 +483,77 @@ _CJK = re.compile(r"[\u3400-\u9fff]")
 _LATIN = re.compile(r"[A-Za-z]")
 
 
-def _ocr_lines(frame_text: str) -> List[str]:
+_BOX_PAIR = re.compile(
+    r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)"
+)
+
+
+def _bbox_from_coordinates(value: str) -> Optional[List[float]]:
+    """把 ``(x1,y1),(x2,y2)`` 之类坐标串归一为 [left, top, right, bottom]。"""
+    points = [(float(x), float(y)) for x, y in _BOX_PAIR.findall(value or "")]
+    if len(points) < 2:
+        return None
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    left, right, top, bottom = min(xs), max(xs), min(ys), max(ys)
+    if right <= left or bottom <= top:
+        return None
+    return [left, top, right, bottom]
+
+
+def _ocr_lines_with_bbox(
+    frame_text: str,
+) -> List[Tuple[str, Optional[List[float]]]]:
+    """拆出每行 OCR 文本及其包围盒。
+
+    保留坐标是为了区分真正的字幕与招牌、水印、观看人数等画面叠加文字；
+    下游只需要文本时用 :func:`_ocr_lines` 即可。
+    """
     cleaned = str(frame_text or "").replace("```", "\n")
-    references = [
-        re.sub(r"\s+", " ", html.unescape(match.group(1))).strip(" \t|-_")
-        for match in _SPOTTING_RECORD.finditer(cleaned)
-    ]
-    if references:
-        return [line for line in references if line and not _URL_OR_UI.search(line)]
-    coordinate_lines = []
+    records: List[Tuple[str, Optional[List[float]]]] = []
+    for match in _SPOTTING_RECORD.finditer(cleaned):
+        text = re.sub(r"\s+", " ", html.unescape(match.group(1))).strip(" \t|-_")
+        if text and not _URL_OR_UI.search(text):
+            records.append((text, _bbox_from_coordinates(match.group(2) or "")))
+    if records:
+        return records
     for physical_line in re.split(r"[\r\n]+", cleaned):
         for match in _PLAIN_COORD_RECORD.finditer(physical_line):
-            line = re.sub(r"\s+", " ", match.group(1)).strip(" \t|-_")
-            if line and not _URL_OR_UI.search(line):
-                coordinate_lines.append(line)
-    if coordinate_lines:
-        return coordinate_lines
-    lines: List[str] = []
+            text = re.sub(r"\s+", " ", match.group(1)).strip(" \t|-_")
+            if text and not _URL_OR_UI.search(text):
+                records.append((text, _bbox_from_coordinates(match.group(2))))
+    if records:
+        return records
     for raw in re.split(r"[\r\n]+", cleaned):
         line = _COORDINATE_PREFIX.sub("", raw).strip(" \t|-_")
         if line and not _URL_OR_UI.search(line):
-            lines.append(line)
-    return lines
+            records.append((line, None))
+    return records
+
+
+def _ocr_lines(frame_text: str) -> List[str]:
+    return [text for text, _ in _ocr_lines_with_bbox(frame_text)]
+
+
+def _inside_subtitle_region(
+    bbox: Optional[List[float]], region: Optional[Mapping[str, float]]
+) -> bool:
+    """判断文本框是否落在由真实字幕反推出的字幕区域。
+
+    缺少任何一方证据时一律放行，避免在无法确定版面时误删正文。
+    """
+    if not region or not bbox:
+        return True
+    left, top, right, bottom = bbox
+    center_x, center_y = (left + right) / 2.0, (top + bottom) / 2.0
+    return (
+        float(region.get("x_min", float("-inf")))
+        <= center_x
+        <= float(region.get("x_max", float("inf")))
+        and float(region.get("y_min", float("-inf")))
+        <= center_y
+        <= float(region.get("y_max", float("inf")))
+    )
 
 
 def _language_matches(line: str, language: str) -> bool:
@@ -582,6 +631,7 @@ def ocr_source_events(
     region_end: float,
     context_tolerance: float = 0.2,
     exclude_texts: Sequence[str] = (),
+    subtitle_region: Optional[Mapping[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Build ordered subtitle events from dense OCR observations.
 
@@ -589,12 +639,18 @@ def ocr_source_events(
     repeated short calls are not collapsed.  Event bounds partition the parent
     speech region: OCR supplies text/order while the acoustic region remains the
     conservative outer timing boundary.
+
+    ``subtitle_region`` restricts evidence to the on-screen subtitle area that
+    the caller inferred from OCR lines matching real ASR text.  Without it,
+    shop signs, street signs and viewer counters can be promoted to dialogue
+    and end up dubbed.
     """
     observations: List[Dict[str, Any]] = []
+    outside_region = 0
     for frame_index, record in enumerate(frame_records):
         timestamp = float(record.get("timestamp", 0.0))
         seen: set[str] = set()
-        for line in _ocr_lines(str(record.get("text") or "")):
+        for line, bbox in _ocr_lines_with_bbox(str(record.get("text") or "")):
             key = normalize_text(line)
             if (
                 key in seen
@@ -602,6 +658,9 @@ def ocr_source_events(
                 or len(key) > 140
                 or not _language_matches(line, source_language)
             ):
+                continue
+            if not _inside_subtitle_region(bbox, subtitle_region):
+                outside_region += 1
                 continue
             seen.add(key)
             observations.append(
@@ -618,6 +677,8 @@ def ocr_source_events(
             "reason": "no_source_language_ocr_evidence",
             "frame_count": len(frame_records),
             "dialogue_evidence": False,
+            "outside_subtitle_region": outside_region,
+            "subtitle_region": dict(subtitle_region) if subtitle_region else None,
         }
 
     timestamps = sorted({float(item["timestamp"]) for item in observations})

@@ -11,7 +11,7 @@ import re
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple, Type
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type
 from urllib.parse import urlsplit, urlunsplit
 
 from autodub_ocr_runtime import VERSION as OCR_OPTIMIZED_VERSION
@@ -146,6 +146,141 @@ def _source_language(config: Any, text: str) -> str:
     if language in {"zh&en", "en&zh", ""}:
         return "zh" if any("\u3400" <= char <= "\u9fff" for char in text) else "en"
     return language if language in {"zh", "en"} else "unsupported"
+
+
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?。！？])\s+")
+_NO_TEXT_MARKERS = {"图片中没有文字。", "图片中没有文字"}
+
+
+def _ocr_frames_by_segment(config: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """读回逐帧 OCR 缓存，按粗片段 id 分组为带时间戳的文本。
+
+    仅在调用方没有传入内存版 ``frame_records`` 时作为兜底使用；
+    主流程会直接把 ``OCRV211Client.frame_records_by_segment`` 传进来，
+    避免缓存里可能残留的历史视频条目混入。
+    """
+    cache_path = _runtime_dir(config) / "ocr_frames.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    frames: Dict[str, List[Dict[str, Any]]] = {}
+    for record in cache.values():
+        if not isinstance(record, dict) or record.get("status") != "ok":
+            continue
+        text = str(record.get("text") or "").strip()
+        if not text or text in _NO_TEXT_MARKERS:
+            continue
+        try:
+            timestamp = float(record["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        segment_id = str(record.get("segment_id", ""))
+        frames.setdefault(segment_id, []).append({"timestamp": timestamp, "text": text})
+    for entries in frames.values():
+        entries.sort(key=lambda item: item["timestamp"])
+    return frames
+
+
+def _split_segment_sentences(segment: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """把粗 ASR 片段切成句子片段，携带精确的字符偏移。
+
+    优先使用强制对齐器生成的 ``qwen3_sentence_candidates``；没有时间戳时退化
+    为标点切分。每个片段的 ``text`` 都等于 ``text[char_start:char_end]``，
+    这样纠错后的句子能原样拼接回去而不破坏句间分隔符。
+    """
+    text = str(segment.get("text") or "")
+    seg_start = float(segment.get("start", 0.0))
+    seg_end = float(segment.get("end", seg_start))
+    if not text.strip():
+        return [{"text": "", "start": seg_start, "end": seg_end, "char_start": 0, "char_end": 0}]
+
+    candidates = segment.get("qwen3_sentence_candidates") or []
+    spans: List[Dict[str, Any]] = []
+    for index, candidate in enumerate(candidates):
+        char_start = candidate.get("char_start")
+        if not isinstance(char_start, int) or char_start < 0:
+            spans = []
+            break
+        next_start = candidates[index + 1].get("char_start") if index + 1 < len(candidates) else None
+        if next_start is not None and not isinstance(next_start, int):
+            spans = []
+            break
+        raw_end = next_start if next_start is not None else len(text)
+        raw_end = min(len(text), max(char_start, int(raw_end)))
+        stripped = text[char_start:raw_end].rstrip()
+        if not stripped:
+            continue
+        spans.append({
+            "text": stripped,
+            "start": float(candidate.get("start", seg_start)),
+            "end": float(candidate.get("end", seg_end)),
+            "char_start": char_start,
+            "char_end": char_start + len(stripped),
+        })
+    if not spans:
+        spans = _split_text_sentences(text, seg_start, seg_end)
+    return spans
+
+
+def _split_text_sentences(text: str, start: float, end: float) -> List[Dict[str, Any]]:
+    """没有词时间戳时按标点切分的兜底方案。"""
+    matches = list(_SENTENCE_BOUNDARY_RE.finditer(text))
+    if not matches:
+        stripped = text.rstrip()
+        return [{"text": stripped, "start": start, "end": end,
+                 "char_start": 0, "char_end": len(stripped)}]
+    spans: List[Dict[str, Any]] = []
+    cursor = 0
+    for match in matches:
+        stripped = text[cursor:match.end()].rstrip()
+        if stripped:
+            spans.append({"text": stripped, "start": start, "end": end,
+                          "char_start": cursor, "char_end": cursor + len(stripped)})
+        cursor = match.end()
+    tail = text[cursor:].rstrip()
+    if tail:
+        spans.append({"text": tail, "start": start, "end": end,
+                      "char_start": cursor, "char_end": cursor + len(tail)})
+    return spans
+
+
+def _merge_sentence_decisions(
+    text: str,
+    sentences: List[Dict[str, Any]],
+    decisions: Dict[str, Dict[str, Any]],
+    segment_id: str,
+) -> Dict[str, Any]:
+    """把逐句纠错结果按字符偏移拼回原片段文本。"""
+    parts: List[str] = []
+    changed = False
+    cursor = 0
+    for index, sentence in enumerate(sentences):
+        char_start, char_end = sentence["char_start"], sentence["char_end"]
+        parts.append(text[cursor:char_start])
+        decision = decisions.get(f"{segment_id}::{index}")
+        corrected_text = decision.get("corrected_text") if isinstance(decision, dict) else None
+        accepted = bool(
+            isinstance(decision, dict)
+            and decision.get("accepted")
+            and corrected_text
+            and corrected_text != sentence["text"]
+        )
+        if accepted:
+            parts.append(corrected_text)
+            changed = True
+        else:
+            parts.append(text[char_start:char_end])
+        cursor = char_end
+    parts.append(text[cursor:])
+    new_text = "".join(parts)
+    return {
+        "accepted": changed,
+        "corrected_text": new_text,
+        "reason": "sentence_level_correction" if changed else "no_sentence_correction_accepted",
+    }
 
 
 class OCRV211Client:
@@ -421,6 +556,7 @@ class OCRV211Corrector:
         self,
         segments: List[Dict[str, Any]],
         ocr_texts: Dict[str, str],
+        frame_records: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> List[Dict[str, Any]]:
         mode = _mode()
         if mode == "off":
@@ -440,23 +576,40 @@ class OCRV211Corrector:
             for source, result in zip(segments, corrected):
                 preserve_speaker_timing_skeleton(source, result)
             return corrected
+        frames_by_segment = (
+            frame_records if frame_records is not None else _ocr_frames_by_segment(self.config)
+        )
         requests = []
+        sentence_map = {}
         for segment in segments:
-            text = str(segment.get("text") or "")
-            language = _source_language(self.config, text)
-            lines = [] if language == "unsupported" else [
-                {"line_id": f"L{index:03d}", "text": line}
-                for index, line in enumerate(
-                    ocr_texts.get(str(segment["id"]), "").splitlines(), start=1
-                )
-                if line.strip()
-            ]
-            requests.append({
-                "id": str(segment["id"]),
-                "source_language": language if language != "unsupported" else "en",
-                "qwen_asr": text,
-                "ocr_candidates": lines,
-            })
+            segment_id = str(segment["id"])
+            sentences = _split_segment_sentences(segment)
+            sentence_map[segment_id] = sentences
+            for index, sentence in enumerate(sentences):
+                language = _source_language(self.config, sentence["text"])
+                lines = []
+                if language != "unsupported":
+                    window_start = float(sentence["start"]) - 0.5
+                    window_end = float(sentence["end"]) + 0.5
+                    for frame in frames_by_segment.get(segment_id, []):
+                        try:
+                            timestamp = float(frame.get("timestamp"))
+                        except (TypeError, ValueError):
+                            continue
+                        frame_text = str(frame.get("text") or "").strip()
+                        if not frame_text or frame_text in _NO_TEXT_MARKERS:
+                            continue
+                        if window_start <= timestamp <= window_end:
+                            lines.append({
+                                "line_id": f"L{len(lines):03d}",
+                                "text": frame_text,
+                            })
+                requests.append({
+                    "id": f"{segment_id}::{index}",
+                    "source_language": language if language != "unsupported" else "en",
+                    "qwen_asr": sentence["text"],
+                    "ocr_candidates": lines,
+                })
         try:
             engine = FrozenBOCREngine(
                 _runtime_dir(self.config) / "classifier",
@@ -472,15 +625,30 @@ class OCRV211Corrector:
             decisions = engine.run(requests)
         except Exception as exc:
             print(f"⚠️ 冻结 B OCR 纠错器失败，保留原 ASR: {type(exc).__name__}: {exc}")
-            decisions = {
-                str(segment["id"]): _ocr_keep(
-                    segment["text"], f"runtime_fallback:{type(exc).__name__}:{exc}"
+            _ocr_atomic_json(
+                _runtime_dir(self.config) / "fallback.json",
+                {"reason": f"{type(exc).__name__}: {exc}", "action": "preserve_asr"},
+            )
+            corrected = [
+                _ocr_update_segment(
+                    segment,
+                    _ocr_keep(str(segment.get("text") or ""), f"runtime_fallback:{type(exc).__name__}:{exc}"),
                 )
                 for segment in segments
-            }
-            _ocr_atomic_json(_runtime_dir(self.config) / "fallback.json", decisions)
+            ]
+            for source, result in zip(segments, corrected):
+                preserve_speaker_timing_skeleton(source, result)
+            return corrected
         corrected = [
-            _ocr_update_segment(segment, decisions[str(segment["id"])])
+            _ocr_update_segment(
+                segment,
+                _merge_sentence_decisions(
+                    str(segment.get("text") or ""),
+                    sentence_map[str(segment["id"])],
+                    decisions,
+                    str(segment["id"]),
+                ),
+            )
             for segment in segments
         ]
         # OCR may fix a few characters while leaving the utterance and its
@@ -833,6 +1001,240 @@ def ocr_recovery_timing_plausibility(
     }
 
 
+def estimate_subtitle_region(
+    frame_records: Sequence[Mapping[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
+    *,
+    minimum_matches: int = 4,
+) -> Optional[Dict[str, float]]:
+    """从与真实 ASR 文本对齐的 OCR 行反推屏幕字幕区域。
+
+    画面里除了字幕还会有店铺招牌、路牌、观看人数等叠加文字。它们通常
+    不在字幕所在的版面区域，但文本本身完全合法，靠内容无法剔除。这里用
+    「OCR 行能与某条 ASR 文本对上」作为字幕样本，取这些框的分位数得到
+    字幕带，供恢复流程只在该区域内采纳文字。
+
+    样本不足时返回 ``None``，调用方应退回原行为而不是误删正文。
+    """
+    from asr_recovery import _ocr_lines_with_bbox, normalize_text, text_similarity
+
+    spans: List[tuple[float, float, str]] = []
+    for segment in segments:
+        try:
+            start, end = float(segment["start"]), float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        text = str(segment.get("text") or "").strip()
+        if text:
+            spans.append((start, end, normalize_text(text)))
+    if not spans:
+        return None
+
+    boxes: List[List[float]] = []
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        nearby = [
+            text
+            for start, end, text in spans
+            if start - 0.4 <= timestamp <= end + 0.4
+        ]
+        if not nearby:
+            continue
+        joined = " ".join(nearby)
+        for line, bbox in _ocr_lines_with_bbox(str(record.get("text") or "")):
+            if not bbox:
+                continue
+            key = normalize_text(line)
+            if len(key) < 2:
+                continue
+            matched = key in joined or any(
+                text_similarity(text, line) >= 0.55 for text in nearby
+            )
+            if matched:
+                boxes.append(bbox)
+
+    if len(boxes) < max(1, minimum_matches):
+        return None
+
+    def percentile(values: List[float], quantile: float) -> float:
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        position = quantile * (len(ordered) - 1)
+        lower = int(math.floor(position))
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    lefts = [box[0] for box in boxes]
+    tops = [box[1] for box in boxes]
+    rights = [box[2] for box in boxes]
+    bottoms = [box[3] for box in boxes]
+    x_low, x_high = percentile(lefts, 0.03), percentile(rights, 0.97)
+    y_low, y_high = percentile(tops, 0.03), percentile(bottoms, 0.97)
+    x_margin = max(20.0, 0.10 * max(1.0, x_high - x_low))
+    y_margin = max(10.0, 0.30 * max(1.0, y_high - y_low))
+    return {
+        "x_min": round(x_low - x_margin, 2),
+        "x_max": round(x_high + x_margin, 2),
+        "y_min": round(y_low - y_margin, 2),
+        "y_max": round(y_high + y_margin, 2),
+        "sample_count": float(len(boxes)),
+    }
+
+
+_SUBTITLE_OVERRIDE_MAX_CONTENT_TOKENS = 12
+_SUBTITLE_OVERRIDE_MIN_COVERAGE = 0.5
+_SUBTITLE_OVERRIDE_MIN_FRAMES = 2
+_SUBTITLE_OVERRIDE_MIN_LENGTH_RATIO = 0.5
+_SUBTITLE_OVERRIDE_MAX_LENGTH_RATIO = 2.0
+
+
+def _content_token_count(text: str) -> int:
+    return len(re.findall(r"[㐀-鿿]|[A-Za-z0-9]+", str(text or "")))
+
+
+def _window_subtitle_lines(
+    frame_records: Sequence[Mapping[str, Any]],
+    start: float,
+    end: float,
+    source_language: str,
+    subtitle_region: Optional[Mapping[str, float]],
+) -> List[Dict[str, Any]]:
+    """收集覆盖该时间窗、且落在字幕区域内的源语言 OCR 行。"""
+    from asr_recovery import (
+        _inside_subtitle_region,
+        _language_matches,
+        _ocr_lines_with_bbox,
+        normalize_text,
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for record in frame_records:
+        try:
+            timestamp = float(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        if not (start - 0.6 <= timestamp <= end + 0.6):
+            continue
+        for line, bbox in _ocr_lines_with_bbox(str(record.get("text") or "")):
+            if not line or not _inside_subtitle_region(bbox, subtitle_region):
+                continue
+            if not _language_matches(line, source_language):
+                continue
+            rows.append({
+                "timestamp": timestamp,
+                "text": line,
+                "key": normalize_text(line),
+            })
+    return rows
+
+
+def apply_short_utterance_subtitle_overrides(
+    segments: Sequence[Mapping[str, Any]],
+    corrected: Sequence[Dict[str, Any]],
+    frame_records: Sequence[Mapping[str, Any]],
+    source_language: str,
+    subtitle_region: Optional[Mapping[str, float]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """用明确无误的整句字幕替换短句的 ASR 文本。
+
+    冻结 B 只在「未变化的上下文能区分两种读法」时才允许改写；四个字的短句
+    根本没有此类上下文，因此真实的识别错误（如 ASR 的「丫头，过来。」对应
+    屏幕字幕「带他过来」）在那里永远无法被纠正。
+
+    这条规则范围很窄，只在同时满足以下条件时生效：
+    - 冻结 B 没有改动该句；
+    - 该句很短（内容词 <= 12）；
+    - 时间窗内只有**一条**源语言字幕，且至少出现在 2 帧；
+    - 该字幕覆盖了至少一半的片段时长；
+    - 字幕与 ASR 的文本长度相当（0.5x ~ 2x）。
+
+    命中后写入 ``ocr_optimized`` 与 ``speaker_timing_*``，并在审计里留痕。
+    """
+    from asr_recovery import normalize_text
+
+    output: List[Dict[str, Any]] = []
+    audit: List[Dict[str, Any]] = []
+    for source, result in zip(segments, corrected):
+        original = str(source.get("text") or "")
+        if not subtitle_region or not original.strip():
+            output.append(result)
+            continue
+        if str(result.get("text") or "") != original:
+            # 冻结 B 已经改过这一句，绝不再叠加第二次改写
+            output.append(result)
+            continue
+        try:
+            start, end = float(source["start"]), float(source["end"])
+        except (KeyError, TypeError, ValueError):
+            output.append(result)
+            continue
+        if end <= start:
+            output.append(result)
+            continue
+        if _content_token_count(original) > _SUBTITLE_OVERRIDE_MAX_CONTENT_TOKENS:
+            output.append(result)
+            continue
+        rows = _window_subtitle_lines(
+            frame_records, start, end, source_language, subtitle_region
+        )
+        keys = {row["key"] for row in rows if row["key"]}
+        if len(keys) != 1:
+            # 没有字幕，或同一时间窗有多条不同字幕 → 无法确定，保守保留 ASR
+            output.append(result)
+            continue
+        key = next(iter(keys))
+        timestamps = {
+            round(row["timestamp"], 3) for row in rows if row["key"] == key
+        }
+        if len(timestamps) < _SUBTITLE_OVERRIDE_MIN_FRAMES:
+            output.append(result)
+            continue
+        if key == normalize_text(original):
+            output.append(result)
+            continue
+        forms: Dict[str, int] = {}
+        for row in rows:
+            if row["key"] == key:
+                forms[row["text"]] = forms.get(row["text"], 0) + 1
+        text = max(forms, key=lambda value: (forms[value], len(value)))
+        first_seen, last_seen = min(timestamps), max(timestamps)
+        coverage = (min(last_seen, end) - max(first_seen, start)) / (end - start)
+        if coverage < _SUBTITLE_OVERRIDE_MIN_COVERAGE:
+            output.append(result)
+            continue
+        ratio = _content_token_count(text) / max(1, _content_token_count(original))
+        if not (
+            _SUBTITLE_OVERRIDE_MIN_LENGTH_RATIO
+            <= ratio
+            <= _SUBTITLE_OVERRIDE_MAX_LENGTH_RATIO
+        ):
+            output.append(result)
+            continue
+        updated = _ocr_update_segment(source, {
+            "accepted": True,
+            "corrected_text": text,
+            "reason": "short_utterance_subtitle_override",
+        })
+        preserve_speaker_timing_skeleton(source, updated)
+        audit.append({
+            "segment_id": source.get("id"),
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "original_text": original,
+            "corrected_text": text,
+            "frame_support": len(timestamps),
+            "coverage": round(coverage, 4),
+            "reason": "short_utterance_subtitle_override",
+        })
+        output.append(updated)
+    return output, audit
+
+
 def persistent_ocr_overlay_texts(
     frame_records: Sequence[Mapping[str, Any]],
 ) -> List[str]:
@@ -967,6 +1369,7 @@ def _recover_deferred_from_ocr(
     source_language: str,
     known_segments: Sequence[Dict[str, Any]] = (),
     persistent_overlay_texts: Sequence[str] = (),
+    subtitle_region: Optional[Mapping[str, float]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Promote stable ordered subtitle events to coarse ASR segments."""
     from asr_recovery import coarse_segment, ocr_source_events
@@ -991,6 +1394,7 @@ def _recover_deferred_from_ocr(
             region_start=float(region["start"]),
             region_end=float(region["end"]),
             exclude_texts=[*known_neighbor_texts, *persistent_overlay_texts],
+            subtitle_region=subtitle_region,
         )
         record = {
             "id": region_id,
@@ -1256,6 +1660,7 @@ def run_step_1b_optimized(
     })
     enabled = not disable_ocr and config.ocr_enabled and _mode() != "off"
     ocr_texts: Dict[str, str] = {}
+    frame_records_by_segment: Dict[str, List[Dict[str, Any]]] = {}
     (
         deferred_regions,
         initial_uncovered_regions,
@@ -1295,6 +1700,7 @@ def run_step_1b_optimized(
                     for segment_id, records in client.frame_records_by_segment.items()
                     for record in records
                 ]
+                frame_records_by_segment = client.frame_records_by_segment
             finally:
                 client.session.close()
         except Exception as exc:
@@ -1305,9 +1711,34 @@ def run_step_1b_optimized(
                 _runtime_dir(config) / "ocr_service_fallback.json",
                 {"reason": f"{type(exc).__name__}: {exc}", "action": "preserve_asr"},
             )
-        segments = OCRV211Corrector(config, legacy_corrector_cls).correct(raw_segments, ocr_texts)
+        segments = OCRV211Corrector(config, legacy_corrector_cls).correct(
+            raw_segments, ocr_texts, frame_records_by_segment
+        )
+        # 用能与真实 ASR 对齐的 OCR 行反推字幕版面区域；招牌、路牌、观看人数
+        # 等画面文字都在区域之外，后续两处判断都会用到它。
+        subtitle_region = estimate_subtitle_region(all_frame_records, raw_segments)
+        if subtitle_region:
+            print(
+                "ℹ️ 字幕区域估计: "
+                f"x=[{subtitle_region['x_min']:.0f},{subtitle_region['x_max']:.0f}] "
+                f"y=[{subtitle_region['y_min']:.0f},{subtitle_region['y_max']:.0f}] "
+                f"(样本 {int(subtitle_region['sample_count'])})"
+            )
+        else:
+            print("ℹ️ 字幕区域样本不足，本轮不按位置过滤 OCR 文字。")
+        segments, subtitle_override_audit = apply_short_utterance_subtitle_overrides(
+            raw_segments,
+            segments,
+            all_frame_records,
+            str(config.ocr_source_language or state.get("src_lang", "")),
+            subtitle_region,
+        )
+        if subtitle_override_audit:
+            print(f"✅ OCR 短句字幕覆盖: {len(subtitle_override_audit)} 句改用屏幕字幕文本。")
     else:
         print("⚠️ OCR 已关闭，跳过 HunyuanOCR 辅助。")
+        subtitle_region = None
+        subtitle_override_audit = []
         segments = [
             _ocr_update_segment(segment, _ocr_keep(segment["text"], "ocr_disabled"))
             for segment in raw_segments
@@ -1324,6 +1755,7 @@ def run_step_1b_optimized(
                 str(config.ocr_source_language or state.get("src_lang", "")),
                 segments,
                 persistent_ocr_overlay_texts(all_frame_records),
+                subtitle_region=subtitle_region,
             )
         )
         if recovered_segments:
@@ -1486,6 +1918,7 @@ def run_step_1b_optimized(
         "asr_uncovered_regions": updated_uncovered,
         "asr_recovery_report_initial": deepcopy(initial_recovery_report),
         "asr_ocr_recovery_report": ocr_recovery_audit,
+        "asr_ocr_subtitle_override_report": subtitle_override_audit,
         "asr_boundary_repair_report": boundary_repair_audit,
         "asr_ocr_entity_correction_report": entity_correction_audit,
         "asr_recovery_micro_fragment_report": micro_fragment_audit,
