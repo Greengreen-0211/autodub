@@ -1,7 +1,9 @@
 """Adapter of the verified 3D-Speaker audio/vision/joint path, without A or providers.
 
-Upstream models and thresholds remain in the pinned installed repository. Only
-resource limits, offline paths, progress and evidence recording are adapted.
+The pinned upstream models remain unchanged. Resource limits, offline paths,
+progress and evidence recording are adapted here. The visual/audio anchor
+boundary deliberately accepts an overlap of exactly one second; upstream uses
+``> 1`` and therefore rejects a numerically exact 1.00 second boundary case.
 """
 from pathlib import Path
 import gc
@@ -16,6 +18,86 @@ from speaker_av_support import (say, read_json, write_json, sha, fingerprint, ph
 
 # Filled from the validated request in the isolated worker before any model load.
 SOURCE = None
+
+VISUAL_AUDIO_MIN_OVERLAP_SECONDS = 1.0
+VISUAL_AUDIO_OVERLAP_EPSILON = 1e-9
+
+
+def inclusive_visual_anchor_embeddings(
+    joint,
+    audio_embeddings,
+    audio_labels,
+    visual_labels,
+    audio_times,
+    visual_times,
+    conf,
+    *,
+    minimum_overlap_seconds=VISUAL_AUDIO_MIN_OVERLAP_SECONDS,
+):
+    """Return upstream-compatible visual anchors using an inclusive boundary.
+
+    This mirrors ``JointClustering.get_vlist_embs`` from the pinned 3D-Speaker
+    checkout. The sole policy change is the anchor admission comparison: an
+    audio/visual overlap equal to the configured minimum is accepted. A tiny
+    epsilon only protects decimal timestamps from binary float noise; it is far
+    below the timestamp resolution used by the models.
+    """
+    import numpy as np
+
+    if len(visual_labels) != len(visual_times):
+        raise ValueError("visual label/time length mismatch")
+    threshold = float(minimum_overlap_seconds)
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("minimum visual/audio overlap must be positive and finite")
+
+    visual_intervals = []
+    for index, timestamp in enumerate(visual_times):
+        timestamp = float(timestamp)
+        if (
+            not visual_intervals
+            or visual_labels[index] != visual_intervals[-1][2]
+            or timestamp - float(visual_times[index - 1])
+            > float(conf.face_det_stride) * 0.04 + 1e-4
+        ):
+            if visual_intervals and visual_intervals[-1][1] - visual_intervals[-1][0] < 1e-4:
+                visual_intervals.pop()
+            visual_intervals.append([timestamp, timestamp, visual_labels[index]])
+        else:
+            visual_intervals[-1][1] = timestamp
+
+    arranged = joint.arrange_labels(
+        [row[2] for row in visual_intervals],
+        a_st=int(np.max(audio_labels)) + 1,
+    )
+    visual_intervals = [
+        [row[0], row[1], label]
+        for row, label in zip(visual_intervals, arranged)
+    ]
+
+    visual_speaker_embeddings = {}
+    for visual_start, visual_end, visual_id in visual_intervals:
+        for index, (audio_start, audio_end) in enumerate(audio_times):
+            audio_start, audio_end = float(audio_start), float(audio_end)
+            if audio_end >= visual_start and visual_end >= audio_start:
+                overlap = min(audio_end, visual_end) - max(audio_start, visual_start)
+                if overlap + VISUAL_AUDIO_OVERLAP_EPSILON >= threshold:
+                    visual_speaker_embeddings.setdefault(visual_id, []).append(
+                        audio_embeddings[index]
+                    )
+
+    for visual_id, embeddings in visual_speaker_embeddings.items():
+        visual_speaker_embeddings[visual_id] = np.stack(embeddings).mean(0)
+
+    retained_intervals = [
+        row for row in visual_intervals if row[2] in visual_speaker_embeddings
+    ]
+    visual_speaker_durations = {}
+    for visual_start, visual_end, visual_id in retained_intervals:
+        visual_speaker_durations[visual_id] = (
+            visual_speaker_durations.get(visual_id, 0.0)
+            + visual_end - visual_start
+        )
+    return retained_intervals, visual_speaker_embeddings, visual_speaker_durations
 
 def pickle_write(path, value):
     path = Path(path)
@@ -281,7 +363,7 @@ def audiovisual_c(run):
     conf = Config(yaml_config_loader(str(SOURCE / 'egs/3dspeaker/speaker-diarization/conf/diar_video.yaml')))
     joint = build('cluster', conf)
     original_audio, original_vision = joint.audio_cluster, joint.vision_cluster
-    original_get, original_overlap = joint.get_vlist_embs, joint.overlap_spks
+    original_overlap = joint.overlap_spks
     saved = {}
 
     def audio(*args, **kwargs):
@@ -295,9 +377,11 @@ def audiovisual_c(run):
         return labels
 
     def anchors(*args, **kwargs):
-        value = original_get(*args, **kwargs)
+        value = inclusive_visual_anchor_embeddings(joint, *args, **kwargs)
         proof['visual_anchor_intervals'] = [[float(a), float(b), int(c)] for a, b, c in value[0]]
         proof['voice_prototypes_from_visual'] = len(value[1])
+        proof['visual_audio_min_overlap_seconds'] = VISUAL_AUDIO_MIN_OVERLAP_SECONDS
+        proof['visual_audio_overlap_comparison'] = 'greater_than_or_equal'
         return value
 
     matches = []
